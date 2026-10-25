@@ -1,0 +1,24 @@
+[package]
+name = "ovs-app"
+description = "OpenViSQL desktop client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "openvisql"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+gpui-kit = { version = "0.8", features = ["tree-sitter-sql"] }
+ovs-core.workspace = true
+ovs-mysql.workspace = true
+ovs-store.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

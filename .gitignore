@@ -1,0 +1,6 @@
+/target
+*.swp
+.DS_Store
+.env
+.dokploy.json
+.claude/project-settings.md

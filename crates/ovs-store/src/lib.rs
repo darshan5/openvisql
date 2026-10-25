@@ -1,0 +1,284 @@
+//! Persistence for things the user expects to survive a restart.
+//!
+//! - Connections live in `connections.toml` in the platform config directory.
+//! - Passwords live in the OS credential store (macOS Keychain, Windows Credential Manager),
+//!   never on disk in plain text.
+//! - Query history lives in `history.toml`, capped at [`HISTORY_LIMIT`] entries.
+//! - Open connection tabs and their query tabs live in `session.toml`, so the app reopens
+//!   where the user left off.
+
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+
+use ovs_core::ConnectionConfig;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use uuid::Uuid;
+
+const APP_DIR: &str = "openvisql";
+const KEYRING_SERVICE: &str = "openvisql";
+pub const HISTORY_LIMIT: usize = 500;
+
+#[derive(Debug, Error)]
+pub enum StoreError {
+    #[error("could not access {path}: {source}")]
+    Io { path: PathBuf, source: io::Error },
+    #[error("{path} is not valid: {source}")]
+    Parse {
+        path: PathBuf,
+        source: toml::de::Error,
+    },
+    #[error("could not serialise settings: {0}")]
+    Serialize(#[from] toml::ser::Error),
+    #[error("credential store: {0}")]
+    Keyring(#[from] keyring::Error),
+}
+
+pub type Result<T> = std::result::Result<T, StoreError>;
+
+/// Platform config directory for the app, e.g. `~/Library/Application Support/openvisql`.
+pub fn default_dir() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(APP_DIR)
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct ConnectionsFile {
+    #[serde(default, rename = "connection")]
+    connections: Vec<ConnectionConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryEntry {
+    /// Unix timestamp in seconds.
+    pub at: u64,
+    pub connection: String,
+    pub database: Option<String>,
+    pub sql: String,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct HistoryFile {
+    #[serde(default, rename = "entry")]
+    entries: Vec<HistoryEntry>,
+}
+
+/// One query tab as it should reopen.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SavedQueryTab {
+    pub title: String,
+    pub database: Option<String>,
+    pub sql: String,
+}
+
+/// One connection tab of the main window.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SavedConnectionTab {
+    /// The saved connection this tab was connected to.
+    pub connection: Option<Uuid>,
+    #[serde(rename = "tab")]
+    pub tabs: Vec<SavedQueryTab>,
+    pub active_tab: usize,
+}
+
+/// Everything needed to restore the main window.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Session {
+    #[serde(rename = "connection")]
+    pub connections: Vec<SavedConnectionTab>,
+    pub active: usize,
+}
+
+/// File-backed store rooted at one directory. Tests point it at a temp dir.
+#[derive(Debug, Clone)]
+pub struct Store {
+    dir: PathBuf,
+}
+
+impl Default for Store {
+    fn default() -> Self {
+        Self::new(default_dir())
+    }
+}
+
+impl Store {
+    pub fn new(dir: impl Into<PathBuf>) -> Self {
+        Self { dir: dir.into() }
+    }
+
+    fn path(&self, file: &str) -> PathBuf {
+        self.dir.join(file)
+    }
+
+    pub fn load_connections(&self) -> Result<Vec<ConnectionConfig>> {
+        let file: ConnectionsFile = read_toml(&self.path("connections.toml"))?;
+        Ok(file.connections)
+    }
+
+    pub fn save_connections(&self, connections: &[ConnectionConfig]) -> Result<()> {
+        let file = ConnectionsFile {
+            connections: connections.to_vec(),
+        };
+        write_toml(&self.path("connections.toml"), &file)
+    }
+
+    pub fn load_session(&self) -> Result<Session> {
+        read_toml(&self.path("session.toml"))
+    }
+
+    pub fn save_session(&self, session: &Session) -> Result<()> {
+        write_toml(&self.path("session.toml"), session)
+    }
+
+    pub fn load_history(&self) -> Result<Vec<HistoryEntry>> {
+        let file: HistoryFile = read_toml(&self.path("history.toml"))?;
+        Ok(file.entries)
+    }
+
+    /// Appends to history, dropping the oldest entries beyond [`HISTORY_LIMIT`].
+    pub fn append_history(&self, entry: HistoryEntry) -> Result<()> {
+        let mut entries = self.load_history()?;
+        entries.push(entry);
+        if entries.len() > HISTORY_LIMIT {
+            entries.drain(..entries.len() - HISTORY_LIMIT);
+        }
+        write_toml(&self.path("history.toml"), &HistoryFile { entries })
+    }
+}
+
+fn read_toml<T: Default + for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
+    match fs::read_to_string(path) {
+        Ok(text) => toml::from_str(&text).map_err(|source| StoreError::Parse {
+            path: path.to_owned(),
+            source,
+        }),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(T::default()),
+        Err(source) => Err(StoreError::Io {
+            path: path.to_owned(),
+            source,
+        }),
+    }
+}
+
+/// Writes via a temp file and rename so a crash never leaves a half-written settings file.
+fn write_toml<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let io_err = |source| StoreError::Io {
+        path: path.to_owned(),
+        source,
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(io_err)?;
+    }
+    let text = toml::to_string_pretty(value)?;
+    let tmp = path.with_extension("toml.tmp");
+    fs::write(&tmp, text).map_err(io_err)?;
+    fs::rename(&tmp, path).map_err(io_err)
+}
+
+/// Passwords in the OS credential store, keyed by connection id.
+pub mod secrets {
+    use super::{KEYRING_SERVICE, Result, Uuid};
+
+    fn entry(id: Uuid) -> keyring::Result<keyring::Entry> {
+        keyring::Entry::new(KEYRING_SERVICE, &id.to_string())
+    }
+
+    pub fn get_password(id: Uuid) -> Result<Option<String>> {
+        match entry(id)?.get_password() {
+            Ok(p) => Ok(Some(p)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn set_password(id: Uuid, password: &str) -> Result<()> {
+        Ok(entry(id)?.set_password(password)?)
+    }
+
+    pub fn delete_password(id: Uuid) -> Result<()> {
+        match entry(id)?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connections_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        assert_eq!(
+            store.load_connections().unwrap(),
+            [] as [ovs_core::ConnectionConfig; 0]
+        );
+
+        let cfg = ConnectionConfig {
+            name: "local".into(),
+            port: 3307,
+            ..ConnectionConfig::default()
+        };
+        store.save_connections(std::slice::from_ref(&cfg)).unwrap();
+        assert_eq!(store.load_connections().unwrap(), [cfg]);
+    }
+
+    #[test]
+    fn session_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        assert_eq!(store.load_session().unwrap(), Session::default());
+
+        let session = Session {
+            connections: vec![SavedConnectionTab {
+                connection: Some(Uuid::new_v4()),
+                tabs: vec![
+                    SavedQueryTab {
+                        title: "Orders".into(),
+                        database: Some("shop".into()),
+                        sql: "SELECT *\nFROM orders;".into(),
+                    },
+                    SavedQueryTab::default(),
+                ],
+                active_tab: 1,
+            }],
+            active: 0,
+        };
+        store.save_session(&session).unwrap();
+        assert_eq!(store.load_session().unwrap(), session);
+    }
+
+    #[test]
+    fn history_is_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        for i in 0..HISTORY_LIMIT + 3 {
+            store
+                .append_history(HistoryEntry {
+                    at: i as u64,
+                    connection: "c".into(),
+                    database: None,
+                    sql: format!("select {i}"),
+                })
+                .unwrap();
+        }
+        let history = store.load_history().unwrap();
+        assert_eq!(history.len(), HISTORY_LIMIT);
+        assert_eq!(history[0].sql, "select 3");
+    }
+
+    #[test]
+    fn corrupt_file_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("connections.toml"), "not = [valid").unwrap();
+        let err = Store::new(dir.path()).load_connections().unwrap_err();
+        assert!(matches!(err, StoreError::Parse { .. }));
+    }
+}

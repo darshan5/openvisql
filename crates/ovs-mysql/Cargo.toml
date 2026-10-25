@@ -1,0 +1,19 @@
+[package]
+name = "ovs-mysql"
+description = "MySQL and MariaDB driver for OpenViSQL"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+mysql_async.workspace = true
+ovs-core.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+
+[lints]
+workspace = true
