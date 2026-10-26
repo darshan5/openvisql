@@ -18,6 +18,7 @@ lsp-types = { version = "0.97", features = ["proposed"] }
 gpui-kit = { version = "0.8", features = ["tree-sitter-sql"] }
 ovs-core.workspace = true
 ovs-mysql.workspace = true
+ovs-ssh.workspace = true
 ovs-store.workspace = true
 tokio.workspace = true
 uuid.workspace = true

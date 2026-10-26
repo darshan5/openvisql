@@ -47,6 +47,41 @@ pub enum PasswordStore {
     Local,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SshAuthMethod {
+    #[default]
+    Password,
+    PrivateKey,
+}
+
+/// Connecting through an SSH tunnel: the database host and port are then as seen from the SSH
+/// server (often `127.0.0.1`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SshConfig {
+    pub enabled: bool,
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub auth: SshAuthMethod,
+    /// Private key file, for `SshAuthMethod::PrivateKey`.
+    pub key_path: String,
+}
+
+impl Default for SshConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            host: String::new(),
+            port: 22,
+            user: String::new(),
+            auth: SshAuthMethod::default(),
+            key_path: String::new(),
+        }
+    }
+}
+
 /// A saved connection. Passwords are never stored here; see `ovs-store`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -71,6 +106,7 @@ pub struct ConnectionConfig {
     pub connect_timeout_secs: u64,
     /// Ask before running UPDATE/DELETE without a WHERE clause.
     pub safe_updates: bool,
+    pub ssh: SshConfig,
 }
 
 impl Default for ConnectionConfig {
@@ -92,6 +128,7 @@ impl Default for ConnectionConfig {
             init_commands: String::new(),
             connect_timeout_secs: 10,
             safe_updates: true,
+            ssh: SshConfig::default(),
         }
     }
 }

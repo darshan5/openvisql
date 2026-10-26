@@ -330,3 +330,102 @@ async fn grid_edits_round_trip_through_real_metadata() {
     );
     cleanup(s, &db).await;
 }
+
+#[tokio::test]
+async fn paging_filtering_and_sorting_queries_run() {
+    use ovs_core::sql::Dialect;
+    use ovs_core::sql::paging::{PageSpec, SortSpec};
+
+    let Some((mut s, db)) = scratch("paging").await else {
+        return;
+    };
+    s.execute(
+        "CREATE TABLE n (id INT PRIMARY KEY, parity VARCHAR(4))",
+        None,
+    )
+    .await
+    .unwrap();
+    let values: Vec<String> = (1..=120)
+        .map(|i| format!("({i}, '{}')", if i % 2 == 0 { "even" } else { "odd" }))
+        .collect();
+    s.execute(&format!("INSERT INTO n VALUES {}", values.join(",")), None)
+        .await
+        .unwrap();
+
+    let mut spec = PageSpec {
+        base: format!("SELECT id, parity FROM {db}.n ORDER BY id"),
+        filter: String::new(),
+        sort: None,
+        offset: 0,
+        page_size: 50,
+    };
+    let first = |out: &[QueryOutcome]| rows(&out[0]).first().map(|r| r[0].clone());
+    spec.next();
+    let out = s
+        .execute(&spec.page_query(Dialect::MySql), None)
+        .await
+        .unwrap();
+    assert_eq!(rows(&out[0]).len(), 50);
+    assert_eq!(first(&out), Some(Value::Int(51)));
+
+    spec.offset = 0;
+    spec.filter = "parity = 'even'".into();
+    spec.sort = Some(SortSpec {
+        column: "id".into(),
+        descending: true,
+    });
+    let out = s
+        .execute(&spec.page_query(Dialect::MySql), None)
+        .await
+        .unwrap();
+    assert_eq!(first(&out), Some(Value::Int(120)));
+    let count = s.execute(&spec.count_query(), None).await.unwrap();
+    assert_eq!(rows(&count[0])[0][0], Value::Int(60));
+    cleanup(s, &db).await;
+}
+
+#[tokio::test]
+async fn object_templates_and_info_queries_run() {
+    use ovs_core::sql::split_statements;
+    use ovs_core::sql::templates::{
+        create_template, database_info, drop_object, rename_table, table_info, truncate_table,
+    };
+
+    let Some((mut s, db)) = scratch("templates").await else {
+        return;
+    };
+    // The table first: the trigger template needs it.
+    for kind in [
+        ObjectKind::Table,
+        ObjectKind::View,
+        ObjectKind::Procedure,
+        ObjectKind::Function,
+        ObjectKind::Trigger,
+        ObjectKind::Event,
+    ] {
+        for stmt in split_statements(&create_template(kind, &db, Some("new_table"))) {
+            s.execute(&stmt.sql, None)
+                .await
+                .unwrap_or_else(|e| panic!("{kind:?}: {e}\n{}", stmt.sql));
+        }
+    }
+    for stmt in split_statements(&table_info(&db, "new_table")) {
+        s.execute(&stmt.sql, None).await.unwrap();
+    }
+    for stmt in split_statements(&database_info(&db)) {
+        s.execute(&stmt.sql, None).await.unwrap();
+    }
+    s.execute(&truncate_table(&db, "new_table"), None)
+        .await
+        .unwrap();
+    s.execute(&rename_table(&db, "new_table", "renamed"), None)
+        .await
+        .unwrap();
+    s.execute(&drop_object(ObjectKind::Trigger, &db, "new_trigger"), None)
+        .await
+        .unwrap();
+    s.execute(&drop_object(ObjectKind::Table, &db, "renamed"), None)
+        .await
+        .unwrap();
+    cleanup(s, &db).await;
+}

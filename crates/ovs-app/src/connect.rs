@@ -17,13 +17,29 @@ use gpui_kit::{
     IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
     Styled as _, Subscription, Window, div, prelude::FluentBuilder as _, px,
 };
-use ovs_core::{ConnectionConfig, PasswordStore, SslMode};
+use ovs_core::{ConnectionConfig, PasswordStore, SshAuthMethod, SshConfig, SslMode};
+use ovs_ssh::{SshAuth, SshSettings};
 use ovs_store::Store;
 use uuid::Uuid;
 
 use crate::runtime::{self, SharedSession};
 
 const SSL_MODES: [SslMode; 3] = [SslMode::Disabled, SslMode::Preferred, SslMode::Required];
+
+/// The form's contents, ready to connect with.
+struct Collected {
+    config: ConnectionConfig,
+    password: String,
+    ssh_secret: String,
+}
+
+/// `~/.ssh/key` → `/Users/me/.ssh/key`.
+fn expand_home(path: &str) -> std::path::PathBuf {
+    match path.strip_prefix("~/").zip(dirs::home_dir()) {
+        Some((rest, home)) => home.join(rest),
+        None => std::path::PathBuf::from(path),
+    }
+}
 
 /// A live connection handed to the shell, which turns the tab into a workspace.
 #[derive(Clone)]
@@ -60,6 +76,13 @@ pub struct ConnectView {
     databases: Entity<InputState>,
     ssl_ca: Entity<InputState>,
     init_commands: Entity<InputState>,
+    ssh_host: Entity<InputState>,
+    ssh_port: Entity<InputState>,
+    ssh_user: Entity<InputState>,
+    ssh_key_path: Entity<InputState>,
+    /// SSH password, or the private key's passphrase.
+    ssh_secret: Entity<InputState>,
+    ssh_secret_edited: bool,
     /// The user typed in the password field. Until then the stored password is used, and it is
     /// only read from the keychain when connecting, so browsing connections never prompts.
     password_edited: bool,
@@ -85,8 +108,21 @@ impl ConnectView {
                 cx.notify();
             }
         });
+        let ssh_secret = cx.new(|cx| InputState::new(window, cx).masked(true));
+        let ssh_secret_sub = cx.subscribe(&ssh_secret, |this, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                this.ssh_secret_edited = true;
+                cx.notify();
+            }
+        });
         let mut view = Self {
             store,
+            ssh_host: input("bastion.example.com", window, cx),
+            ssh_port: input("22", window, cx),
+            ssh_user: input("SSH user name", window, cx),
+            ssh_key_path: input("~/.ssh/id_ed25519", window, cx),
+            ssh_secret,
+            ssh_secret_edited: false,
             editing: ConnectionConfig::default(),
             name: input("My server", window, cx),
             host: input("localhost", window, cx),
@@ -99,7 +135,7 @@ impl ConnectView {
             password_edited: false,
             status,
             connections,
-            _subscriptions: vec![password_sub],
+            _subscriptions: vec![password_sub, ssh_secret_sub],
         };
         let first = view.connections.first().cloned().unwrap_or_default();
         view.load(first, window, cx);
@@ -125,6 +161,12 @@ impl ConnectView {
         // Left empty: a saved password stays in the keychain until it's needed.
         set(&self.password, String::new(), window, cx);
         self.password_edited = false;
+        set(&self.ssh_host, config.ssh.host.clone(), window, cx);
+        set(&self.ssh_port, config.ssh.port.to_string(), window, cx);
+        set(&self.ssh_user, config.ssh.user.clone(), window, cx);
+        set(&self.ssh_key_path, config.ssh.key_path.clone(), window, cx);
+        set(&self.ssh_secret, String::new(), window, cx);
+        self.ssh_secret_edited = false;
         set(&self.databases, config.databases.clone(), window, cx);
         set(
             &self.ssl_ca,
@@ -143,7 +185,7 @@ impl ConnectView {
     }
 
     /// Reads the form back into a config, validating what the driver can't.
-    fn collect(&self, cx: &App) -> Result<(ConnectionConfig, String), String> {
+    fn collect(&self, cx: &App) -> Result<Collected, String> {
         let text = |state: &Entity<InputState>| state.read(cx).value().trim().to_owned();
         let host = text(&self.host);
         if host.is_empty() {
@@ -162,7 +204,37 @@ impl ConnectView {
             n => n,
         };
         let ssl_ca = Some(text(&self.ssl_ca)).filter(|s| !s.is_empty());
+        let ssh = if self.editing.ssh.enabled {
+            let ssh_port_text = text(&self.ssh_port);
+            let ssh = SshConfig {
+                enabled: true,
+                host: text(&self.ssh_host),
+                port: if ssh_port_text.is_empty() {
+                    22
+                } else {
+                    ssh_port_text
+                        .parse()
+                        .map_err(|_| format!("SSH port must be a number, not '{ssh_port_text}'."))?
+                },
+                user: text(&self.ssh_user),
+                key_path: text(&self.ssh_key_path),
+                ..self.editing.ssh.clone()
+            };
+            if ssh.host.is_empty() || ssh.user.is_empty() {
+                return Err("SSH host and user are required.".into());
+            }
+            if ssh.auth == SshAuthMethod::PrivateKey && ssh.key_path.is_empty() {
+                return Err("Choose the SSH private key file.".into());
+            }
+            ssh
+        } else {
+            SshConfig {
+                enabled: false,
+                ..self.editing.ssh.clone()
+            }
+        };
         let config = ConnectionConfig {
+            ssh,
             name,
             host,
             port,
@@ -185,7 +257,71 @@ impl ConnectView {
                 .unwrap_or(typed),
             _ => typed,
         };
-        Ok((config, password))
+        let typed_ssh = self.ssh_secret.read(cx).value().to_string();
+        let saved_ssh = self
+            .saved(config.id)
+            .filter(|c| c.save_password && c.ssh.enabled);
+        let ssh_secret = match saved_ssh {
+            Some(saved) if !self.ssh_secret_edited && config.ssh.enabled => self
+                .store
+                .ssh_secret(config.id, saved.password_store)
+                .map_err(|e| format!("Could not read the saved SSH secret: {e}"))?
+                .unwrap_or(typed_ssh),
+            _ => typed_ssh,
+        };
+        Ok(Collected {
+            config,
+            password,
+            ssh_secret,
+        })
+    }
+
+    /// What the tunnel registry needs to reach the database through SSH.
+    fn tunnel_setup(
+        &self,
+        config: &ConnectionConfig,
+        secret: &str,
+    ) -> Option<(SshSettings, (String, u16), Option<String>)> {
+        let ssh = config.ssh.clone();
+        if !ssh.enabled {
+            return None;
+        }
+        let auth = match ssh.auth {
+            SshAuthMethod::Password => SshAuth::Password(secret.to_owned()),
+            SshAuthMethod::PrivateKey => SshAuth::PrivateKey {
+                path: expand_home(&ssh.key_path),
+                passphrase: Some(secret.to_owned()).filter(|s| !s.is_empty()),
+            },
+        };
+        let known = self.store.known_host(&ssh.host, ssh.port).ok().flatten();
+        Some((
+            SshSettings {
+                host: ssh.host,
+                port: ssh.port,
+                user: ssh.user,
+                auth,
+            },
+            (config.host.clone(), config.port),
+            known,
+        ))
+    }
+
+    /// Remembers the SSH server's host key the first time a tunnel to it connects.
+    fn remember_host_key(&self, config: &ConnectionConfig, fingerprint: Option<String>) {
+        let Some(fingerprint) = fingerprint else {
+            return;
+        };
+        let ssh = &config.ssh;
+        if self
+            .store
+            .known_host(&ssh.host, ssh.port)
+            .ok()
+            .flatten()
+            .is_none()
+        {
+            // Failing to record it only means the key is checked on first use again.
+            let _ = self.store.remember_host(&ssh.host, ssh.port, &fingerprint);
+        }
     }
 
     fn saved(&self, id: Uuid) -> Option<&ConnectionConfig> {
@@ -194,12 +330,35 @@ impl ConnectView {
 
     /// Saves `config`, and its password in the store it names. Only the stores involved are
     /// touched, so connections that don't use the keychain never trigger a keychain prompt.
-    fn persist(&mut self, config: &ConnectionConfig, password: &str) -> Result<(), String> {
+    fn persist(
+        &mut self,
+        config: &ConnectionConfig,
+        password: &str,
+        ssh_secret: &str,
+    ) -> Result<(), String> {
         let err = |e: ovs_store::StoreError| e.to_string();
         let previous = self
             .saved(config.id)
             .filter(|c| c.save_password)
             .map(|c| c.password_store);
+        let previous_ssh = self
+            .saved(config.id)
+            .filter(|c| c.save_password && c.ssh.enabled)
+            .map(|c| c.password_store);
+        if config.save_password && config.ssh.enabled {
+            let moved = previous_ssh.is_some_and(|p| p != config.password_store);
+            if self.ssh_secret_edited || moved || previous_ssh.is_none() {
+                self.store
+                    .set_ssh_secret(config.id, config.password_store, ssh_secret)
+                    .map_err(err)?;
+            }
+            if let Some(old) = previous_ssh.filter(|_| moved) {
+                self.store.delete_ssh_secret(config.id, old).map_err(err)?;
+            }
+        } else if let Some(old) = previous_ssh {
+            self.store.delete_ssh_secret(config.id, old).map_err(err)?;
+        }
+        self.ssh_secret_edited = false;
         if config.save_password {
             let moved = previous.is_some_and(|p| p != config.password_store);
             // An untouched field means the stored password is still current.
@@ -230,9 +389,9 @@ impl ConnectView {
     }
 
     fn save(&mut self, cx: &mut Context<Self>) {
-        self.status = match self.collect(cx).and_then(|(config, password)| {
-            self.persist(&config, &password)?;
-            self.editing = config;
+        self.status = match self.collect(cx).and_then(|c| {
+            self.persist(&c.config, &c.password, &c.ssh_secret)?;
+            self.editing = c.config;
             Ok(())
         }) {
             Ok(()) => Status::Ok("Saved.".into()),
@@ -299,7 +458,11 @@ impl ConnectView {
     }
 
     fn test(&mut self, cx: &mut Context<Self>) {
-        let (config, password) = match self.collect(cx) {
+        let Collected {
+            config,
+            password,
+            ssh_secret,
+        } = match self.collect(cx) {
             Ok(v) => v,
             Err(err) => {
                 self.status = Status::Failed(err);
@@ -309,8 +472,17 @@ impl ConnectView {
         };
         self.status = Status::Busy("Testing connection…");
         cx.notify();
+        let tunnel = self.tunnel_setup(&config, &ssh_secret);
         cx.spawn(async move |this, cx| {
-            let result = runtime::connect(config, Some(password)).await;
+            if let Some((settings, target, known)) = tunnel {
+                runtime::register_tunnel(config.id, settings, target, known).await;
+            }
+            let result = runtime::connect(config.clone(), Some(password)).await;
+            let fingerprint = if config.ssh.enabled && result.is_ok() {
+                runtime::tunnel_fingerprint(config.id).await
+            } else {
+                None
+            };
             let status = match result {
                 Ok(session) => {
                     let version = runtime::run(async move {
@@ -323,6 +495,7 @@ impl ConnectView {
                 Err(err) => Status::Failed(err.to_string()),
             };
             this.update(cx, |this, cx| {
+                this.remember_host_key(&config, fingerprint);
                 this.status = status;
                 cx.notify();
             })
@@ -332,7 +505,11 @@ impl ConnectView {
     }
 
     fn connect(&mut self, cx: &mut Context<Self>) {
-        let (config, password) = match self.collect(cx) {
+        let Collected {
+            config,
+            password,
+            ssh_secret,
+        } = match self.collect(cx) {
             Ok(v) => v,
             Err(err) => {
                 self.status = Status::Failed(err);
@@ -342,15 +519,25 @@ impl ConnectView {
         };
         // Saving on connect is what users expect from a connection manager; a failure to save
         // shouldn't stop them from connecting, so it is only reported.
-        let save_error = self.persist(&config, &password).err();
+        let save_error = self.persist(&config, &password, &ssh_secret).err();
         self.editing = config.clone();
         self.status = Status::Busy("Connecting…");
         cx.notify();
+        let tunnel = self.tunnel_setup(&config, &ssh_secret);
 
         cx.spawn(async move |this, cx| {
+            if let Some((settings, target, known)) = tunnel {
+                runtime::register_tunnel(config.id, settings, target, known).await;
+            }
             let result = runtime::connect(config.clone(), Some(password.clone())).await;
+            let fingerprint = if config.ssh.enabled && result.is_ok() {
+                runtime::tunnel_fingerprint(config.id).await
+            } else {
+                None
+            };
             this.update(cx, |this, cx| match result {
                 Ok(session) => {
+                    this.remember_host_key(&config, fingerprint);
                     this.status = Status::Idle;
                     cx.emit(ConnectEvent::Connected(Box::new(Connected {
                         config,
@@ -659,6 +846,69 @@ impl ConnectView {
                                     Field::new()
                                         .label("CA file")
                                         .child(Input::new(&self.ssl_ca)),
+                                )
+                            })
+                            .child(
+                                Field::new().label_indent(true).child(
+                                    Checkbox::new("ssh-enabled")
+                                        .label("Connect through an SSH tunnel")
+                                        .checked(self.editing.ssh.enabled)
+                                        .on_change(cx.listener(|this, value: &bool, _, cx| {
+                                            this.editing.ssh.enabled = *value;
+                                            cx.notify();
+                                        })),
+                                ),
+                            )
+                            .when(self.editing.ssh.enabled, |form| {
+                                let key = self.editing.ssh.auth == SshAuthMethod::PrivateKey;
+                                let secret_saved = self.editing.save_password
+                                    && !self.ssh_secret_edited
+                                    && self
+                                        .saved(self.editing.id)
+                                        .is_some_and(|c| c.save_password && c.ssh.enabled);
+                                form.child(
+                                    Field::new()
+                                        .label("SSH host")
+                                        .description(
+                                            "The database Host and Port above are then as seen \
+                                             from this server, often 127.0.0.1.",
+                                        )
+                                        .child(Input::new(&self.ssh_host)),
+                                )
+                                .child(Field::new().label("SSH port").child(Input::new(&self.ssh_port)))
+                                .child(Field::new().label("SSH user").child(Input::new(&self.ssh_user)))
+                                .child(
+                                    Field::new().label("SSH login").child(
+                                        RadioGroup::horizontal("ssh-auth")
+                                            .children(["Password", "Private key"])
+                                            .selected_index(Some(usize::from(key)))
+                                            .on_change(cx.listener(|this, ix: &usize, _, cx| {
+                                                this.editing.ssh.auth = if *ix == 0 {
+                                                    SshAuthMethod::Password
+                                                } else {
+                                                    SshAuthMethod::PrivateKey
+                                                };
+                                                cx.notify();
+                                            })),
+                                    ),
+                                )
+                                .when(key, |form| {
+                                    form.child(
+                                        Field::new()
+                                            .label("Key file")
+                                            .child(Input::new(&self.ssh_key_path)),
+                                    )
+                                })
+                                .child(
+                                    Field::new()
+                                        .label(if key { "Key passphrase" } else { "SSH password" })
+                                        .when(secret_saved, |field| {
+                                            field.description("Saved. Type to replace it.")
+                                        })
+                                        .when(key && !secret_saved, |field| {
+                                            field.description("Leave empty if the key has none.")
+                                        })
+                                        .child(Input::new(&self.ssh_secret).mask_toggle()),
                                 )
                             })
                             .child(

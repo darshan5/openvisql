@@ -138,3 +138,22 @@ OpenViSQL is MIT-licensed, so its code must stay compatible with MIT:
 - **Consequences:**
   - Startup never touches the network or the keychain.
   - Saved tabs for a deleted connection are simply never restored.
+
+## ADR-007: SSH tunnels shared per connection, trust-on-first-use host keys
+
+- **Date:** 2026-10-26
+- **Decision:**
+  - `ovs-ssh` (on `russh` with the `ring` backend, so no CMake or NASM is needed on Windows)
+    forwards a local port to the database through an SSH server.
+  - The app keeps one tunnel per connection id in `runtime.rs`. The object browser and every
+    query tab connect to `127.0.0.1:<local port>`, and a dropped tunnel is reopened on the
+    next connect.
+  - The SSH password or key passphrase is stored like the database password (keychain or
+    encrypted file, under `<id>:ssh`).
+  - Host keys are recorded in `known_hosts.toml` on first connection. A different key is
+    refused, as OpenSSH does.
+- **Consequences:**
+  - With SSL "verify certificate", the server name checked is the tunnel's local end, so
+    "encrypt only" is the practical SSL mode through a tunnel.
+  - Live tests run against an Alpine sshd container.
+

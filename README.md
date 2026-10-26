@@ -17,10 +17,16 @@ the right, and results below.
   - the OS keychain (macOS Keychain or Windows Credential Manager), or
   - an encrypted file on this computer, which never shows a system prompt.
 - TLS (encrypt-only or full certificate verification), compressed protocol, init commands.
+- **SSH tunnels** with a password or private key. One tunnel per connection is shared by every
+  tab and reopens if it drops. Host keys are trusted on first use, and a changed key is refused.
 - Object browser with lazy loading: databases → tables, views, procedures, functions,
-  triggers, events → columns and indexes. Includes a filter box and context menus (open data,
-  show `CREATE`, copy name).
-- SQL editor with syntax highlighting, line numbers, find and replace.
+  triggers, events → columns and indexes. Includes a filter box. Context menus offer:
+  - open data, an **Info** tab, show `CREATE`
+  - templates for new tables, views, routines, triggers and events
+  - paste SELECT/INSERT/UPDATE/DELETE statements
+  - create database, rename, truncate and drop, with confirmation
+- SQL editor with syntax highlighting, line numbers, find and replace, open/save `.sql` files
+  (⌘O, ⌘S, ⇧⌘S), toggle comments (⌘/) and UPPER/lower case (⇧⌘U, ⇧⌘L).
 - **Autocomplete** for tables, views, columns (aliases resolved), databases, functions and
   keywords. It opens as you type, or with **Ctrl+Space**, and caches schema per connection.
 - **Export** results to CSV, JSON, SQL INSERT, Markdown or HTML, either the rows shown or all
@@ -35,9 +41,13 @@ the right, and results below.
   warnings, errors and timings.
 - Query tabs can be renamed with a double click and reordered by dragging.
 - Double-clicking a column in the object browser inserts `` `column` `` at the cursor.
-- **Inline editing** of single-table SELECT results:
-  - Double-click a cell to edit it. Right-click a row to set a cell to NULL, delete the row,
-    or add a row.
+- Result **paging** (Prev/Next), a **WHERE filter** box and **server-side sorting** for large
+  results.
+- **Inline editing** of SELECT results. For joins, pick which table to edit.
+  - Double-click a cell to edit it. Right-click a row to set a cell to NULL, duplicate, delete
+    or add a row, or to open the **value editor** (large text, or hex with file load/save for
+    binary values).
+  - You're warned before unsaved edits would be lost.
   - **Save** applies the changes in one transaction, then re-fetches the rows.
   - Rows are matched by primary key, or a NOT NULL unique key; without either, by all columns
     plus `LIMIT 1`.

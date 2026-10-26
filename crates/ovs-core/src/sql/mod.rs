@@ -7,7 +7,10 @@ mod dialect;
 mod edit;
 pub mod keywords;
 mod lexer;
+pub mod paging;
 mod splitter;
+pub mod templates;
+pub mod text;
 
 pub use analyze::{
     LimitClause, StatementKind, apply_row_limit, classify, count_query, limit_clause,

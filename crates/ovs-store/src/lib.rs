@@ -73,6 +73,8 @@ struct HistoryFile {
 #[serde(default)]
 pub struct SavedQueryTab {
     pub title: String,
+    /// The `.sql` file the tab was opened from or saved to.
+    pub path: Option<String>,
     pub database: Option<String>,
     pub sql: String,
 }
@@ -95,6 +97,39 @@ pub struct Session {
     #[serde(rename = "connection")]
     pub connections: Vec<SavedConnectionTab>,
     pub active: usize,
+}
+
+/// A secret belonging to a connection.
+#[derive(Clone, Copy)]
+enum Secret {
+    Database(Uuid),
+    Ssh(Uuid),
+}
+
+impl Secret {
+    /// Keychain account and local-file key. Database passwords use the bare id, as they did
+    /// before SSH secrets existed.
+    fn name(self) -> String {
+        match self {
+            Self::Database(id) => id.to_string(),
+            Self::Ssh(id) => format!("{id}:ssh"),
+        }
+    }
+
+    /// What a locally encrypted secret is bound to.
+    fn aad(self) -> Vec<u8> {
+        match self {
+            Self::Database(id) => id.as_bytes().to_vec(),
+            Self::Ssh(_) => self.name().into_bytes(),
+        }
+    }
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct KnownHosts {
+    /// `host:port` → SHA-256 fingerprint.
+    #[serde(default)]
+    hosts: std::collections::BTreeMap<String, String>,
 }
 
 /// File-backed store rooted at one directory. Tests point it at a temp dir.
@@ -132,24 +167,67 @@ impl Store {
 
     /// The saved password of connection `id` from `store`, if any.
     pub fn password(&self, id: Uuid, store: PasswordStore) -> Result<Option<String>> {
-        match store {
-            PasswordStore::Keychain => keychain::get_password(id),
-            PasswordStore::Local => local::LocalSecrets::new(&self.dir).get(id),
-        }
+        self.secret(Secret::Database(id), store)
     }
 
     pub fn set_password(&self, id: Uuid, store: PasswordStore, password: &str) -> Result<()> {
-        match store {
-            PasswordStore::Keychain => keychain::set_password(id, password),
-            PasswordStore::Local => local::LocalSecrets::new(&self.dir).set(id, password),
-        }
+        self.set_secret(Secret::Database(id), store, password)
     }
 
     pub fn delete_password(&self, id: Uuid, store: PasswordStore) -> Result<()> {
+        self.delete_secret(Secret::Database(id), store)
+    }
+
+    /// The saved SSH password or key passphrase of connection `id`.
+    pub fn ssh_secret(&self, id: Uuid, store: PasswordStore) -> Result<Option<String>> {
+        self.secret(Secret::Ssh(id), store)
+    }
+
+    pub fn set_ssh_secret(&self, id: Uuid, store: PasswordStore, secret: &str) -> Result<()> {
+        self.set_secret(Secret::Ssh(id), store, secret)
+    }
+
+    pub fn delete_ssh_secret(&self, id: Uuid, store: PasswordStore) -> Result<()> {
+        self.delete_secret(Secret::Ssh(id), store)
+    }
+
+    fn secret(&self, secret: Secret, store: PasswordStore) -> Result<Option<String>> {
         match store {
-            PasswordStore::Keychain => keychain::delete_password(id),
-            PasswordStore::Local => local::LocalSecrets::new(&self.dir).delete(id),
+            PasswordStore::Keychain => keychain::get_password(&secret.name()),
+            PasswordStore::Local => {
+                local::LocalSecrets::new(&self.dir).get(&secret.name(), &secret.aad())
+            }
         }
+    }
+
+    fn set_secret(&self, secret: Secret, store: PasswordStore, value: &str) -> Result<()> {
+        match store {
+            PasswordStore::Keychain => keychain::set_password(&secret.name(), value),
+            PasswordStore::Local => {
+                local::LocalSecrets::new(&self.dir).set(&secret.name(), &secret.aad(), value)
+            }
+        }
+    }
+
+    fn delete_secret(&self, secret: Secret, store: PasswordStore) -> Result<()> {
+        match store {
+            PasswordStore::Keychain => keychain::delete_password(&secret.name()),
+            PasswordStore::Local => local::LocalSecrets::new(&self.dir).delete(&secret.name()),
+        }
+    }
+
+    /// The SSH host key fingerprint seen on earlier connections to `host:port`.
+    pub fn known_host(&self, host: &str, port: u16) -> Result<Option<String>> {
+        let file: KnownHosts = read_toml(&self.path("known_hosts.toml"))?;
+        Ok(file.hosts.get(&format!("{host}:{port}")).cloned())
+    }
+
+    pub fn remember_host(&self, host: &str, port: u16, fingerprint: &str) -> Result<()> {
+        let path = self.path("known_hosts.toml");
+        let mut file: KnownHosts = read_toml(&path)?;
+        file.hosts
+            .insert(format!("{host}:{port}"), fingerprint.to_owned());
+        write_toml(&path, &file)
     }
 
     pub fn load_session(&self) -> Result<Session> {
@@ -239,6 +317,7 @@ mod tests {
                 tabs: vec![
                     SavedQueryTab {
                         title: "Orders".into(),
+                        path: Some("/tmp/orders.sql".into()),
                         database: Some("shop".into()),
                         sql: "SELECT *\nFROM orders;".into(),
                     },
@@ -250,6 +329,41 @@ mod tests {
         };
         store.save_session(&session).unwrap();
         assert_eq!(store.load_session().unwrap(), session);
+    }
+
+    #[test]
+    fn ssh_secrets_and_known_hosts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        let id = Uuid::new_v4();
+        store.set_password(id, PasswordStore::Local, "db").unwrap();
+        store
+            .set_ssh_secret(id, PasswordStore::Local, "ssh")
+            .unwrap();
+        assert_eq!(
+            store.password(id, PasswordStore::Local).unwrap().as_deref(),
+            Some("db")
+        );
+        assert_eq!(
+            store
+                .ssh_secret(id, PasswordStore::Local)
+                .unwrap()
+                .as_deref(),
+            Some("ssh")
+        );
+        store.delete_ssh_secret(id, PasswordStore::Local).unwrap();
+        assert_eq!(store.ssh_secret(id, PasswordStore::Local).unwrap(), None);
+        assert_eq!(
+            store.password(id, PasswordStore::Local).unwrap().as_deref(),
+            Some("db")
+        );
+
+        assert_eq!(store.known_host("db.example", 22).unwrap(), None);
+        store.remember_host("db.example", 22, "SHA256:abc").unwrap();
+        assert_eq!(
+            store.known_host("db.example", 22).unwrap().as_deref(),
+            Some("SHA256:abc")
+        );
     }
 
     #[test]

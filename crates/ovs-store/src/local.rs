@@ -17,7 +17,6 @@ use base64::engine::general_purpose::STANDARD as B64;
 use chacha20poly1305::XChaCha20Poly1305;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 use crate::{Result, StoreError, read_toml, write_toml};
 
@@ -81,9 +80,10 @@ impl<'a> LocalSecrets<'a> {
         read_toml(&self.path(SECRETS_FILE))
     }
 
-    pub(crate) fn get(&self, id: Uuid) -> Result<Option<String>> {
+    /// `key` names the secret in the file; `aad` binds the ciphertext to it.
+    pub(crate) fn get(&self, key: &str, aad: &[u8]) -> Result<Option<String>> {
         let file = self.load()?;
-        let Some(sealed) = file.passwords.get(&id.to_string()) else {
+        let Some(sealed) = file.passwords.get(key) else {
             return Ok(None);
         };
         let path = self.path(SECRETS_FILE);
@@ -105,7 +105,7 @@ impl<'a> LocalSecrets<'a> {
                 nonce.try_into().map_err(|_| invalid(&path, "bad nonce"))?,
                 Payload {
                     msg: ciphertext,
-                    aad: id.as_bytes(),
+                    aad,
                 },
             )
             .map_err(|_| invalid(&path, "a stored password can't be decrypted; re-enter it"))?;
@@ -114,7 +114,7 @@ impl<'a> LocalSecrets<'a> {
             .map_err(|_| invalid(&path, "a stored password is damaged"))
     }
 
-    pub(crate) fn set(&self, id: Uuid, password: &str) -> Result<()> {
+    pub(crate) fn set(&self, key: &str, aad: &[u8], password: &str) -> Result<()> {
         let path = self.path(SECRETS_FILE);
         let cipher = self.cipher(true)?.expect("cipher is created on demand");
         let nonce: [u8; NONCE_LEN] = random(&path)?;
@@ -123,20 +123,20 @@ impl<'a> LocalSecrets<'a> {
                 (&nonce).into(),
                 Payload {
                     msg: password.as_bytes(),
-                    aad: id.as_bytes(),
+                    aad,
                 },
             )
             .map_err(|_| invalid(&path, "encryption failed"))?;
         let mut sealed = nonce.to_vec();
         sealed.extend_from_slice(&ciphertext);
         let mut file = self.load()?;
-        file.passwords.insert(id.to_string(), B64.encode(sealed));
+        file.passwords.insert(key.to_owned(), B64.encode(sealed));
         write_toml(&path, &file)
     }
 
-    pub(crate) fn delete(&self, id: Uuid) -> Result<()> {
+    pub(crate) fn delete(&self, key: &str) -> Result<()> {
         let mut file = self.load()?;
-        if file.passwords.remove(&id.to_string()).is_some() {
+        if file.passwords.remove(key).is_some() {
             write_toml(&self.path(SECRETS_FILE), &file)?;
         }
         Ok(())
@@ -173,27 +173,37 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use uuid::Uuid;
+
     use super::*;
+
+    fn get(s: &LocalSecrets<'_>, id: Uuid) -> Result<Option<String>> {
+        s.get(&id.to_string(), id.as_bytes())
+    }
+
+    fn set(s: &LocalSecrets<'_>, id: Uuid, password: &str) -> Result<()> {
+        s.set(&id.to_string(), id.as_bytes(), password)
+    }
 
     #[test]
     fn round_trip_and_isolation() {
         let dir = tempfile::tempdir().unwrap();
         let secrets = LocalSecrets::new(dir.path());
         let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
-        assert_eq!(secrets.get(a).unwrap(), None);
+        assert_eq!(get(&secrets, a).unwrap(), None);
 
-        secrets.set(a, "s3cret ü").unwrap();
-        secrets.set(b, "other").unwrap();
-        assert_eq!(secrets.get(a).unwrap().as_deref(), Some("s3cret ü"));
-        assert_eq!(secrets.get(b).unwrap().as_deref(), Some("other"));
+        set(&secrets, a, "s3cret ü").unwrap();
+        set(&secrets, b, "other").unwrap();
+        assert_eq!(get(&secrets, a).unwrap().as_deref(), Some("s3cret ü"));
+        assert_eq!(get(&secrets, b).unwrap().as_deref(), Some("other"));
 
         // Nothing readable on disk.
         let text = fs::read_to_string(dir.path().join(SECRETS_FILE)).unwrap();
         assert!(!text.contains("s3cret") && !text.contains("other"));
 
-        secrets.delete(a).unwrap();
-        assert_eq!(secrets.get(a).unwrap(), None);
-        assert_eq!(secrets.get(b).unwrap().as_deref(), Some("other"));
+        secrets.delete(&a.to_string()).unwrap();
+        assert_eq!(get(&secrets, a).unwrap(), None);
+        assert_eq!(get(&secrets, b).unwrap().as_deref(), Some("other"));
     }
 
     #[test]
@@ -201,13 +211,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let secrets = LocalSecrets::new(dir.path());
         let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
-        secrets.set(a, "for-a").unwrap();
+        set(&secrets, a, "for-a").unwrap();
         // Copy a's sealed password under b's id: decryption must fail, not return a's password.
         let mut file = secrets.load().unwrap();
         let sealed = file.passwords[&a.to_string()].clone();
         file.passwords.insert(b.to_string(), sealed);
         write_toml(&dir.path().join(SECRETS_FILE), &file).unwrap();
-        assert!(secrets.get(b).is_err());
+        assert!(get(&secrets, b).is_err());
     }
 
     #[cfg(unix)]
@@ -215,9 +225,7 @@ mod tests {
     fn key_file_is_private() {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().unwrap();
-        LocalSecrets::new(dir.path())
-            .set(Uuid::new_v4(), "x")
-            .unwrap();
+        set(&LocalSecrets::new(dir.path()), Uuid::new_v4(), "x").unwrap();
         let mode = fs::metadata(dir.path().join(KEY_FILE))
             .unwrap()
             .permissions()

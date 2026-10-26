@@ -1,11 +1,12 @@
 //! One connection: toolbar, object browser on the left, query tabs on the right, status bar at
 //! the bottom. Shown inside a connection tab of the main window.
 
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, IconName, Sizable as _,
-    button::{Button, ButtonVariants as _},
+    ActiveTheme as _, Disableable as _, IconName, Sizable as _, WindowExt as _,
+    button::{Button, ButtonVariant, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState},
     resizable::{h_resizable, resizable_panel},
@@ -15,21 +16,22 @@ use gpui_kit::component::{
 };
 use gpui_kit::{
     App, AppContext as _, Context, Entity, EntityId, EventEmitter, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Subscription, Window, div, px,
+    IntoElement, ParentElement as _, PathPromptOptions, Render, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, px,
 };
 use ovs_core::sql::Dialect;
 use ovs_core::{ConnectionConfig, ObjectKind};
 use ovs_store::SavedConnectionTab;
 
-use crate::browser::{BrowserEvent, ObjectBrowser};
+use crate::browser::{BrowserEvent, BuildSql, ObjectBrowser};
 use crate::completion::CompletionSource;
 use crate::query::{DEFAULT_ROW_LIMIT, QueryEvent, QueryTab, RunMode, TabSpec, format_duration};
 use crate::runtime::{self, SharedSession};
 use crate::tab_fit::{OnNew, OnSelect, TAB_BAR_RESERVED, TabFit, tab_list_menu};
 use crate::{
-    CloseQueryTab, ExecuteAll, ExecuteCurrent, NewConnection, NewQueryTab, RefreshBrowser,
-    StopQuery, WORKSPACE_CONTEXT,
+    CloseQueryTab, ExecuteAll, ExecuteCurrent, LowerCase, NewConnection, NewQueryTab, OpenSqlFile,
+    RefreshBrowser, SaveSqlFile, SaveSqlFileAs, StopQuery, ToggleComment, UpperCase,
+    WORKSPACE_CONTEXT,
 };
 
 struct InlineRename {
@@ -145,6 +147,9 @@ impl Workspace {
         let saved = restore.unwrap_or_default();
         for tab in saved.tabs {
             ws.add_tab(Some(tab.title), tab.database, tab.sql, false, window, cx);
+            if let (Some(path), Some(added)) = (tab.path, ws.tabs.last()) {
+                added.update(cx, |t, cx| t.set_path(Some(PathBuf::from(path)), cx));
+            }
         }
         if ws.tabs.is_empty() {
             let first_db = ws.config.database_filter().first().map(|s| (*s).to_owned());
@@ -345,7 +350,182 @@ impl Workspace {
                     tab.update(cx, |tab, cx| tab.set_database(db.clone(), cx));
                 }
             }
+            BrowserEvent::OpenSql {
+                title,
+                db,
+                sql,
+                run,
+            } => {
+                self.add_tab(
+                    Some(title.clone()),
+                    db.clone(),
+                    sql.clone(),
+                    *run,
+                    window,
+                    cx,
+                );
+            }
+            BrowserEvent::ConfirmExecute {
+                sql,
+                title,
+                description,
+                action,
+            } => {
+                let this = cx.entity().downgrade();
+                let (sql, title, description, action) = (
+                    sql.clone(),
+                    title.clone(),
+                    description.clone(),
+                    action.clone(),
+                );
+                window.open_alert_dialog(cx, move |alert, _, _| {
+                    let (this, sql) = (this.clone(), sql.clone());
+                    alert
+                        .title(title.clone())
+                        .description(description.clone())
+                        .confirm()
+                        .ok_text(action.clone())
+                        .ok_variant(ButtonVariant::Danger)
+                        .on_ok(move |_, window, cx| {
+                            let sql = sql.clone();
+                            this.update(cx, |this, cx| this.run_on_metadata(sql, window, cx))
+                                .ok();
+                            true
+                        })
+                });
+            }
+            BrowserEvent::PromptExecute {
+                title,
+                initial,
+                build,
+            } => self.prompt_execute(title.clone(), initial.clone(), build.clone(), window, cx),
         }
+    }
+
+    /// Runs a schema change on the metadata session, then refreshes the browser and
+    /// autocomplete. The outcome is reported as a notification.
+    fn run_on_metadata(&mut self, sql: String, window: &mut Window, cx: &mut Context<Self>) {
+        let session = self.completion.session.clone();
+        let statement = sql.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result =
+                runtime::run(async move { session.lock().await.execute(&statement, None).await })
+                    .await;
+            this.update_in(cx, |this, window, cx| {
+                match result {
+                    Ok(_) => window.push_notification(format!("Done: {sql}"), cx),
+                    Err(err) => window.push_notification(format!("Failed: {err}"), cx),
+                }
+                this.refresh(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Asks for a name, then runs the statement `build` makes from it.
+    fn prompt_execute(
+        &mut self,
+        title: String,
+        initial: String,
+        build: BuildSql,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(initial));
+        input.update(cx, |state, cx| {
+            state.focus(window, cx);
+            state.select_all(window, cx);
+        });
+        let this = cx.entity().downgrade();
+        // Enter runs inside this workspace's update, so it works on `this` directly.
+        let enter_build = build.clone();
+        self.subscriptions.push(cx.subscribe_in(
+            &input,
+            window,
+            move |this, input, event: &InputEvent, window, cx| {
+                if !matches!(event, InputEvent::PressEnter { .. }) {
+                    return;
+                }
+                let name = input.read(cx).value().trim().to_owned();
+                if !name.is_empty() {
+                    window.close_dialog(cx);
+                    this.run_on_metadata(enter_build(&name), window, cx);
+                }
+            },
+        ));
+        window.open_dialog(cx, move |dialog, _, _| {
+            let (this, input, build) = (this.clone(), input.clone(), build.clone());
+            dialog
+                .title(title.clone())
+                .w(px(420.))
+                .child(Input::new(&input))
+                .footer(
+                    h_flex()
+                        .gap_2()
+                        .justify_end()
+                        .child(
+                            Button::new("prompt-cancel")
+                                .label("Cancel")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(Button::new("prompt-ok").primary().label("OK").on_click(
+                            move |_, window, cx| {
+                                let name = input.read(cx).value().trim().to_owned();
+                                if name.is_empty() {
+                                    return;
+                                }
+                                window.close_dialog(cx);
+                                let sql = build(&name);
+                                this.update(cx, |this, cx| this.run_on_metadata(sql, window, cx))
+                                    .ok();
+                            },
+                        )),
+                )
+        });
+    }
+
+    /// Closes a query tab, asking first if it has unsaved grid edits.
+    fn request_close_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(ix) else { return };
+        let unsaved = tab.read(cx).unsaved_edit_rows(cx);
+        if unsaved == 0 {
+            self.close_tab(ix, window, cx);
+            return;
+        }
+        let this = cx.entity().downgrade();
+        let tab = tab.downgrade();
+        let title = tab
+            .upgrade()
+            .map(|t| t.read(cx).title())
+            .unwrap_or_default();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let (this, tab) = (this.clone(), tab.clone());
+            alert
+                .title("Close tab with unsaved changes?")
+                .description(format!(
+                    "\u{201c}{title}\u{201d} has {unsaved} edited row{} that haven't been saved.",
+                    if unsaved == 1 { "" } else { "s" }
+                ))
+                .confirm()
+                .ok_text("Discard and close")
+                .ok_variant(ButtonVariant::Danger)
+                .on_ok(move |_, window, cx| {
+                    let tab = tab.clone();
+                    this.update(cx, |this, cx| {
+                        // The tab may have moved since the dialog opened.
+                        if let Some(ix) = this
+                            .tabs
+                            .iter()
+                            .position(|t| Some(t.downgrade()) == Some(tab.clone()))
+                        {
+                            this.close_tab(ix, window, cx);
+                        }
+                    })
+                    .ok();
+                    true
+                })
+        });
     }
 
     fn close_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -451,7 +631,11 @@ impl Workspace {
         let on_select: OnSelect = Rc::new(move |ix, _, cx| {
             this.update(cx, |this, cx| this.select_tab(ix, cx)).ok();
         });
-        let titles = self.tabs.iter().map(|t| t.read(cx).title()).collect();
+        let titles = self
+            .tabs
+            .iter()
+            .map(|t| t.read(cx).display_title())
+            .collect();
         let bar = TabBar::new("query-tabs")
             .small()
             .max_width(tab_width)
@@ -465,7 +649,7 @@ impl Workspace {
             ))
             .selected_index(self.active)
             .children(self.tabs.iter().enumerate().map(|(ix, tab)| {
-                let title = tab.read(cx).title();
+                let title = tab.read(cx).display_title();
                 let editing = self
                     .renaming
                     .as_ref()
@@ -511,7 +695,7 @@ impl Workspace {
                             .xsmall()
                             .icon(IconName::Close)
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                this.close_tab(ix, window, cx);
+                                this.request_close_tab(ix, window, cx);
                             })),
                     )
             }))
@@ -566,6 +750,51 @@ impl Workspace {
         ))
     }
 
+    fn with_active_tab(
+        &mut self,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut QueryTab, &mut Context<QueryTab>),
+    ) {
+        if let Some(tab) = self.active_tab().cloned() {
+            tab.update(cx, f);
+        }
+    }
+
+    /// Asks for `.sql` files and opens each in a new query tab.
+    fn open_files(window: &mut Window, cx: &mut Context<Self>) {
+        let chosen = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Open".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = chosen.await else {
+                return;
+            };
+            for path in paths {
+                let contents = std::fs::read_to_string(&path);
+                this.update_in(cx, |this, window, cx| match contents {
+                    Ok(sql) => {
+                        let title = path.file_name().map_or_else(
+                            || "Query".to_owned(),
+                            |n| n.to_string_lossy().into_owned(),
+                        );
+                        let db = this.active_database(cx);
+                        this.add_tab(Some(title), db, sql, false, window, cx);
+                        if let Some(tab) = this.tabs.last() {
+                            tab.update(cx, |t, cx| t.set_path(Some(path), cx));
+                        }
+                    }
+                    Err(err) => window
+                        .push_notification(format!("Could not open {}: {err}", path.display()), cx),
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
     /// Reloads the object browser and forgets autocomplete's cached schema.
     fn refresh(&mut self, cx: &mut Context<Self>) {
         self.completion.invalidate();
@@ -607,7 +836,25 @@ impl Render for Workspace {
                 this.add_tab(None, db, String::new(), false, window, cx);
             }))
             .on_action(cx.listener(|this, _: &CloseQueryTab, window, cx| {
-                this.close_tab(this.active, window, cx);
+                this.request_close_tab(this.active, window, cx);
+            }))
+            .on_action(cx.listener(|_, _: &OpenSqlFile, window, cx| {
+                Self::open_files(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SaveSqlFile, window, cx| {
+                this.with_active_tab(cx, |tab, cx| tab.save_file(false, window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &SaveSqlFileAs, window, cx| {
+                this.with_active_tab(cx, |tab, cx| tab.save_file(true, window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &ToggleComment, window, cx| {
+                this.with_active_tab(cx, |tab, cx| tab.toggle_comment(window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &UpperCase, window, cx| {
+                this.with_active_tab(cx, |tab, cx| tab.change_case(true, window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &LowerCase, window, cx| {
+                this.with_active_tab(cx, |tab, cx| tab.change_case(false, window, cx));
             }))
             .size_full()
             .bg(cx.theme().background)

@@ -3,6 +3,7 @@
 //! Edits are kept as [`PendingEdits`] on top of the immutable result and only reach the server
 //! when the query tab saves them.
 
+use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui_kit::component::{
@@ -15,7 +16,7 @@ use gpui_kit::{
     App, AppContext as _, ClipboardItem, Context, Entity, IntoElement, ParentElement as _,
     Styled as _, Subscription, Window, div, px,
 };
-use ovs_core::editing::{EditTarget, PendingEdits};
+use ovs_core::editing::{EditTarget, KeyPlan, PendingEdits};
 use ovs_core::export::{ExportFormat, ExportOptions, export_to_string};
 use ovs_core::{ResultSet, Value};
 
@@ -52,6 +53,11 @@ struct CellEditor {
     _subscription: Subscription,
 }
 
+/// Sorts on the server instead of in memory: called with the column index and direction.
+pub type ServerSort = Rc<dyn Fn(usize, ColumnSort, &mut App)>;
+/// Opens the value viewer/editor for a cell (display row, column).
+pub type OpenValue = Rc<dyn Fn(usize, usize, &mut Window, &mut App)>;
+
 pub struct ResultGrid {
     data: Arc<ResultSet>,
     columns: Vec<Column>,
@@ -63,6 +69,9 @@ pub struct ResultGrid {
     editing: Option<CellEditor>,
     /// Last selected or right-clicked cell, as display coordinates.
     focused_cell: Option<(usize, usize)>,
+    /// Set when only a page of the rows is loaded, so sorting must re-query.
+    server_sort: Option<ServerSort>,
+    on_open_value: Option<OpenValue>,
 }
 
 impl ResultGrid {
@@ -85,7 +94,82 @@ impl ResultGrid {
             pending: PendingEdits::default(),
             editing: None,
             focused_cell: None,
+            server_sort: None,
+            on_open_value: None,
         }
+    }
+
+    pub fn set_on_open_value(&mut self, open: Option<OpenValue>) {
+        self.on_open_value = open;
+    }
+
+    pub fn column_name(&self, col: usize) -> Option<&str> {
+        self.data.columns.get(col).map(|c| c.name.as_str())
+    }
+
+    pub fn is_binary_column(&self, col: usize) -> bool {
+        self.data.columns.get(col).is_some_and(|c| c.binary)
+    }
+
+    pub fn is_cell_editable(&self, row: usize, col: usize) -> bool {
+        self.target().is_some_and(|t| t.is_column_editable(col))
+            && !matches!(self.slot(row), Some(Slot::Existing(r)) if self.pending.is_deleted(r))
+    }
+
+    /// The value shown in a cell; `None` for a new row's cell left to its default.
+    pub fn cell_value(&self, row: usize, col: usize) -> Option<Value> {
+        match self.cell(row, col)? {
+            Cell::Value(v) => Some(v.clone()),
+            Cell::Default => None,
+        }
+    }
+
+    /// Stores a new value for a cell as a pending change.
+    pub fn set_cell_value(&mut self, row: usize, col: usize, value: Value) {
+        if !self.is_cell_editable(row, col) {
+            return;
+        }
+        match self.slot(row) {
+            Some(Slot::Existing(r)) => {
+                if let Some(original) = self.data.rows.get(r).and_then(|row| row.get(col)) {
+                    self.pending.set_cell(r, col, value, original);
+                }
+            }
+            Some(Slot::Inserted(i)) => self.pending.set_inserted_cell(i, col, Some(value)),
+            None => {}
+        }
+    }
+
+    /// Copies a row into a new unsaved row, leaving key columns empty so they get new values.
+    pub fn duplicate_row(&mut self, row: usize) -> Option<usize> {
+        let target = self.target()?;
+        let keys: Vec<usize> = match &target.key {
+            KeyPlan::Unique(cols) => cols.clone(),
+            KeyPlan::AllColumns(_) => Vec::new(),
+        };
+        let values: Vec<Option<Value>> = (0..self.columns.len())
+            .map(|col| {
+                if keys.contains(&col) || !target.is_column_editable(col) {
+                    None
+                } else {
+                    self.cell_value(row, col)
+                }
+            })
+            .collect();
+        let ix = self.pending.add_row_with(values);
+        Some(self.order.len() + ix)
+    }
+
+    /// Shows `sort` on column `col`'s header, for rows that arrive already sorted.
+    pub fn with_sort(mut self, col: usize, sort: ColumnSort) -> Self {
+        if let Some(column) = self.columns.get_mut(col) {
+            *column = column.clone().sort(sort);
+        }
+        self
+    }
+
+    pub fn set_server_sort(&mut self, server_sort: Option<ServerSort>) {
+        self.server_sort = server_sort;
     }
 
     pub fn data(&self) -> &Arc<ResultSet> {
@@ -310,9 +394,14 @@ impl TableDelegate for ResultGrid {
         col_ix: usize,
         sort: ColumnSort,
         _: &mut Window,
-        _: &mut Context<TableState<Self>>,
+        cx: &mut Context<TableState<Self>>,
     ) {
         self.editing = None;
+        if let Some(server_sort) = self.server_sort.clone() {
+            // Runs after the table's update; the callback reads this table.
+            cx.defer(move |cx| server_sort(col_ix, sort, cx));
+            return;
+        }
         let rows = &self.data.rows;
         match sort {
             ColumnSort::Default => self.order = (0..rows.len()).collect(),
@@ -454,6 +543,21 @@ impl TableDelegate for ResultGrid {
                 PopupMenuItem::new("Copy all as SQL INSERT")
                     .on_click(copy_as(ExportFormat::SqlInsert)),
             );
+        // Context menus act on the right-clicked row and the column last clicked in it.
+        let col = self
+            .focused_cell
+            .filter(|(r, _)| *r == row_ix)
+            .map(|(_, c)| c);
+        // Row actions need the row even when no cell in it was clicked; `usize::MAX` marks
+        // "no column", which no column-level action accepts.
+        self.focused_cell = Some((row_ix, col.unwrap_or(usize::MAX)));
+        let menu = match (col, self.on_open_value.clone()) {
+            (Some(col), Some(open)) => menu.separator().item(
+                PopupMenuItem::new("View / edit value…")
+                    .on_click(move |_, window, cx| open(row_ix, col, window, cx)),
+            ),
+            _ => menu,
+        };
         if self.target().is_none() {
             return menu;
         }
@@ -471,14 +575,6 @@ impl TableDelegate for ResultGrid {
                     .ok();
             }
         };
-        // Context menus act on the right-clicked row and the column last clicked in it.
-        let col = self
-            .focused_cell
-            .filter(|(r, _)| *r == row_ix)
-            .map(|(_, c)| c);
-        // Row actions need the row even when no cell in it was clicked; `usize::MAX` marks
-        // "no column", which no column-level action accepts.
-        self.focused_cell = Some((row_ix, col.unwrap_or(usize::MAX)));
         let deleted =
             matches!(self.slot(row_ix), Some(Slot::Existing(r)) if self.pending.is_deleted(r));
         let menu = menu.separator();
@@ -492,7 +588,12 @@ impl TableDelegate for ResultGrid {
             ),
             _ => menu,
         };
-        menu.item(
+        menu.item(PopupMenuItem::new("Duplicate row").on_click(edit(|grid| {
+            if let Some((row, _)) = grid.focused_cell {
+                grid.duplicate_row(row);
+            }
+        })))
+        .item(
             PopupMenuItem::new(if deleted {
                 "Undo delete row"
             } else {

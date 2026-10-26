@@ -39,6 +39,19 @@ OVS_TEST_MYSQL=127.0.0.1:33307:root:secret cargo test -p ovs-mysql --test live
 
 Without the variable these tests return early and pass, so `cargo test` works offline.
 
+SSH tunnel tests need an SSH server that can reach MySQL:
+
+```sh
+docker network create ovs-net && docker network connect ovs-net ovs-mysql
+docker run -d --name ovs-ssh --network ovs-net -p 2222:22 alpine:3.20 sh -c \
+  "apk add --no-cache openssh && ssh-keygen -A && adduser -D tunnel && \
+   echo tunnel:secret | chpasswd && \
+   sed -i 's/^AllowTcpForwarding no/AllowTcpForwarding yes/' /etc/ssh/sshd_config && \
+   echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config && exec /usr/sbin/sshd -D -e"
+
+OVS_TEST_SSH=127.0.0.1:2222:tunnel:secret:ovs-mysql:3306 cargo test -p ovs-ssh -p ovs-app
+```
+
 ## Where data lives
 
 | What | macOS | Windows |

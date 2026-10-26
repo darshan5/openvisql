@@ -30,6 +30,12 @@ actions!(
         ExecuteAll,
         StopQuery,
         RefreshBrowser,
+        OpenSqlFile,
+        SaveSqlFile,
+        SaveSqlFileAs,
+        ToggleComment,
+        UpperCase,
+        LowerCase,
         Quit
     ]
 );
@@ -59,6 +65,12 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-shift-enter", ExecuteAll, ws),
         KeyBinding::new("secondary-.", StopQuery, ws),
         KeyBinding::new("f5", RefreshBrowser, ws),
+        KeyBinding::new("secondary-o", OpenSqlFile, ws),
+        KeyBinding::new("secondary-s", SaveSqlFile, ws),
+        KeyBinding::new("secondary-shift-s", SaveSqlFileAs, ws),
+        KeyBinding::new("secondary-/", ToggleComment, ws),
+        KeyBinding::new("secondary-shift-u", UpperCase, ws),
+        KeyBinding::new("secondary-shift-l", LowerCase, ws),
         // Suggestions on demand; they also open by themselves while typing.
         KeyBinding::new("ctrl-space", ShowCompletions, Some("Input")),
     ]);
@@ -80,7 +92,19 @@ fn set_menus(cx: &mut App) {
                 MenuItem::action("Previous Connection", PreviousConnection),
                 MenuItem::separator(),
                 MenuItem::action("New Query Tab", NewQueryTab),
+                MenuItem::action("Open SQL File…", OpenSqlFile),
+                MenuItem::action("Save", SaveSqlFile),
+                MenuItem::action("Save As…", SaveSqlFileAs),
                 MenuItem::action("Close Query Tab", CloseQueryTab),
+            ],
+            disabled: false,
+        },
+        Menu {
+            name: "Edit".into(),
+            items: vec![
+                MenuItem::action("Toggle Comment", ToggleComment),
+                MenuItem::action("UPPERCASE", UpperCase),
+                MenuItem::action("lowercase", LowerCase),
             ],
             disabled: false,
         },

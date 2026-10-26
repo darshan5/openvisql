@@ -7,8 +7,6 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock, PoisonError};
 
-use uuid::Uuid;
-
 use crate::Result;
 
 const SERVICE: &str = "openvisql";
@@ -21,43 +19,44 @@ enum Known {
     Missing,
 }
 
-fn cache() -> &'static Mutex<HashMap<Uuid, Known>> {
-    static CACHE: OnceLock<Mutex<HashMap<Uuid, Known>>> = OnceLock::new();
+fn cache() -> &'static Mutex<HashMap<String, Known>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Known>>> = OnceLock::new();
     CACHE.get_or_init(Mutex::default)
 }
 
-fn cached(id: Uuid) -> Option<Known> {
+fn cached(account: &str) -> Option<Known> {
     cache()
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .get(&id)
+        .get(account)
         .cloned()
 }
 
-fn remember(id: Uuid, known: Known) {
+fn remember(account: &str, known: Known) {
     cache()
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .insert(id, known);
+        .insert(account.to_owned(), known);
 }
 
-fn entry(id: Uuid) -> keyring::Result<keyring::Entry> {
-    keyring::Entry::new(SERVICE, &id.to_string())
+fn entry(account: &str) -> keyring::Result<keyring::Entry> {
+    keyring::Entry::new(SERVICE, account)
 }
 
-pub fn get_password(id: Uuid) -> Result<Option<String>> {
-    match cached(id) {
+/// `account` is the connection id, with a `:ssh` suffix for SSH secrets.
+pub fn get_password(account: &str) -> Result<Option<String>> {
+    match cached(account) {
         Some(Known::Stored(p)) => return Ok(Some(p)),
         Some(Known::Missing) => return Ok(None),
         None => {}
     }
-    match entry(id)?.get_password() {
+    match entry(account)?.get_password() {
         Ok(p) => {
-            remember(id, Known::Stored(p.clone()));
+            remember(account, Known::Stored(p.clone()));
             Ok(Some(p))
         }
         Err(keyring::Error::NoEntry) => {
-            remember(id, Known::Missing);
+            remember(account, Known::Missing);
             Ok(None)
         }
         Err(e) => Err(e.into()),
@@ -65,22 +64,22 @@ pub fn get_password(id: Uuid) -> Result<Option<String>> {
 }
 
 /// Stores `password`, skipping the keychain write when it already holds that value.
-pub fn set_password(id: Uuid, password: &str) -> Result<()> {
-    if matches!(cached(id), Some(Known::Stored(p)) if p == password) {
+pub fn set_password(account: &str, password: &str) -> Result<()> {
+    if matches!(cached(account), Some(Known::Stored(p)) if p == password) {
         return Ok(());
     }
-    entry(id)?.set_password(password)?;
-    remember(id, Known::Stored(password.to_owned()));
+    entry(account)?.set_password(password)?;
+    remember(account, Known::Stored(password.to_owned()));
     Ok(())
 }
 
-pub fn delete_password(id: Uuid) -> Result<()> {
-    if cached(id) == Some(Known::Missing) {
+pub fn delete_password(account: &str) -> Result<()> {
+    if cached(account) == Some(Known::Missing) {
         return Ok(());
     }
-    match entry(id)?.delete_credential() {
+    match entry(account)?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => {
-            remember(id, Known::Missing);
+            remember(account, Known::Missing);
             Ok(())
         }
         Err(e) => Err(e.into()),

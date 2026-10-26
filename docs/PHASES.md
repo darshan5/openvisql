@@ -35,6 +35,21 @@ Behaviour targets come from [FEATURE_SPEC.md](FEATURE_SPEC.md). Source code that
 Progress:
 - ✅ Export (2026-10-25)
 - ✅ Autocomplete (2026-10-25)
+- ✅ Result paging, WHERE filter and server-side sorting (2026-10-26)
+- ✗ History tab: dropped at the user's request. Statements are still saved to
+  `history.toml`.
+- ✅ Editor basics: open/save `.sql`, toggle comment, change case (2026-10-26)
+- ✅ Grid editing extras (2026-10-26):
+  - unsaved-edit warnings
+  - TEXT/BLOB value editor
+  - duplicate row
+  - choose the table to edit for joins
+- ✅ Object operations and Info (2026-10-26):
+  - create/drop/truncate/rename
+  - CREATE templates
+  - statement templates
+  - Info tabs
+- ✅ SSH tunnels (2026-10-26)
 - Done along the way:
   - inline tab rename and tab-list dropdowns with a "New" item
   - Save, Discard, + Row and Export in the results bar

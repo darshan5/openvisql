@@ -1,0 +1,19 @@
+[package]
+name = "ovs-ssh"
+description = "SSH tunnels for OpenViSQL connections"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+russh = { version = "0.65", default-features = false, features = ["ring", "rsa", "flate2"] }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net", "io-util"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["net", "io-util", "macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

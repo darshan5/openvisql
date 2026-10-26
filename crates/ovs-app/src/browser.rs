@@ -19,6 +19,7 @@ use gpui_kit::{
 };
 use ovs_core::ObjectKind;
 use ovs_core::sql::Dialect;
+use ovs_core::sql::templates::{self, StatementTemplate};
 
 use crate::runtime::{self, SharedSession};
 
@@ -185,7 +186,11 @@ enum Loaded {
     Failed(String),
 }
 
+/// Builds a statement from a name the user typed.
+pub type BuildSql = Rc<dyn Fn(&str) -> String>;
+
 /// Requests the browser makes of its workspace.
+#[derive(Clone)]
 pub enum BrowserEvent {
     /// Show a table's or view's rows.
     OpenData { db: String, name: String },
@@ -199,6 +204,26 @@ pub enum BrowserEvent {
     UseDatabase(String),
     /// Insert text at the cursor of the active query editor.
     InsertText(String),
+    /// Open SQL in a new query tab, running it when `run` is set.
+    OpenSql {
+        title: String,
+        db: Option<String>,
+        sql: String,
+        run: bool,
+    },
+    /// Run a statement after the user confirms (title, explanation), then refresh.
+    ConfirmExecute {
+        sql: String,
+        title: String,
+        description: String,
+        action: String,
+    },
+    /// Ask for a name, then run the statement built from it and refresh.
+    PromptExecute {
+        title: String,
+        initial: String,
+        build: BuildSql,
+    },
 }
 
 impl EventEmitter<BrowserEvent> for ObjectBrowser {}
@@ -435,10 +460,9 @@ impl ObjectBrowser {
     fn context_menu(this: &WeakEntity<Self>, node: Option<&Node>, menu: PopupMenu) -> PopupMenu {
         let emit = |event: BrowserEvent| {
             let this = this.clone();
-            let event = Rc::new(event);
             move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| {
                 let event = event.clone();
-                this.update(cx, |_, cx| cx.emit(clone_event(&event))).ok();
+                this.update(cx, |_, cx| cx.emit(event)).ok();
             }
         };
         let refresh = {
@@ -452,11 +476,49 @@ impl ObjectBrowser {
                 cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
             }
         };
+        let new_object = |kind: ObjectKind, db: &str, table: Option<&str>| {
+            emit(BrowserEvent::OpenSql {
+                title: format!("New {}", kind.sql_keyword().to_lowercase()),
+                db: Some(db.to_owned()),
+                sql: templates::create_template(kind, db, table),
+                run: false,
+            })
+        };
+        let create_database = emit(BrowserEvent::PromptExecute {
+            title: "Create database".into(),
+            initial: String::new(),
+            build: Rc::new(templates::create_database),
+        });
+        let drop = |kind: ObjectKind, db: &str, name: &str| {
+            let what = kind.sql_keyword().to_lowercase();
+            let detail = match kind {
+                ObjectKind::Database => "and every table, view and routine in it",
+                ObjectKind::Table => "and all of its rows",
+                _ => "",
+            };
+            emit(BrowserEvent::ConfirmExecute {
+                sql: templates::drop_object(kind, db, name),
+                title: format!("Drop {what} {name}?"),
+                description: format!(
+                    "This permanently deletes the {what} \u{201c}{name}\u{201d} {detail}. It can't be undone."
+                ),
+                action: format!("Drop {what}"),
+            })
+        };
+
         let menu = match node {
             Some(Node::Database(db)) => menu
                 .item(
                     PopupMenuItem::new("Use in query tab")
                         .on_click(emit(BrowserEvent::UseDatabase(db.clone()))),
+                )
+                .item(
+                    PopupMenuItem::new("Info").on_click(emit(BrowserEvent::OpenSql {
+                        title: format!("{db} (info)"),
+                        db: Some(db.clone()),
+                        sql: templates::database_info(db),
+                        run: true,
+                    })),
                 )
                 .item(PopupMenuItem::new("Show CREATE DATABASE").on_click(emit(
                     BrowserEvent::ShowDdl {
@@ -465,20 +527,70 @@ impl ObjectBrowser {
                         kind: ObjectKind::Database,
                     },
                 )))
+                .separator()
+                .item(PopupMenuItem::new("New table…").on_click(new_object(
+                    ObjectKind::Table,
+                    db,
+                    None,
+                )))
+                .item(PopupMenuItem::new("New view…").on_click(new_object(
+                    ObjectKind::View,
+                    db,
+                    None,
+                )))
+                .item(
+                    PopupMenuItem::new("New stored procedure…").on_click(new_object(
+                        ObjectKind::Procedure,
+                        db,
+                        None,
+                    )),
+                )
+                .item(PopupMenuItem::new("New function…").on_click(new_object(
+                    ObjectKind::Function,
+                    db,
+                    None,
+                )))
+                .item(PopupMenuItem::new("New event…").on_click(new_object(
+                    ObjectKind::Event,
+                    db,
+                    None,
+                )))
+                .separator()
+                .item(PopupMenuItem::new("Create database…").on_click(create_database))
                 .item(PopupMenuItem::new("Copy name").on_click(copy(db.clone())))
+                .item(PopupMenuItem::new("Drop database…").on_click(drop(
+                    ObjectKind::Database,
+                    db,
+                    db,
+                )))
+                .separator(),
+            Some(Node::Folder { db, kind }) if *kind != ObjectKind::Trigger => menu
+                .item(
+                    PopupMenuItem::new(format!("New {}…", kind.sql_keyword().to_lowercase()))
+                        .on_click(new_object(*kind, db, None)),
+                )
                 .separator(),
             Some(Node::Object { db, kind, name, .. }) => {
-                let menu = if kind.has_data() {
-                    menu.item(PopupMenuItem::new("Open data").on_click(emit(
+                let mut menu = menu;
+                if kind.has_data() {
+                    menu = menu.item(PopupMenuItem::new("Open data").on_click(emit(
                         BrowserEvent::OpenData {
                             db: db.clone(),
                             name: name.clone(),
                         },
-                    )))
-                } else {
-                    menu
-                };
-                menu.item(
+                    )));
+                }
+                if *kind == ObjectKind::Table {
+                    menu = menu.item(PopupMenuItem::new("Info").on_click(emit(
+                        BrowserEvent::OpenSql {
+                            title: format!("{name} (info)"),
+                            db: Some(db.clone()),
+                            sql: templates::table_info(db, name),
+                            run: true,
+                        },
+                    )));
+                }
+                menu = menu.item(
                     PopupMenuItem::new(format!("Show CREATE {}", kind.sql_keyword())).on_click(
                         emit(BrowserEvent::ShowDdl {
                             db: db.clone(),
@@ -486,9 +598,58 @@ impl ObjectBrowser {
                             kind: *kind,
                         }),
                     ),
-                )
-                .item(PopupMenuItem::new("Copy name").on_click(copy(name.clone())))
-                .separator()
+                );
+                if kind.has_data() {
+                    menu = menu.separator();
+                    for template in StatementTemplate::ALL {
+                        let (this, db, name) = (this.clone(), db.clone(), name.clone());
+                        menu = menu.item(
+                            PopupMenuItem::new(format!("Paste {} statement", template.label()))
+                                .on_click(move |_, _, cx| {
+                                    let (db, name) = (db.clone(), name.clone());
+                                    this.update(cx, |this, cx| {
+                                        this.paste_statement(template, db, name, cx);
+                                    })
+                                    .ok();
+                                }),
+                        );
+                    }
+                }
+                menu = menu.separator();
+                if *kind == ObjectKind::Table {
+                    let (rename_db, rename_from) = (db.clone(), name.clone());
+                    menu = menu
+                        .item(PopupMenuItem::new("New trigger…").on_click(new_object(
+                            ObjectKind::Trigger,
+                            db,
+                            Some(name),
+                        )))
+                        .item(PopupMenuItem::new("Rename…").on_click(emit(
+                            BrowserEvent::PromptExecute {
+                                title: format!("Rename table {name}"),
+                                initial: name.clone(),
+                                build: Rc::new(move |to| {
+                                    templates::rename_table(&rename_db, &rename_from, to)
+                                }),
+                            },
+                        )))
+                        .item(PopupMenuItem::new("Truncate…").on_click(emit(
+                            BrowserEvent::ConfirmExecute {
+                                sql: templates::truncate_table(db, name),
+                                title: format!("Truncate table {name}?"),
+                                description: format!(
+                                    "This deletes every row of \u{201c}{name}\u{201d}. It can't be undone."
+                                ),
+                                action: "Truncate".into(),
+                            },
+                        )));
+                }
+                menu.item(PopupMenuItem::new("Copy name").on_click(copy(name.clone())))
+                    .item(
+                        PopupMenuItem::new(format!("Drop {}…", kind.sql_keyword().to_lowercase()))
+                            .on_click(drop(*kind, db, name)),
+                    )
+                    .separator()
             }
             Some(Node::Leaf { label, .. }) => menu
                 .item(PopupMenuItem::new("Copy name").on_click(copy(label.clone())))
@@ -496,6 +657,37 @@ impl ObjectBrowser {
             _ => menu,
         };
         menu.item(PopupMenuItem::new("Refresh").on_click(refresh))
+    }
+
+    /// Inserts a SELECT/INSERT/UPDATE/DELETE for a table at the editor cursor, after loading
+    /// its columns.
+    fn paste_statement(
+        &mut self,
+        template: StatementTemplate,
+        db: String,
+        table: String,
+        cx: &mut Context<Self>,
+    ) {
+        let session = self.session.clone();
+        cx.spawn(async move |this, cx| {
+            let (d, t) = (db.clone(), table.clone());
+            let columns =
+                runtime::run(async move { session.lock().await.list_columns(&d, &t).await }).await;
+            this.update(cx, |_, cx| {
+                if let Ok(columns) = columns {
+                    let sql = templates::statement_template(
+                        template,
+                        &db,
+                        &table,
+                        &columns,
+                        crate::query::DEFAULT_ROW_LIMIT,
+                    );
+                    cx.emit(BrowserEvent::InsertText(sql));
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Double-click behaviour: open data for tables and views, DDL for routines, and insert the
@@ -522,22 +714,6 @@ impl ObjectBrowser {
             _ => return,
         };
         cx.emit(event);
-    }
-}
-
-fn clone_event(event: &BrowserEvent) -> BrowserEvent {
-    match event {
-        BrowserEvent::OpenData { db, name } => BrowserEvent::OpenData {
-            db: db.clone(),
-            name: name.clone(),
-        },
-        BrowserEvent::ShowDdl { db, name, kind } => BrowserEvent::ShowDdl {
-            db: db.clone(),
-            name: name.clone(),
-            kind: *kind,
-        },
-        BrowserEvent::UseDatabase(db) => BrowserEvent::UseDatabase(db.clone()),
-        BrowserEvent::InsertText(text) => BrowserEvent::InsertText(text.clone()),
     }
 }
 

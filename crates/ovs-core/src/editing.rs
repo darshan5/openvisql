@@ -38,18 +38,23 @@ pub enum KeyPlan {
 
 /// The single `(schema, table)` every non-expression column comes from, if there is one.
 pub fn single_source_table(rs: &ResultSet) -> Option<(String, String)> {
-    let mut source: Option<(&str, &str)> = None;
-    for col in &rs.columns {
-        if col.table.is_empty() {
-            continue;
-        }
-        match source {
-            None => source = Some((&col.schema, &col.table)),
-            Some(s) if s == (col.schema.as_str(), col.table.as_str()) => {}
-            Some(_) => return None,
+    let mut tables = source_tables(rs);
+    if tables.len() == 1 {
+        tables.pop()
+    } else {
+        None
+    }
+}
+
+/// Every distinct `(schema, table)` the result's columns come from, in column order.
+pub fn source_tables(rs: &ResultSet) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for col in rs.columns.iter().filter(|c| !c.table.is_empty()) {
+        if !out.iter().any(|(s, t)| *s == col.schema && *t == col.table) {
+            out.push((col.schema.clone(), col.table.clone()));
         }
     }
-    source.map(|(s, t)| (s.to_owned(), t.to_owned()))
+    out
 }
 
 impl EditTarget {
@@ -61,10 +66,26 @@ impl EditTarget {
         indexes: &[IndexInfo],
     ) -> Option<Self> {
         let (schema, table) = single_source_table(rs)?;
+        Self::detect_for(rs, &schema, &table, table_columns, indexes)
+    }
+
+    /// Like [`Self::detect`], editing only the columns of `schema.table`; the result may come
+    /// from several tables (a join). Columns of other tables stay read-only.
+    pub fn detect_for(
+        rs: &ResultSet,
+        schema: &str,
+        table: &str,
+        table_columns: &[ColumnInfo],
+        indexes: &[IndexInfo],
+    ) -> Option<Self> {
+        let (schema, table) = (schema.to_owned(), table.to_owned());
         let columns: Vec<Option<String>> = rs
             .columns
             .iter()
-            .map(|c| (c.table == table && !c.origin_name.is_empty()).then(|| c.origin_name.clone()))
+            .map(|c| {
+                (c.table == table && c.schema == schema && !c.origin_name.is_empty())
+                    .then(|| c.origin_name.clone())
+            })
             .collect();
         if columns.iter().all(Option::is_none) {
             return None;
@@ -197,6 +218,13 @@ impl PendingEdits {
 
     pub fn is_deleted(&self, row: usize) -> bool {
         self.deletes.contains(&row)
+    }
+
+    /// Adds a row pre-filled with `values` (e.g. a duplicated row) and returns its index among
+    /// inserted rows.
+    pub fn add_row_with(&mut self, values: Vec<Option<Value>>) -> usize {
+        self.inserts.push(values);
+        self.inserts.len() - 1
     }
 
     /// Adds an empty row and returns its index among inserted rows.
@@ -361,6 +389,33 @@ mod tests {
         // Nullable unique columns can't identify a row.
         let target = EditTarget::detect(&rs, &[info("code", true)], &indexes).unwrap();
         assert_eq!(target.key, KeyPlan::AllColumns(vec![0, 1]));
+    }
+
+    #[test]
+    fn joins_can_edit_one_chosen_table() {
+        let mut rs = orders();
+        rs.columns.push(col("name", "customers", "VARCHAR"));
+        for row in &mut rs.rows {
+            row.push(Value::Text("x".into()));
+        }
+        assert_eq!(
+            source_tables(&rs),
+            [
+                ("shop".to_owned(), "orders".to_owned()),
+                ("shop".to_owned(), "customers".to_owned())
+            ]
+        );
+        let target = EditTarget::detect_for(
+            &rs,
+            "shop",
+            "orders",
+            &[],
+            &[index("PRIMARY", &["id"], true)],
+        )
+        .unwrap();
+        assert!(target.is_column_editable(1));
+        assert!(!target.is_column_editable(3), "customers.name is read-only");
+        assert_eq!(target.key, KeyPlan::Unique(vec![0]));
     }
 
     #[test]

@@ -13,6 +13,7 @@ rust-version = "1.92"
 [workspace.dependencies]
 ovs-core = { path = "crates/ovs-core" }
 ovs-mysql = { path = "crates/ovs-mysql" }
+ovs-ssh = { path = "crates/ovs-ssh" }
 ovs-store = { path = "crates/ovs-store" }
 
 anyhow = "1"
