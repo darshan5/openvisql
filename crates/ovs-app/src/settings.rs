@@ -43,7 +43,27 @@ pub fn apply_theme(window: Option<&mut Window>, cx: &mut App) {
     }
 }
 
-const THEMES: [ThemePreference; 3] = [
+/// Switches to `theme` and remembers it. A failure to save is ignored: the theme still
+/// changes for this session.
+pub fn set_theme(theme: ThemePreference, window: &mut Window, cx: &mut App) {
+    let mut preferences = prefs(cx).clone();
+    preferences.theme = theme;
+    let _ = Store::default().save_preferences(&preferences);
+    cx.set_global(Prefs(preferences));
+    apply_theme(Some(window), cx);
+    cx.refresh_windows();
+}
+
+/// The name of a theme choice, as menus show it.
+pub fn theme_label(theme: ThemePreference) -> &'static str {
+    match theme {
+        ThemePreference::System => "Match System",
+        ThemePreference::Light => "Light",
+        ThemePreference::Dark => "Dark",
+    }
+}
+
+pub const THEMES: [ThemePreference; 3] = [
     ThemePreference::System,
     ThemePreference::Light,
     ThemePreference::Dark,
@@ -129,7 +149,7 @@ impl Render for SettingsForm {
                     .child(
                         Field::new().label("Theme").child(
                             RadioGroup::horizontal("settings-theme")
-                                .children(["System", "Light", "Dark"])
+                                .children(THEMES.map(theme_label))
                                 .selected_index(theme_ix)
                                 .on_change(cx.listener(|this, ix: &usize, _, cx| {
                                     this.theme = THEMES[*ix];

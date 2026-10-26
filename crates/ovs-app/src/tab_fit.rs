@@ -25,6 +25,8 @@ pub const MIN_TAB_WIDTH: f32 = 90.;
 pub const MAX_TAB_WIDTH: f32 = 220.;
 /// Space kept free in a tab bar for the "+" button and the overflow menu button.
 pub const TAB_BAR_RESERVED: f32 = 72.;
+/// Extra space the connection tab bar keeps for its appearance and settings buttons.
+pub const APP_BUTTONS_WIDTH: f32 = 56.;
 
 /// Measured width of a tab bar, shared between the view and the element that measures it.
 #[derive(Clone, Default)]

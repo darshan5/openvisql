@@ -43,6 +43,9 @@ actions!(
         UpperCase,
         LowerCase,
         OpenSettings,
+        ThemeSystem,
+        ThemeLight,
+        ThemeDark,
         Quit
     ]
 );
@@ -117,6 +120,15 @@ fn set_menus(cx: &mut App) {
                 MenuItem::action("Toggle Comment", ToggleComment),
                 MenuItem::action("UPPERCASE", UpperCase),
                 MenuItem::action("lowercase", LowerCase),
+            ],
+            disabled: false,
+        },
+        Menu {
+            name: "View".into(),
+            items: vec![
+                MenuItem::action("Appearance: Match System", ThemeSystem),
+                MenuItem::action("Appearance: Light", ThemeLight),
+                MenuItem::action("Appearance: Dark", ThemeDark),
             ],
             disabled: false,
         },

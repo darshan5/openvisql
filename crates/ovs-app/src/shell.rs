@@ -13,22 +13,24 @@ use gpui_kit::component::{
     ActiveTheme as _, Icon, IconName, Sizable as _,
     button::{Button, ButtonVariants as _},
     h_flex,
+    menu::{DropdownMenu as _, PopupMenuItem},
     tab::{Tab, TabBar},
     v_flex,
 };
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, FocusHandle, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, SharedString, Styled as _, Subscription, Task, Window, div, px,
+    Anchor, App, AppContext as _, Context, Entity, FocusHandle, InteractiveElement as _,
+    IntoElement, ParentElement as _, Render, SharedString, Styled as _, Subscription, Task, Window,
+    div, px,
 };
-use ovs_store::{SavedConnectionTab, Session, Store};
+use ovs_store::{SavedConnectionTab, Session, Store, ThemePreference};
 use uuid::Uuid;
 
 use crate::connect::{ConnectEvent, ConnectView};
-use crate::tab_fit::{TAB_BAR_RESERVED, TabFit, tab_list_menu};
+use crate::tab_fit::{APP_BUTTONS_WIDTH, TAB_BAR_RESERVED, TabFit, tab_list_menu};
 use crate::workspace::{Workspace, WorkspaceEvent};
 use crate::{
-    CloseConnection, NewConnection, NextConnection, OpenSettings, PreviousConnection,
-    window_options,
+    CloseConnection, NewConnection, NextConnection, OpenSettings, PreviousConnection, ThemeDark,
+    ThemeLight, ThemeSystem, window_options,
 };
 
 /// Delay between the last change and writing the session file.
@@ -289,6 +291,15 @@ impl Render for AppShell {
             .on_action(cx.listener(|_, _: &OpenSettings, window, cx| {
                 crate::settings::open(window, cx);
             }))
+            .on_action(cx.listener(|_, _: &ThemeSystem, window, cx| {
+                crate::settings::set_theme(ThemePreference::System, window, cx);
+            }))
+            .on_action(cx.listener(|_, _: &ThemeLight, window, cx| {
+                crate::settings::set_theme(ThemePreference::Light, window, cx);
+            }))
+            .on_action(cx.listener(|_, _: &ThemeDark, window, cx| {
+                crate::settings::set_theme(ThemePreference::Dark, window, cx);
+            }))
             .on_action(cx.listener(|this, _: &NewConnection, window, cx| {
                 this.show_connections(window, cx);
             }))
@@ -304,31 +315,47 @@ impl Render for AppShell {
                     .child(self.tab_fit.measure(cx.entity_id()))
                     .child(
                         TabBar::new("connection-tabs")
-                            .suffix(tab_list_menu(
-                                "connection-tab-list",
-                                "New connection",
-                                self.tabs.iter().map(|t| Self::tab_label(t, cx)).collect(),
-                                self.active,
-                                Rc::new({
-                                    let this = this.clone();
-                                    move |window, cx| {
-                                        this.update(cx, |this, cx| {
-                                            this.show_connections(window, cx);
-                                        })
-                                        .ok();
-                                    }
-                                }),
-                                Rc::new({
-                                    let this = this.clone();
-                                    move |ix, _, cx| {
-                                        this.update(cx, |this, cx| this.select(ix, cx)).ok();
-                                    }
-                                }),
-                            ))
-                            .max_width(
-                                self.tab_fit
-                                    .tab_width(self.tabs.len(), px(TAB_BAR_RESERVED)),
+                            .suffix(
+                                h_flex()
+                                    .items_center()
+                                    .child(theme_menu(cx))
+                                    .child(
+                                        Button::new("open-settings")
+                                            .ghost()
+                                            .xsmall()
+                                            .icon(IconName::Settings)
+                                            .tooltip("Settings (⌘, / Ctrl+,)")
+                                            .on_click(|_, window, cx| {
+                                                crate::settings::open(window, cx);
+                                            }),
+                                    )
+                                    .child(tab_list_menu(
+                                        "connection-tab-list",
+                                        "New connection",
+                                        self.tabs.iter().map(|t| Self::tab_label(t, cx)).collect(),
+                                        self.active,
+                                        Rc::new({
+                                            let this = this.clone();
+                                            move |window, cx| {
+                                                this.update(cx, |this, cx| {
+                                                    this.show_connections(window, cx);
+                                                })
+                                                .ok();
+                                            }
+                                        }),
+                                        Rc::new({
+                                            let this = this.clone();
+                                            move |ix, _, cx| {
+                                                this.update(cx, |this, cx| this.select(ix, cx))
+                                                    .ok();
+                                            }
+                                        }),
+                                    )),
                             )
+                            .max_width(self.tab_fit.tab_width(
+                                self.tabs.len(),
+                                px(TAB_BAR_RESERVED + APP_BUTTONS_WIDTH),
+                            ))
                             .selected_index(self.active)
                             .on_click(cx.listener(|this, ix: &usize, _, cx| this.select(*ix, cx)))
                             .children(tabs)
@@ -349,4 +376,30 @@ impl Render for AppShell {
             )
             .child(div().flex_1().min_h_0().child(content))
     }
+}
+
+/// The appearance button: a sun or moon for the current look, with a menu of the choices.
+fn theme_menu(cx: &App) -> impl IntoElement {
+    let current = crate::settings::prefs(cx).theme;
+    let icon = if cx.theme().mode.is_dark() {
+        IconName::Moon
+    } else {
+        IconName::Sun
+    };
+    Button::new("theme-menu")
+        .ghost()
+        .xsmall()
+        .icon(icon)
+        .tooltip("Appearance")
+        .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
+            crate::settings::THEMES.iter().fold(menu, |menu, &theme| {
+                menu.item(
+                    PopupMenuItem::new(crate::settings::theme_label(theme))
+                        .checked(theme == current)
+                        .on_click(move |_, window, cx| {
+                            crate::settings::set_theme(theme, window, cx);
+                        }),
+                )
+            })
+        })
 }
