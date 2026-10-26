@@ -27,7 +27,7 @@ jobs:
       matrix:
         include:
           - { os: macos-latest, target: aarch64-apple-darwin, formats: "app,dmg" }
-          - { os: macos-13, target: x86_64-apple-darwin, formats: "app,dmg" }
+          - { os: macos-latest, target: x86_64-apple-darwin, formats: "app,dmg" }
           - { os: windows-latest, target: x86_64-pc-windows-msvc, formats: "nsis" }
     runs-on: ${{ matrix.os }}
     env:
