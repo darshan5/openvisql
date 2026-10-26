@@ -1,0 +1,111 @@
+name: Release
+
+# Pushing a tag like v0.2.0 builds installers and attaches them to a draft GitHub release.
+# Signing is optional: without the secrets below, unsigned packages are built.
+#
+# macOS signing and notarization:
+#   APPLE_CERTIFICATE (base64 .p12), APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY,
+#   APPLE_ID, APPLE_PASSWORD (app-specific), APPLE_TEAM_ID
+# Windows Authenticode:
+#   WINDOWS_CERTIFICATE (base64 .pfx), WINDOWS_CERTIFICATE_PASSWORD
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-latest, target: aarch64-apple-darwin, formats: "app,dmg" }
+          - { os: macos-13, target: x86_64-apple-darwin, formats: "app,dmg" }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, formats: "nsis" }
+    runs-on: ${{ matrix.os }}
+    env:
+      # Step conditions can't read secrets directly, so expose whether they're set.
+      HAS_APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE != '' }}
+      HAS_WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install cargo-packager
+        run: cargo install cargo-packager --locked --version 0.11.8
+
+      - name: Package
+        shell: bash
+        env:
+          CARGO_BUILD_TARGET: ${{ matrix.target }}
+          SECRET_APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          SECRET_APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          SECRET_APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          SECRET_APPLE_ID: ${{ secrets.APPLE_ID }}
+          SECRET_APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          SECRET_APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          cd crates/ovs-app
+          # cargo-packager imports the certificate and notarizes from these variables, and takes
+          # the signing identity from its config. Only set them when the secrets exist, since
+          # missing secrets arrive as empty strings.
+          if [ "$RUNNER_OS" = macOS ] && [ "$HAS_APPLE_CERTIFICATE" = true ]; then
+            printf 'signing-identity = "%s"\n' "$SECRET_APPLE_SIGNING_IDENTITY" >> Cargo.toml
+            export APPLE_CERTIFICATE="$SECRET_APPLE_CERTIFICATE"
+            export APPLE_CERTIFICATE_PASSWORD="$SECRET_APPLE_CERTIFICATE_PASSWORD"
+            if [ -n "$SECRET_APPLE_ID" ]; then
+              export APPLE_ID="$SECRET_APPLE_ID" APPLE_PASSWORD="$SECRET_APPLE_PASSWORD" \
+                APPLE_TEAM_ID="$SECRET_APPLE_TEAM_ID"
+            fi
+          fi
+          cargo packager --release --target ${{ matrix.target }} --formats ${{ matrix.formats }}
+
+      - name: Sign the Windows installer
+        if: runner.os == 'Windows' && env.HAS_WINDOWS_CERTIFICATE == 'true'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          [IO.File]::WriteAllBytes("cert.pfx", [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" | Select-Object -Last 1
+          Get-ChildItem target/packages/*.exe | ForEach-Object {
+            & $signtool.FullName sign /f cert.pfx /p $env:WINDOWS_CERTIFICATE_PASSWORD /fd sha256 /tr http://timestamp.digicert.com /td sha256 $_.FullName
+          }
+          Remove-Item cert.pfx
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openvisql-${{ matrix.target }}
+          path: |
+            target/packages/*.dmg
+            target/packages/*.exe
+          if-no-files-found: error
+
+  release:
+    needs: package
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create a draft release with the installers
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist/* \
+            --repo "${GITHUB_REPOSITORY}" --draft --generate-notes \
+            --title "OpenViSQL ${GITHUB_REF_NAME#v}"

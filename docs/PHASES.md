@@ -142,6 +142,9 @@ Phase 4 is complete.
 
 ## Packaging
 
-- macOS: `.app` bundle and `.dmg` (cargo-packager), code signing and notarization.
-- Windows: MSI or NSIS installer, Authenticode signing.
-- A GitHub Actions release workflow that attaches the artifacts to tags.
+- ✅ macOS `.app` bundle and `.dmg`, Windows NSIS installer (cargo-packager), with an app icon.
+- ✅ A GitHub Actions release workflow that builds them on tags (Apple Silicon, Intel,
+  Windows) and attaches them to a draft release.
+- ✅ Signing and notarization run when the certificate secrets are set; see
+  [DEPLOYMENT.md](DEPLOYMENT.md#signing).
+- Auto-update.

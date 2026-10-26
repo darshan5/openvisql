@@ -80,7 +80,12 @@ the right, and results below.
   - theme: system, light or dark
   - whether "Execute all" stops at the first error
 
-## Install and run
+## Download
+
+Installers for macOS (Apple Silicon and Intel `.dmg`) and Windows (`-setup.exe`) are
+attached to [GitHub releases](https://github.com/darshan5/openvisql/releases).
+
+## Build from source
 
 Prerequisites:
 - Rust 1.92 or newer

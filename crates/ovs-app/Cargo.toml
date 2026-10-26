@@ -28,3 +28,27 @@ uuid.workspace = true
 
 [lints]
 workspace = true
+
+# Installers, built with `cargo packager --release` from this directory (see
+# .github/workflows/release.yml).
+[package.metadata.packager]
+product-name = "OpenViSQL"
+identifier = "io.github.darshan5.openvisql"
+description = "A fast, native SQL client for MySQL, MariaDB, PostgreSQL and SQLite"
+homepage = "https://github.com/darshan5/openvisql"
+authors = ["OpenViSQL contributors"]
+publisher = "OpenViSQL"
+copyright = "Copyright (c) 2026 OpenViSQL contributors"
+license-file = "../../LICENSE"
+category = "DeveloperTool"
+icons = ["icons/icon.icns", "icons/icon.ico", "icons/icon.png"]
+out-dir = "../../target/packages"
+before-packaging-command = "cargo build --release -p ovs-app"
+binaries = [{ path = "openvisql", main = true }]
+
+[package.metadata.packager.nsis]
+installer-mode = "currentUser"
+
+# Keep this table last: the release workflow appends the signing identity to it.
+[package.metadata.packager.macos]
+minimum-system-version = "11.0"
