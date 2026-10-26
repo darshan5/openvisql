@@ -2,12 +2,12 @@
 //! selected connection's settings on the right.
 
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, IconName, Sizable as _, StyledExt as _,
-    button::{Button, ButtonVariants as _},
+    ActiveTheme as _, Disableable as _, IconName, Sizable as _, StyledExt as _, WindowExt as _,
+    button::{Button, ButtonVariant, ButtonVariants as _},
     checkbox::Checkbox,
     form::{Field, Form},
     h_flex,
-    input::{Input, InputState},
+    input::{Input, InputEvent, InputState},
     list::ListItem,
     radio::RadioGroup,
     v_flex,
@@ -15,10 +15,10 @@ use gpui_kit::component::{
 use gpui_kit::{
     App, AppContext as _, Axis, Context, Entity, EventEmitter, InteractiveElement as _,
     IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Window, div, prelude::FluentBuilder as _, px,
+    Styled as _, Subscription, Window, div, prelude::FluentBuilder as _, px,
 };
-use ovs_core::{ConnectionConfig, SslMode};
-use ovs_store::{Store, secrets};
+use ovs_core::{ConnectionConfig, PasswordStore, SslMode};
+use ovs_store::Store;
 use uuid::Uuid;
 
 use crate::runtime::{self, SharedSession};
@@ -60,7 +60,11 @@ pub struct ConnectView {
     databases: Entity<InputState>,
     ssl_ca: Entity<InputState>,
     init_commands: Entity<InputState>,
+    /// The user typed in the password field. Until then the stored password is used, and it is
+    /// only read from the keychain when connecting, so browsing connections never prompts.
+    password_edited: bool,
     status: Status,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl ConnectView {
@@ -74,6 +78,13 @@ impl ConnectView {
             let placeholder = SharedString::from(placeholder.to_owned());
             cx.new(|cx| InputState::new(window, cx).placeholder(placeholder))
         };
+        let password = cx.new(|cx| InputState::new(window, cx).masked(true));
+        let password_sub = cx.subscribe(&password, |this, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                this.password_edited = true;
+                cx.notify();
+            }
+        });
         let mut view = Self {
             store,
             editing: ConnectionConfig::default(),
@@ -81,38 +92,18 @@ impl ConnectView {
             host: input("localhost", window, cx),
             port: input("3306", window, cx),
             user: input("root", window, cx),
-            password: cx.new(|cx| InputState::new(window, cx).masked(true)),
+            password: password.clone(),
             databases: input("All databases (or db1;db2)", window, cx),
             ssl_ca: input("Path to CA certificate (PEM), optional", window, cx),
             init_commands: input("SET NAMES utf8mb4; SET time_zone = '+00:00'", window, cx),
+            password_edited: false,
             status,
             connections,
+            _subscriptions: vec![password_sub],
         };
         let first = view.connections.first().cloned().unwrap_or_default();
         view.load(first, window, cx);
         view
-    }
-
-    /// Name of the connection shown in the form.
-    pub fn editing_name(&self) -> String {
-        self.editing.name.clone()
-    }
-
-    /// Selects saved connection `id` and connects to it if its password is available, which
-    /// is how the previous session is restored. Returns false if the connection no longer
-    /// exists.
-    pub fn reconnect(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let Some(config) = self.connections.iter().find(|c| c.id == id).cloned() else {
-            return false;
-        };
-        let has_password = config.save_password;
-        self.load(config, window, cx);
-        if has_password {
-            self.connect(cx);
-        } else {
-            self.status = Status::Failed("Enter the password to reconnect.".into());
-        }
-        true
     }
 
     fn is_saved(&self) -> bool {
@@ -121,14 +112,6 @@ impl ConnectView {
 
     /// Fills the form from `config`, including its stored password.
     fn load(&mut self, config: ConnectionConfig, window: &mut Window, cx: &mut Context<Self>) {
-        let password = if config.save_password {
-            secrets::get_password(config.id).unwrap_or_else(|err| {
-                self.status = Status::Failed(format!("Could not read the saved password: {err}"));
-                None
-            })
-        } else {
-            None
-        };
         let set = |state: &Entity<InputState>,
                    value: String,
                    window: &mut Window,
@@ -139,7 +122,9 @@ impl ConnectView {
         set(&self.host, config.host.clone(), window, cx);
         set(&self.port, config.port.to_string(), window, cx);
         set(&self.user, config.user.clone(), window, cx);
-        set(&self.password, password.unwrap_or_default(), window, cx);
+        // Left empty: a saved password stays in the keychain until it's needed.
+        set(&self.password, String::new(), window, cx);
+        self.password_edited = false;
         set(&self.databases, config.databases.clone(), window, cx);
         set(
             &self.ssl_ca,
@@ -188,16 +173,48 @@ impl ConnectView {
             ..self.editing.clone()
         };
         // Passwords may legitimately have surrounding spaces.
-        let password = self.password.read(cx).value().to_string();
+        let typed = self.password.read(cx).value().to_string();
+        // Read from where the password was saved, which may differ from a store the user has
+        // just picked but not saved yet.
+        let saved = self.saved(config.id).filter(|c| c.save_password);
+        let password = match saved {
+            Some(saved) if !self.password_edited => self
+                .store
+                .password(config.id, saved.password_store)
+                .map_err(|e| format!("Could not read the saved password: {e}"))?
+                .unwrap_or(typed),
+            _ => typed,
+        };
         Ok((config, password))
     }
 
+    fn saved(&self, id: Uuid) -> Option<&ConnectionConfig> {
+        self.connections.iter().find(|c| c.id == id)
+    }
+
+    /// Saves `config`, and its password in the store it names. Only the stores involved are
+    /// touched, so connections that don't use the keychain never trigger a keychain prompt.
     fn persist(&mut self, config: &ConnectionConfig, password: &str) -> Result<(), String> {
+        let err = |e: ovs_store::StoreError| e.to_string();
+        let previous = self
+            .saved(config.id)
+            .filter(|c| c.save_password)
+            .map(|c| c.password_store);
         if config.save_password {
-            secrets::set_password(config.id, password).map_err(|e| e.to_string())?;
-        } else {
-            secrets::delete_password(config.id).map_err(|e| e.to_string())?;
+            let moved = previous.is_some_and(|p| p != config.password_store);
+            // An untouched field means the stored password is still current.
+            if self.password_edited || moved || previous.is_none() {
+                self.store
+                    .set_password(config.id, config.password_store, password)
+                    .map_err(err)?;
+            }
+            if let Some(old) = previous.filter(|_| moved) {
+                self.store.delete_password(config.id, old).map_err(err)?;
+            }
+        } else if let Some(old) = previous {
+            self.store.delete_password(config.id, old).map_err(err)?;
         }
+        self.password_edited = false;
         match self.connections.iter_mut().find(|c| c.id == config.id) {
             Some(existing) => *existing = config.clone(),
             None => self.connections.push(config.clone()),
@@ -224,14 +241,55 @@ impl ConnectView {
         cx.notify();
     }
 
+    /// Throws away unsaved edits: reloads the saved settings, or leaves a new connection.
+    fn cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let saved = self
+            .connections
+            .iter()
+            .find(|c| c.id == self.editing.id)
+            .or_else(|| self.connections.first())
+            .cloned()
+            .unwrap_or_default();
+        self.status = Status::Idle;
+        self.load(saved, window, cx);
+    }
+
+    fn confirm_delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let this = cx.entity().downgrade();
+        let name = self.editing.name.clone();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let this = this.clone();
+            alert
+                .title("Delete connection?")
+                .description(format!(
+                    "\u{201c}{name}\u{201d} and its saved password will be removed. Open tabs \
+                     using it stay connected until closed."
+                ))
+                .confirm()
+                .ok_text("Delete")
+                .ok_variant(ButtonVariant::Danger)
+                .on_ok(move |_, window, cx| {
+                    this.update(cx, |this, cx| this.delete(window, cx)).ok();
+                    true
+                })
+        });
+    }
+
     fn delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let id = self.editing.id;
+        let stored_in = self
+            .saved(id)
+            .filter(|c| c.save_password)
+            .map(|c| c.password_store);
         self.connections.retain(|c| c.id != id);
         let result = self
             .store
             .save_connections(&self.connections)
-            .map_err(|e| e.to_string())
-            .and_then(|()| secrets::delete_password(id).map_err(|e| e.to_string()));
+            .and_then(|()| match stored_in {
+                Some(store) => self.store.delete_password(id, store),
+                None => Ok(()),
+            })
+            .map_err(|e| e.to_string());
         let next = self.connections.first().cloned().unwrap_or_default();
         self.load(next, window, cx);
         self.status = match result {
@@ -317,8 +375,9 @@ impl ConnectView {
     fn render_saved_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let editing_id = self.editing.id;
         let unsaved = !self.is_saved();
+        let busy = matches!(self.status, Status::Busy(_));
         v_flex()
-            .w(px(240.))
+            .w(px(300.))
             .h_full()
             .border_r_1()
             .border_color(cx.theme().border)
@@ -357,18 +416,55 @@ impl ConnectView {
                         ListItem::new(SharedString::from(id.to_string()))
                             .selected(id == editing_id)
                             .child(
-                                v_flex().child(c.name.clone()).child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(c.endpoint()),
-                                ),
+                                h_flex()
+                                    .w_full()
+                                    .gap_2()
+                                    .justify_between()
+                                    .child(
+                                        v_flex()
+                                            .min_w_0()
+                                            .overflow_hidden()
+                                            .child(div().truncate().child(c.name.clone()))
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .truncate()
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .child(c.endpoint()),
+                                            ),
+                                    )
+                                    .child(
+                                        Button::new(SharedString::from(format!("connect-{id}")))
+                                            .xsmall()
+                                            .icon(IconName::Play)
+                                            .label("Connect")
+                                            .disabled(busy)
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.connect_saved(id, window, cx);
+                                            })),
+                                    ),
                             )
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.select(id, window, cx);
-                            }))
+                            // Single click edits the connection; double click connects.
+                            .on_click(cx.listener(
+                                move |this, event: &gpui_kit::ClickEvent, window, cx| {
+                                    if event.click_count() >= 2 {
+                                        this.connect_saved(id, window, cx);
+                                    } else {
+                                        this.select(id, window, cx);
+                                    }
+                                },
+                            ))
                     })),
             )
+    }
+
+    /// Connects to a saved connection straight from the list.
+    fn connect_saved(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.status, Status::Busy(_)) {
+            return;
+        }
+        self.select(id, window, cx);
+        self.connect(cx);
     }
 
     fn select(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
@@ -388,9 +484,79 @@ impl ConnectView {
             Status::Failed(msg) => div().text_color(cx.theme().danger).child(msg.clone()),
         };
 
+        let title = if self.is_saved() {
+            self.editing.name.clone()
+        } else {
+            "New connection".to_owned()
+        };
         v_flex()
             .flex_1()
             .h_full()
+            .child(
+                h_flex()
+                    .px_4()
+                    .py_2()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .font_semibold()
+                            .child(title),
+                    )
+                    .child(
+                        Button::new("connect")
+                            .primary()
+                            .label("Connect")
+                            .loading(busy)
+                            .disabled(busy)
+                            .on_click(cx.listener(|this, _, _, cx| this.connect(cx))),
+                    )
+                    .child(
+                        Button::new("test")
+                            .label("Test")
+                            .disabled(busy)
+                            .on_click(cx.listener(|this, _, _, cx| this.test(cx))),
+                    )
+                    .child(
+                        Button::new("save")
+                            .label("Save")
+                            .disabled(busy)
+                            .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
+                    )
+                    .child(
+                        Button::new("cancel")
+                            .label("Cancel")
+                            .disabled(busy)
+                            .tooltip("Discard unsaved changes")
+                            .on_click(cx.listener(|this, _, window, cx| this.cancel(window, cx))),
+                    )
+                    .when(self.is_saved(), |row| {
+                        row.child(
+                            Button::new("delete")
+                                .label("Delete")
+                                .danger()
+                                .disabled(busy)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.confirm_delete(window, cx);
+                                })),
+                        )
+                    }),
+            )
+            .when(!matches!(self.status, Status::Idle), |panel| {
+                panel.child(
+                    div()
+                        .px_4()
+                        .py_1p5()
+                        .text_sm()
+                        .border_b_1()
+                        .border_color(cx.theme().border)
+                        .child(status),
+                )
+            })
             .child(
                 v_flex()
                     .id("connection-form")
@@ -408,12 +574,27 @@ impl ConnectView {
                             .child(
                                 Field::new()
                                     .label("Password")
+                                    .when(
+                                        self.editing.save_password
+                                            && self.is_saved()
+                                            && !self.password_edited,
+                                        |field| {
+                                            field.description(match self.editing.password_store {
+                                                PasswordStore::Keychain => {
+                                                    "Saved in the system keychain. Type to replace it."
+                                                }
+                                                PasswordStore::Local => {
+                                                    "Saved on this computer, encrypted. Type to replace it."
+                                                }
+                                            })
+                                        },
+                                    )
                                     .child(Input::new(&self.password).mask_toggle()),
                             )
                             .child(
                                 Field::new().label_indent(true).child(
                                     Checkbox::new("save-password")
-                                        .label("Save password in the system keychain")
+                                        .label("Save password")
                                         .checked(self.editing.save_password)
                                         .on_change(cx.listener(|this, value: &bool, _, cx| {
                                             this.editing.save_password = *value;
@@ -421,6 +602,41 @@ impl ConnectView {
                                         })),
                                 ),
                             )
+                            .when(self.editing.save_password, |form| {
+                                form.child(
+                                    Field::new()
+                                        .label("Save in")
+                                        .description(match self.editing.password_store {
+                                            PasswordStore::Keychain => {
+                                                "macOS Keychain / Windows Credential Manager. The \
+                                                 system may ask to allow access."
+                                            }
+                                            PasswordStore::Local => {
+                                                "Encrypted file in the app's settings folder, \
+                                                 readable only by your user account. No system \
+                                                 prompts."
+                                            }
+                                        })
+                                        .child(
+                                            RadioGroup::horizontal("password-store")
+                                                .children(["System keychain", "This computer (encrypted)"])
+                                                .selected_index(Some(
+                                                    match self.editing.password_store {
+                                                        PasswordStore::Keychain => 0,
+                                                        PasswordStore::Local => 1,
+                                                    },
+                                                ))
+                                                .on_change(cx.listener(|this, ix: &usize, _, cx| {
+                                                    this.editing.password_store = if *ix == 0 {
+                                                        PasswordStore::Keychain
+                                                    } else {
+                                                        PasswordStore::Local
+                                                    };
+                                                    cx.notify();
+                                                })),
+                                        ),
+                                )
+                            })
                             .child(
                                 Field::new()
                                     .label("Databases")
@@ -473,45 +689,6 @@ impl ConnectView {
                                         })),
                                 ),
                             ),
-                    ),
-            )
-            .child(
-                h_flex()
-                    .p_3()
-                    .gap_2()
-                    .border_t_1()
-                    .border_color(cx.theme().border)
-                    .child(div().flex_1().text_sm().child(status))
-                    .when(self.is_saved(), |row| {
-                        row.child(
-                            Button::new("delete")
-                                .label("Delete")
-                                .danger()
-                                .disabled(busy)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.delete(window, cx);
-                                })),
-                        )
-                    })
-                    .child(
-                        Button::new("test")
-                            .label("Test")
-                            .disabled(busy)
-                            .on_click(cx.listener(|this, _, _, cx| this.test(cx))),
-                    )
-                    .child(
-                        Button::new("save")
-                            .label("Save")
-                            .disabled(busy)
-                            .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
-                    )
-                    .child(
-                        Button::new("connect")
-                            .primary()
-                            .label("Connect")
-                            .loading(busy)
-                            .disabled(busy)
-                            .on_click(cx.listener(|this, _, _, cx| this.connect(cx))),
                     ),
             )
     }

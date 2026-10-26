@@ -8,7 +8,9 @@ pub mod keywords;
 mod lexer;
 mod splitter;
 
-pub use analyze::{StatementKind, apply_row_limit, classify, count_query, missing_where};
+pub use analyze::{
+    LimitClause, StatementKind, apply_row_limit, classify, count_query, limit_clause, missing_where,
+};
 pub use dialect::Dialect;
 pub use edit::{CellEdit, RowEdit, RowKey, generate_edit};
 pub use lexer::{Token, TokenKind, tokenize};

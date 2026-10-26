@@ -36,6 +36,17 @@ pub enum SslMode {
     Required,
 }
 
+/// Where a saved password is kept.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PasswordStore {
+    /// The OS credential store (macOS Keychain, Windows Credential Manager).
+    #[default]
+    Keychain,
+    /// An encrypted file in the app's config directory; avoids keychain prompts.
+    Local,
+}
+
 /// A saved connection. Passwords are never stored here; see `ovs-store`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -49,6 +60,8 @@ pub struct ConnectionConfig {
     /// Databases to show in the object browser, separated by `;`. Empty shows all.
     pub databases: String,
     pub save_password: bool,
+    /// Where the password is saved when `save_password` is set.
+    pub password_store: PasswordStore,
     pub ssl: SslMode,
     /// Optional path to a PEM CA bundle used when `ssl` is `Required`.
     pub ssl_ca: Option<String>,
@@ -72,6 +85,7 @@ impl Default for ConnectionConfig {
             user: "root".to_owned(),
             databases: String::new(),
             save_password: true,
+            password_store: PasswordStore::default(),
             ssl: SslMode::default(),
             ssl_ca: None,
             compress: false,

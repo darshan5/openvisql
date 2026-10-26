@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 use super::lexer::{TokenKind, tokenize};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,10 +95,60 @@ pub fn apply_row_limit(sql: &str, limit: usize) -> Option<String> {
     Some(format!("{} LIMIT {limit}", sql.trim_end()))
 }
 
-/// Wraps a `SELECT` so it returns the number of rows the original would produce. Used to show
-/// "50 of 20,000 rows" after an automatic `LIMIT`.
+/// A top-level `LIMIT` clause.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LimitClause {
+    pub row_count: u64,
+    pub offset: u64,
+    /// Byte range of the clause, from `LIMIT` to its last number.
+    pub range: Range<usize>,
+}
+
+/// Finds the statement's own top-level `LIMIT n`, `LIMIT offset, n` or `LIMIT n OFFSET m`.
+/// Limits inside subqueries are ignored, and so is a `LIMIT` with placeholders or variables.
+pub fn limit_clause(sql: &str) -> Option<LimitClause> {
+    let tokens: Vec<_> = tokenize(sql)
+        .into_iter()
+        .filter(|t| !t.kind.is_trivia())
+        .collect();
+    let mut depth = 0i32;
+    for (i, tok) in tokens.iter().enumerate() {
+        match tok.kind {
+            TokenKind::Punct if tok.text(sql) == "(" => depth += 1,
+            TokenKind::Punct if tok.text(sql) == ")" => depth -= 1,
+            TokenKind::Word if depth == 0 && tok.text(sql).eq_ignore_ascii_case("limit") => {
+                let number = |j: usize| -> Option<u64> {
+                    let t = tokens.get(j)?;
+                    (t.kind == TokenKind::Number).then(|| t.text(sql).parse().ok())?
+                };
+                let first = number(i + 1)?;
+                let next = tokens.get(i + 2);
+                let (row_count, offset, last) = match next.map(|t| t.text(sql)) {
+                    Some(",") => (number(i + 3)?, first, i + 3),
+                    Some(w) if w.eq_ignore_ascii_case("offset") => (first, number(i + 3)?, i + 3),
+                    _ => (first, 0, i + 1),
+                };
+                return Some(LimitClause {
+                    row_count,
+                    offset,
+                    range: tok.range.start..tokens[last].range.end,
+                });
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Wraps a `SELECT` so it returns the number of rows the original would produce without its
+/// own top-level `LIMIT`. Used to show "Showing 50 of 20,000 rows".
 pub fn count_query(sql: &str) -> String {
-    format!("SELECT COUNT(*) FROM ({}) AS ovs_count", sql.trim())
+    let sql = sql.trim();
+    let body = match limit_clause(sql) {
+        Some(limit) => format!("{}{}", &sql[..limit.range.start], &sql[limit.range.end..]),
+        None => sql.to_owned(),
+    };
+    format!("SELECT COUNT(*) FROM ({}) AS ovs_count", body.trim())
 }
 
 /// True for an `UPDATE` or `DELETE` with no top-level `WHERE`, i.e. one that would touch every
@@ -144,6 +196,22 @@ mod tests {
             count_query(" select * from t order by a "),
             "SELECT COUNT(*) FROM (select * from t order by a) AS ovs_count"
         );
+        assert_eq!(
+            count_query("select * from t limit 50"),
+            "SELECT COUNT(*) FROM (select * from t) AS ovs_count"
+        );
+    }
+
+    #[test]
+    fn finds_top_level_limit() {
+        let l = limit_clause("SELECT * FROM t LIMIT 50").unwrap();
+        assert_eq!((l.row_count, l.offset), (50, 0));
+        let l = limit_clause("select 1 from t limit 10, 25").unwrap();
+        assert_eq!((l.row_count, l.offset), (25, 10));
+        let l = limit_clause("select 1 from t limit 25 offset 10 for update").unwrap();
+        assert_eq!((l.row_count, l.offset), (25, 10));
+        assert_eq!(limit_clause("select * from (select 1 limit 5) x"), None);
+        assert_eq!(limit_clause("select * from t limit ?"), None);
     }
 
     #[test]

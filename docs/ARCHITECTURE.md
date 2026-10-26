@@ -78,13 +78,26 @@ OpenViSQL is MIT-licensed, so its code must stay compatible with MIT:
   - Edits round-trip without precision loss.
   - No server-side statement cache builds up for each tab.
 
-## ADR-003: Passwords in the OS keychain
+## ADR-003: Passwords in the keychain or an encrypted local file
 
-- **Date:** 2026-10-25
-- **Context:** Encrypting passwords in a settings file with a key that ships in the binary is
-  obfuscation, not protection.
-- **Decision:** Passwords go to the platform credential store through the `keyring` crate,
-  keyed by connection UUID. `connections.toml` never contains secrets.
+- **Date:** 2026-10-25 (revised the same day to add the local option)
+- **Context:**
+  - Encrypting passwords in a settings file with a key that ships in the binary is
+    obfuscation, not protection.
+  - The OS keychain can prompt for access, and does so again after every rebuild of an
+    unsigned development binary.
+- **Decision:** each connection chooses where its password goes (`PasswordStore`):
+  - **Keychain:** the platform credential store through the `keyring` crate, keyed by
+    connection UUID.
+  - **Local:** XChaCha20-Poly1305 in `secrets.toml`, with each password bound to its
+    connection id as associated data. The key is random, created on first use, and kept in
+    `secret.key` (mode 0600).
+  - `connections.toml` never contains secrets.
+  - Passwords are read only when connecting and cached for the process. Unchanged passwords
+    are never rewritten, so a connection that doesn't use the keychain never touches it.
+- **Consequences:** the local store protects against the settings files being copied or read
+  by other accounts. It does not protect against someone who can already read the user's own
+  files, because the key sits beside them.
 
 ## ADR-004: Automatic `LIMIT` for plain SELECTs
 
@@ -114,11 +127,14 @@ OpenViSQL is MIT-licensed, so its code must stay compatible with MIT:
 - **Consequences:** MyISAM tables can't roll back. The footer warns when the all-columns
   fallback is in use.
 
-## ADR-006: Session restore
+## ADR-006: Query tabs persist per connection; nothing connects at startup
 
-- **Date:** 2026-10-25
-- **Decision:** `session.toml` records the open connection tabs (by connection id) and each
-  query tab's title, database and SQL. It is written 700 ms after the last change and on quit.
-- **Consequences:** On launch, connections with a saved password reconnect automatically.
-  The others show the form and ask for the password. Tabs whose connection was deleted are
-  dropped.
+- **Date:** 2026-10-25 (revised: auto-reconnect removed at the user's request)
+- **Decision:**
+  - `session.toml` records each connection's query tabs (title, database, SQL), keyed by
+    connection id. It is written 700 ms after the last change, on close, and on quit.
+  - The app always opens on the connection manager with no open connections.
+  - Connecting to a connection restores its saved tabs.
+- **Consequences:**
+  - Startup never touches the network or the keychain.
+  - Saved tabs for a deleted connection are simply never restored.

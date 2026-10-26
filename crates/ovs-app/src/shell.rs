@@ -1,8 +1,9 @@
 //! The main window: a strip of connection tabs on top, each holding either the connection
 //! manager (for a tab that isn't connected yet) or a connected workspace.
 //!
-//! The open connections and their query tabs are saved to the session file a moment after
-//! every change and when the app quits, and reopened on the next launch.
+//! The app always starts on the connection manager with nothing connected. Each connection's
+//! query tabs are saved to the session file (a moment after every change and on quit) and come
+//! back when the user connects to that connection again.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -10,17 +11,19 @@ use std::time::Duration;
 use gpui_kit::component::{
     ActiveTheme as _, Icon, IconName, Sizable as _,
     button::{Button, ButtonVariants as _},
+    h_flex,
     tab::{Tab, TabBar},
     v_flex,
 };
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, EntityId, FocusHandle, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, SharedString, Styled as _, Subscription, Task, Window,
-    div,
+    App, AppContext as _, Context, Entity, FocusHandle, InteractiveElement as _, IntoElement,
+    ParentElement as _, Render, SharedString, Styled as _, Subscription, Task, Window, div, px,
 };
 use ovs_store::{SavedConnectionTab, Session, Store};
+use uuid::Uuid;
 
 use crate::connect::{ConnectEvent, ConnectView};
+use crate::tab_fit::{TAB_BAR_RESERVED, TabFit};
 use crate::workspace::{Workspace, WorkspaceEvent};
 use crate::{CloseConnection, NewConnection, NextConnection, PreviousConnection, window_options};
 
@@ -46,9 +49,11 @@ pub struct AppShell {
     store: Store,
     tabs: Vec<ShellTab>,
     active: usize,
-    /// Saved query tabs waiting for their connection tab to finish connecting, by view id.
-    pending: HashMap<EntityId, SavedConnectionTab>,
+    /// Saved query tabs of connections that aren't open, by connection id. They are restored
+    /// when the connection is opened and kept in the session file until then.
+    saved_tabs: HashMap<Uuid, SavedConnectionTab>,
     save_task: Option<Task<()>>,
+    tab_fit: TabFit,
     subscriptions: Vec<Subscription>,
 }
 
@@ -66,33 +71,20 @@ impl AppShell {
             store: Store::default(),
             tabs: Vec::new(),
             active: 0,
-            pending: HashMap::new(),
+            saved_tabs: HashMap::new(),
             save_task: None,
+            tab_fit: TabFit::default(),
             subscriptions: vec![quit],
         };
-        shell.restore(window, cx);
-        shell
-    }
-
-    /// Reopens the connection tabs from the last session, connecting each one again.
-    fn restore(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // A corrupt session file shouldn't stop the app from starting.
-        let session = self.store.load_session().unwrap_or_default();
-        for saved in session.connections {
-            let Some(id) = saved.connection else { continue };
-            let view = self.push_connect_tab(window, cx);
-            let known = view.update(cx, |view, cx| view.reconnect(id, window, cx));
-            if known {
-                self.pending.insert(view.entity_id(), saved);
-            } else {
-                // The saved connection was deleted since; drop the tab.
-                self.tabs.pop();
-            }
-        }
-        if self.tabs.is_empty() {
-            self.push_connect_tab(window, cx);
-        }
-        self.active = session.active.min(self.tabs.len() - 1);
+        let session = shell.store.load_session().unwrap_or_default();
+        shell.saved_tabs = session
+            .connections
+            .into_iter()
+            .filter_map(|saved| Some((saved.connection?, saved)))
+            .collect();
+        shell.push_connect_tab(window, cx);
+        shell
     }
 
     fn push_connect_tab(
@@ -111,9 +103,10 @@ impl AppShell {
 
     /// Shows the connection manager, reusing an unconnected tab if one is open.
     fn show_connections(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let existing = self.tabs.iter().position(
-            |t| matches!(t, ShellTab::Connect(v) if !self.pending.contains_key(&v.entity_id())),
-        );
+        let existing = self
+            .tabs
+            .iter()
+            .position(|t| matches!(t, ShellTab::Connect(_)));
         match existing {
             Some(ix) => {
                 self.active = ix;
@@ -141,7 +134,7 @@ impl AppShell {
         else {
             return;
         };
-        let restore = self.pending.remove(&view.entity_id());
+        let restore = self.saved_tabs.remove(&connected.config.id);
         let connected = connected.clone();
         let workspace = cx.new(|cx| {
             Workspace::new(
@@ -167,9 +160,13 @@ impl AppShell {
         if ix >= self.tabs.len() {
             return;
         }
-        // Dropping the workspace drops its sessions, which closes their connections.
-        if let ShellTab::Connect(view) = self.tabs.remove(ix) {
-            self.pending.remove(&view.entity_id());
+        // Dropping the workspace drops its sessions, which closes their connections. Its query
+        // tabs are kept so they come back the next time the connection is opened.
+        if let ShellTab::Connected(ws) = self.tabs.remove(ix) {
+            let snapshot = ws.read(cx).snapshot(cx);
+            if let Some(id) = snapshot.connection {
+                self.saved_tabs.insert(id, snapshot);
+            }
         }
         if self.tabs.is_empty() {
             self.push_connect_tab(window, cx);
@@ -205,29 +202,21 @@ impl AppShell {
 
     fn save_now(&mut self, cx: &mut Context<Self>) {
         let mut session = Session::default();
-        for (ix, tab) in self.tabs.iter().enumerate() {
-            let saved = match tab {
-                ShellTab::Connected(ws) => Some(ws.read(cx).snapshot(cx)),
-                // Still reconnecting (or the reconnect failed): keep its tabs for next time.
-                ShellTab::Connect(view) => self.pending.get(&view.entity_id()).cloned(),
-            };
-            if let Some(saved) = saved {
-                if ix == self.active {
-                    session.active = session.connections.len();
-                }
-                session.connections.push(saved);
+        for tab in &self.tabs {
+            if let ShellTab::Connected(ws) = tab {
+                session.connections.push(ws.read(cx).snapshot(cx));
             }
         }
+        session
+            .connections
+            .extend(self.saved_tabs.values().cloned());
         // Losing the session is an inconvenience, not a reason to interrupt the user.
         let _ = self.store.save_session(&session);
     }
 
-    fn tab_label(&self, tab: &ShellTab, cx: &App) -> SharedString {
+    fn tab_label(tab: &ShellTab, cx: &App) -> SharedString {
         match tab {
             ShellTab::Connected(ws) => ws.read(cx).title(),
-            ShellTab::Connect(view) if self.pending.contains_key(&view.entity_id()) => {
-                view.read(cx).editing_name().into()
-            }
             ShellTab::Connect(_) => "Connections".into(),
         }
     }
@@ -251,7 +240,7 @@ impl Render for AppShell {
                 };
                 Tab::new()
                     .prefix(div().pl_2().child(Icon::new(icon).small()))
-                    .label(self.tab_label(tab, cx))
+                    .label(Self::tab_label(tab, cx))
                     .suffix(
                         Button::new(("close-connection", ix))
                             .ghost()
@@ -279,19 +268,33 @@ impl Render for AppShell {
             .on_action(cx.listener(|this, _: &NextConnection, _, cx| this.cycle(true, cx)))
             .on_action(cx.listener(|this, _: &PreviousConnection, _, cx| this.cycle(false, cx)))
             .child(
-                TabBar::new("connection-tabs")
-                    .selected_index(self.active)
-                    .on_click(cx.listener(|this, ix: &usize, _, cx| this.select(*ix, cx)))
-                    .children(tabs)
-                    .suffix(
-                        Button::new("add-connection")
-                            .ghost()
-                            .small()
-                            .icon(IconName::Plus)
-                            .tooltip("Connections: add, edit or open (⌘N / Ctrl+N)")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.show_connections(window, cx);
-                            })),
+                div()
+                    .relative()
+                    .w_full()
+                    .child(self.tab_fit.measure(cx.entity_id()))
+                    .child(
+                        TabBar::new("connection-tabs")
+                            .menu(true)
+                            .max_width(
+                                self.tab_fit
+                                    .tab_width(self.tabs.len(), px(TAB_BAR_RESERVED)),
+                            )
+                            .selected_index(self.active)
+                            .on_click(cx.listener(|this, ix: &usize, _, cx| this.select(*ix, cx)))
+                            .children(tabs)
+                            // Right after the last tab, like a browser's new-tab button.
+                            .last_empty_space(
+                                h_flex().flex_1().h_full().items_center().pl_1().child(
+                                    Button::new("add-connection")
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(IconName::Plus)
+                                        .tooltip("New connection (⌘N / Ctrl+N)")
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.show_connections(window, cx);
+                                        })),
+                                ),
+                            ),
                     ),
             )
             .child(div().flex_1().min_h_0().child(content))

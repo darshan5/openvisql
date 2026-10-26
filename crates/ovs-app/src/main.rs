@@ -6,6 +6,7 @@ mod grid;
 mod query;
 mod runtime;
 mod shell;
+mod tab_fit;
 mod workspace;
 
 use gpui_kit::{

@@ -23,8 +23,9 @@ use ovs_core::{ConnectionConfig, ObjectKind};
 use ovs_store::SavedConnectionTab;
 
 use crate::browser::{BrowserEvent, ObjectBrowser};
-use crate::query::{QueryEvent, QueryTab, RunMode, TabSpec, format_duration};
+use crate::query::{DEFAULT_ROW_LIMIT, QueryEvent, QueryTab, RunMode, TabSpec, format_duration};
 use crate::runtime::{self, SharedSession};
+use crate::tab_fit::{TAB_BAR_RESERVED, TabFit};
 use crate::{
     CloseQueryTab, ExecuteAll, ExecuteCurrent, NewConnection, NewQueryTab, RefreshBrowser,
     StopQuery, WORKSPACE_CONTEXT,
@@ -83,6 +84,7 @@ pub struct Workspace {
     tabs: Vec<Entity<QueryTab>>,
     active: usize,
     next_tab_number: usize,
+    tab_fit: TabFit,
     subscriptions: Vec<Subscription>,
 }
 
@@ -123,6 +125,7 @@ impl Workspace {
             tabs: Vec::new(),
             active: 0,
             next_tab_number: 1,
+            tab_fit: TabFit::default(),
             subscriptions: vec![sub],
         };
         let saved = restore.unwrap_or_default();
@@ -304,7 +307,10 @@ impl Workspace {
         let d = Dialect::MySql;
         match event {
             BrowserEvent::OpenData { db, name } => {
-                let sql = format!("SELECT * FROM {};", d.qualified(db, name));
+                let sql = format!(
+                    "SELECT * FROM {} LIMIT {DEFAULT_ROW_LIMIT};",
+                    d.qualified(db, name)
+                );
                 self.add_tab(Some(name.clone()), Some(db.clone()), sql, true, window, cx);
             }
             BrowserEvent::ShowDdl { db, name, kind } => {
@@ -436,8 +442,13 @@ impl Workspace {
 
     fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
         // Per-tab click handlers (rather than TabBar::on_click) so a double click can rename.
-        TabBar::new("query-tabs")
+        let tab_width = self
+            .tab_fit
+            .tab_width(self.tabs.len(), px(TAB_BAR_RESERVED));
+        let bar = TabBar::new("query-tabs")
             .small()
+            .menu(true)
+            .max_width(tab_width)
             .selected_index(self.active)
             .children(self.tabs.iter().enumerate().map(|(ix, tab)| {
                 let title = tab.read(cx).title();
@@ -477,6 +488,24 @@ impl Workspace {
                             })),
                     )
             }))
+            .last_empty_space(
+                h_flex().flex_1().h_full().items_center().pl_1().child(
+                    Button::new("new-query-tab")
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::Plus)
+                        .tooltip("New query tab (⌘T / Ctrl+T)")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            let db = this.active_database(cx);
+                            this.add_tab(None, db, String::new(), false, window, cx);
+                        })),
+                ),
+            );
+        div()
+            .relative()
+            .w_full()
+            .child(bar)
+            .child(self.tab_fit.measure(cx.entity_id()))
     }
 
     fn render_status(&self, cx: &mut Context<Self>) -> impl IntoElement {

@@ -8,10 +8,12 @@ the right, and results below.
 
 ## Features
 
-- Several connections open at once as tabs across the top. The app reopens your connections
-  and query tabs (titles, SQL, database) after a restart.
-- Saved connections with passwords stored in the OS keychain (macOS Keychain / Windows
-  Credential Manager), never in plain text.
+- Several connections open at once as tabs across the top, with tabs that shrink to fit. The
+  app starts on the connection manager with nothing connected. Each connection's query tabs
+  (titles, SQL, database) come back when you connect to it again.
+- Saved passwords are never in plain text. Each connection chooses where its password goes:
+  - the OS keychain (macOS Keychain or Windows Credential Manager), or
+  - an encrypted file on this computer, which never shows a system prompt.
 - TLS (encrypt-only or full certificate verification), compressed protocol, init commands.
 - Object browser with lazy loading: databases → tables, views, procedures, functions,
   triggers, events → columns and indexes. Includes a filter box and context menus (open data,
@@ -21,8 +23,9 @@ the right, and results below.
   (**Ctrl+F9** / **⇧⌘↵**). Handles `DELIMITER` for stored-program bodies.
 - Runs each query tab on its own connection, so long queries never block the rest of the app.
   **Stop** (**⌘.** / **Ctrl+.**) cancels with `KILL QUERY`.
-- Plain `SELECT`s get `LIMIT 50` automatically; the results footer shows "Showing 50 of 20,000
-  rows". Multiple result sets open in separate tabs, and a Messages tab shows rows affected,
+- *Open data* writes `SELECT … LIMIT 50` into the editor, and SELECTs without a limit get
+  `LIMIT 50` automatically. The results footer shows "Showing 50 of 20,000 rows" whenever a
+  limit cut the result short. Multiple result sets open in separate tabs, and a Messages tab shows rows affected,
   warnings, errors and timings.
 - Query tabs can be renamed with a double click and reordered by dragging.
 - Double-clicking a column in the object browser inserts `` `column` `` at the cursor.
@@ -57,7 +60,7 @@ See [docs/SETUP.md](docs/SETUP.md) for development setup and running the integra
 | --- | --- |
 | `ovs-core` | Engine-agnostic types, driver traits, SQL lexer/splitter, quoting, grid-edit SQL |
 | `ovs-mysql` | MySQL/MariaDB driver built on `mysql_async` |
-| `ovs-store` | Saved connections, keychain secrets, query history |
+| `ovs-store` | Saved connections, passwords (keychain or encrypted file), history, session |
 | `ovs-app` | The desktop app, built with [GPUI Kit](https://gpui-kit.com) |
 
 ## License

@@ -74,6 +74,7 @@ struct ResultTab {
     /// Rows the statement would return without the automatic `LIMIT`, when it was cut short.
     total: Option<u64>,
     auto_limited: bool,
+    hit_limit: bool,
     /// Reading stopped at `MAX_FETCH_ROWS`.
     truncated: bool,
     /// Re-run after saving edits; `None` for results that can't be edited.
@@ -85,6 +86,8 @@ struct ResultTab {
 #[derive(Clone, Default)]
 struct Limits {
     auto_limited: bool,
+    /// The result has exactly as many rows as its `LIMIT`, so more may exist.
+    hit_limit: bool,
     total: Option<u64>,
     /// The SQL that produced the result, when it's a plain SELECT whose rows may be edited
     /// and re-fetched after saving.
@@ -384,16 +387,27 @@ impl QueryTab {
                 })
                 .await;
                 let elapsed = t0.elapsed();
-                // When our LIMIT cut the result short, count what the query would really return.
-                // A failed count (e.g. duplicate column names in a join) just leaves it unknown.
-                let hit_limit = matches!(
-                    &result,
-                    Ok(outcomes) if matches!(
-                        outcomes.first(),
-                        Some(QueryOutcome::Rows(rs)) if rs.rows.len() == DEFAULT_ROW_LIMIT
+                // When a LIMIT (ours or the user's) cut the result short, count what the query
+                // would return without it. A failed count (e.g. duplicate column names in a
+                // join) just leaves the total unknown.
+                let is_select = sql::classify(&stmt.sql) == StatementKind::Select;
+                let limit = if auto_limited {
+                    Some(DEFAULT_ROW_LIMIT as u64)
+                } else if is_select {
+                    sql::limit_clause(&stmt.sql).map(|l| l.row_count)
+                } else {
+                    None
+                };
+                let hit_limit = limit.is_some_and(|n| {
+                    matches!(
+                        &result,
+                        Ok(outcomes) if matches!(
+                            outcomes.first(),
+                            Some(QueryOutcome::Rows(rs)) if rs.rows.len() as u64 == n
+                        )
                     )
-                );
-                let total = if auto_limited && hit_limit {
+                });
+                let total = if hit_limit {
                     let count_sql = sql::count_query(&stmt.sql);
                     let session = session.clone();
                     runtime::run(async move {
@@ -411,12 +425,13 @@ impl QueryTab {
                 } else {
                     None
                 };
-                let source_sql = (sql::classify(&stmt.sql) == StatementKind::Select).then(|| {
+                let source_sql = is_select.then(|| {
                     sql::apply_row_limit(&stmt.sql, DEFAULT_ROW_LIMIT)
                         .unwrap_or_else(|| stmt.sql.clone())
                 });
                 let limits = Limits {
                     auto_limited,
+                    hit_limit,
                     total,
                     source_sql,
                 };
@@ -536,6 +551,7 @@ impl QueryTab {
             elapsed,
             total: limits.total,
             auto_limited: limits.auto_limited,
+            hit_limit: limits.hit_limit,
             truncated,
             source_sql: source.map(|(sql, _)| sql),
             _subscriptions: [events, observe],
@@ -929,18 +945,16 @@ impl QueryTab {
 /// The line under a result grid, e.g. "Showing 50 of 20,000 rows · 12 ms".
 fn result_footer(r: &ResultTab) -> String {
     let rows = thousands(r.rows as u64);
+    let added = if r.auto_limited {
+        format!(" (LIMIT {DEFAULT_ROW_LIMIT} added automatically)")
+    } else {
+        String::new()
+    };
     let mut text = match r.total {
         Some(total) if total > r.rows as u64 => {
-            format!(
-                "Showing {rows} of {} rows (LIMIT {DEFAULT_ROW_LIMIT} added automatically)",
-                thousands(total)
-            )
+            format!("Showing {rows} of {} rows{added}", thousands(total))
         }
-        None if r.auto_limited && r.rows == DEFAULT_ROW_LIMIT => {
-            format!(
-                "{rows} rows returned (LIMIT {DEFAULT_ROW_LIMIT} added automatically; more rows may exist)"
-            )
-        }
+        None if r.hit_limit => format!("{rows} rows returned{added}; more rows may exist"),
         _ => format!("{rows} row{} returned", if r.rows == 1 { "" } else { "s" }),
     };
     if r.truncated {

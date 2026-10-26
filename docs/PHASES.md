@@ -23,6 +23,12 @@ Behaviour targets come from [FEATURE_SPEC.md](FEATURE_SPEC.md). Source code that
 - Double-clicking a column inserts its backtick-quoted name at the cursor.
 - `LIMIT 50` by default, with a "Showing 50 of N rows" footer.
 - Inline grid editing (update, set NULL, delete, insert) with transactional save.
+- Connection manager:
+  - a Connect button on each saved connection
+  - top bar with Connect, Test, Save, Cancel and a confirmed Delete
+  - password stored in the keychain or an encrypted local file
+- Tabs shrink to fit, with an overflow menu. *Open data* writes an explicit `LIMIT 50`.
+- The app starts on the connection manager; query tabs restore when you connect.
 
 ## Phase 2: Day-to-day essentials
 

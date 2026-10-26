@@ -17,9 +17,12 @@ ovs-store = { path = "crates/ovs-store" }
 
 anyhow = "1"
 async-trait = "0.1"
+base64 = "0.23"
+chacha20poly1305 = "0.11"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 dirs = "6"
 futures = "0.3"
+getrandom = "0.4"
 keyring = { version = "3", features = ["apple-native", "windows-native"] }
 mysql_async = { version = "0.37", default-features = false, features = ["minimal-rust", "rustls-tls", "ring", "tls12", "client_ed25519"] }
 serde = { version = "1", features = ["derive"] }

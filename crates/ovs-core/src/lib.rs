@@ -16,7 +16,7 @@ pub mod schema;
 pub mod sql;
 pub mod value;
 
-pub use connection::{ConnectionConfig, Engine, SslMode};
+pub use connection::{ConnectionConfig, Engine, PasswordStore, SslMode};
 pub use driver::{CancelHandle, Driver, Session};
 pub use error::{Error, Result};
 pub use result::{Column, QueryOutcome, ResultSet, StatementReport};

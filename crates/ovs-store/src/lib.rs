@@ -1,8 +1,9 @@
 //! Persistence for things the user expects to survive a restart.
 //!
 //! - Connections live in `connections.toml` in the platform config directory.
-//! - Passwords live in the OS credential store (macOS Keychain, Windows Credential Manager),
-//!   never on disk in plain text.
+//! - Passwords live either in the OS credential store (macOS Keychain, Windows Credential
+//!   Manager) or encrypted in `secrets.toml`, as each connection chooses; never in plain text.
+//!   The keychain is only touched for connections that use it.
 //! - Query history lives in `history.toml`, capped at [`HISTORY_LIMIT`] entries.
 //! - Open connection tabs and their query tabs live in `session.toml`, so the app reopens
 //!   where the user left off.
@@ -11,13 +12,15 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use ovs_core::ConnectionConfig;
+use ovs_core::{ConnectionConfig, PasswordStore};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+mod keychain;
+mod local;
 use uuid::Uuid;
 
 const APP_DIR: &str = "openvisql";
-const KEYRING_SERVICE: &str = "openvisql";
 pub const HISTORY_LIMIT: usize = 500;
 
 #[derive(Debug, Error)]
@@ -127,6 +130,28 @@ impl Store {
         write_toml(&self.path("connections.toml"), &file)
     }
 
+    /// The saved password of connection `id` from `store`, if any.
+    pub fn password(&self, id: Uuid, store: PasswordStore) -> Result<Option<String>> {
+        match store {
+            PasswordStore::Keychain => keychain::get_password(id),
+            PasswordStore::Local => local::LocalSecrets::new(&self.dir).get(id),
+        }
+    }
+
+    pub fn set_password(&self, id: Uuid, store: PasswordStore, password: &str) -> Result<()> {
+        match store {
+            PasswordStore::Keychain => keychain::set_password(id, password),
+            PasswordStore::Local => local::LocalSecrets::new(&self.dir).set(id, password),
+        }
+    }
+
+    pub fn delete_password(&self, id: Uuid, store: PasswordStore) -> Result<()> {
+        match store {
+            PasswordStore::Keychain => keychain::delete_password(id),
+            PasswordStore::Local => local::LocalSecrets::new(&self.dir).delete(id),
+        }
+    }
+
     pub fn load_session(&self) -> Result<Session> {
         read_toml(&self.path("session.toml"))
     }
@@ -151,7 +176,7 @@ impl Store {
     }
 }
 
-fn read_toml<T: Default + for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
+pub(crate) fn read_toml<T: Default + for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
     match fs::read_to_string(path) {
         Ok(text) => toml::from_str(&text).map_err(|source| StoreError::Parse {
             path: path.to_owned(),
@@ -166,7 +191,7 @@ fn read_toml<T: Default + for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
 }
 
 /// Writes via a temp file and rename so a crash never leaves a half-written settings file.
-fn write_toml<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+pub(crate) fn write_toml<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let io_err = |source| StoreError::Io {
         path: path.to_owned(),
         source,
@@ -178,34 +203,6 @@ fn write_toml<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let tmp = path.with_extension("toml.tmp");
     fs::write(&tmp, text).map_err(io_err)?;
     fs::rename(&tmp, path).map_err(io_err)
-}
-
-/// Passwords in the OS credential store, keyed by connection id.
-pub mod secrets {
-    use super::{KEYRING_SERVICE, Result, Uuid};
-
-    fn entry(id: Uuid) -> keyring::Result<keyring::Entry> {
-        keyring::Entry::new(KEYRING_SERVICE, &id.to_string())
-    }
-
-    pub fn get_password(id: Uuid) -> Result<Option<String>> {
-        match entry(id)?.get_password() {
-            Ok(p) => Ok(Some(p)),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    pub fn set_password(id: Uuid, password: &str) -> Result<()> {
-        Ok(entry(id)?.set_password(password)?)
-    }
-
-    pub fn delete_password(id: Uuid) -> Result<()> {
-        match entry(id)?.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(e) => Err(e.into()),
-        }
-    }
 }
 
 #[cfg(test)]
