@@ -103,8 +103,8 @@ pub struct Session {
 #[serde(rename_all = "lowercase")]
 pub enum ThemePreference {
     /// Follow the operating system's light/dark appearance.
-    #[default]
     System,
+    #[default]
     Light,
     Dark,
 }
@@ -131,7 +131,7 @@ impl Default for Preferences {
         Self {
             row_limit: 50,
             editor_font_size: 14.0,
-            theme: ThemePreference::System,
+            theme: ThemePreference::Light,
             stop_on_error: false,
         }
     }
@@ -429,6 +429,8 @@ mod tests {
         let partial = store.load_preferences().unwrap();
         assert_eq!(partial.row_limit, 10);
         assert!((partial.editor_font_size - 14.0).abs() < f32::EPSILON);
+        // The app starts in light mode until another theme is chosen.
+        assert_eq!(partial.theme, ThemePreference::Light);
     }
 
     #[test]
