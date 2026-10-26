@@ -652,6 +652,7 @@ async fn table_designer_sql_runs() {
                 ..IndexDef::default()
             },
         ],
+        ..TableDesign::default()
     };
     s.execute(&create_sql(Dialect::MySql, &db, &new_table), None)
         .await
@@ -770,5 +771,82 @@ async fn table_designer_sql_runs() {
             ("title_text".to_owned(), IndexKind::Fulltext, 1),
         ]
     );
+    cleanup(s, &db).await;
+}
+
+#[tokio::test]
+async fn table_designer_foreign_keys_and_options() {
+    use ovs_core::sql::Dialect;
+    use ovs_core::sql::design::{TableDesign, alter_sql};
+
+    async fn load(s: &mut Box<dyn Session>, db: &str) -> TableDesign {
+        let columns = s.list_columns(db, "pets").await.unwrap();
+        let indexes = s.list_indexes(db, "pets").await.unwrap();
+        let fks = s.list_foreign_keys(db, "pets").await.unwrap();
+        let options = s.table_options(db, "pets").await.unwrap();
+        TableDesign::from_table("pets", &columns, &indexes).with_constraints(db, &fks, options)
+    }
+    let Some((mut s, db)) = scratch("designer_fk").await else {
+        return;
+    };
+    for sql in [
+        "CREATE TABLE owners (login VARCHAR(20) NOT NULL PRIMARY KEY, team INT NOT NULL, \
+         UNIQUE KEY by_team (team, login))",
+        "CREATE TABLE pets (id INT NOT NULL PRIMARY KEY, owner VARCHAR(20) NULL, \
+         team INT NULL, CONSTRAINT fk_owner FOREIGN KEY (owner) REFERENCES owners (login) \
+         ON DELETE CASCADE) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 \
+         COLLATE=utf8mb4_unicode_ci COMMENT='animals'",
+        "INSERT INTO owners VALUES ('ada', 1)",
+        "INSERT INTO pets VALUES (1, 'ada', 1)",
+    ] {
+        s.execute(sql, None)
+            .await
+            .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+    }
+    let before = load(&mut s, &db).await;
+    assert_eq!(before.options.engine, "InnoDB");
+    assert_eq!(before.options.collation, "utf8mb4_unicode_ci");
+    assert_eq!(before.options.comment, "animals");
+    assert_eq!(before.foreign_keys.len(), 1);
+    let fk = &before.foreign_keys[0];
+    assert_eq!(
+        (fk.ref_database.as_str(), fk.ref_table.as_str()),
+        ("", "owners")
+    );
+    assert_eq!(fk.on_delete, "CASCADE");
+    assert_eq!(alter_sql(Dialect::MySql, &db, &before, &before), None);
+
+    // Rename the referencing column, widen the key to two columns and change the options.
+    let mut after = before.clone();
+    after.columns[1].name = "owner_login".into();
+    after.follow_renames();
+    let fk = &mut after.foreign_keys[0];
+    fk.columns.insert(0, "team".into());
+    fk.ref_columns.insert(0, "team".into());
+    fk.on_delete = "SET NULL".into();
+    after.options.comment = "pets and owners".into();
+    after.options.collation = "utf8mb4_general_ci".into();
+    after.validate().unwrap();
+    let sql = alter_sql(Dialect::MySql, &db, &before, &after).unwrap();
+    s.execute(&sql, None)
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+
+    let reloaded = load(&mut s, &db).await;
+    let fk = &reloaded.foreign_keys[0];
+    assert_eq!(fk.columns, ["team", "owner_login"]);
+    assert_eq!(fk.ref_columns, ["team", "login"]);
+    assert_eq!(fk.on_delete, "SET NULL");
+    assert_eq!(reloaded.options.comment, "pets and owners");
+    assert_eq!(reloaded.options.collation, "utf8mb4_general_ci");
+
+    // Dropping the foreign key leaves the index the server made for it alone.
+    let mut dropped = reloaded.clone();
+    dropped.foreign_keys.clear();
+    let sql = alter_sql(Dialect::MySql, &db, &reloaded, &dropped).unwrap();
+    s.execute(&sql, None)
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+    assert_eq!(s.list_foreign_keys(&db, "pets").await.unwrap().len(), 0);
     cleanup(s, &db).await;
 }

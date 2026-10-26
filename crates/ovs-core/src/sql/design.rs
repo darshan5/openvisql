@@ -2,7 +2,7 @@
 //! `CREATE TABLE` / `ALTER TABLE` that applies them.
 
 use super::dialect::Dialect;
-use crate::schema::{ColumnInfo, IndexInfo};
+use crate::schema::{ColumnInfo, ForeignKeyInfo, IndexInfo, TableOptions};
 
 /// One column in the designer.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -53,11 +53,85 @@ pub struct IndexDef {
     pub original_name: Option<String>,
 }
 
+/// What a foreign key does when the referenced row is updated or deleted.
+pub const REFERENTIAL_ACTIONS: [&str; 5] = [
+    "RESTRICT",
+    "CASCADE",
+    "SET NULL",
+    "NO ACTION",
+    "SET DEFAULT",
+];
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ForeignKeyDef {
+    pub name: String,
+    pub columns: Vec<String>,
+    /// Empty for the table's own database.
+    pub ref_database: String,
+    pub ref_table: String,
+    pub ref_columns: Vec<String>,
+    pub on_update: String,
+    pub on_delete: String,
+    /// The constraint's name in the existing table; `None` for a new one.
+    pub original_name: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TableDesign {
     pub name: String,
     pub columns: Vec<ColumnDef>,
     pub indexes: Vec<IndexDef>,
+    pub foreign_keys: Vec<ForeignKeyDef>,
+    /// Empty fields leave the server default (new tables) or the current value alone.
+    pub options: TableOptions,
+}
+
+/// `ENGINE=… DEFAULT CHARSET=… COLLATE=… COMMENT='…'` for the options that are set.
+fn options_sql(d: Dialect, options: &TableOptions) -> Vec<String> {
+    let mut out = Vec::new();
+    if !options.engine.trim().is_empty() {
+        out.push(format!("ENGINE={}", options.engine.trim()));
+    }
+    let collation = options.collation.trim();
+    if !collation.is_empty() {
+        let charset = collation.split('_').next().unwrap_or(collation);
+        out.push(format!("DEFAULT CHARSET={charset} COLLATE={collation}"));
+    }
+    if !options.comment.is_empty() {
+        out.push(format!("COMMENT={}", d.quote_str(&options.comment)));
+    }
+    out
+}
+
+/// `CONSTRAINT name FOREIGN KEY (a) REFERENCES t (b) ON DELETE … ON UPDATE …`.
+pub fn foreign_key_sql(d: Dialect, db: &str, fk: &ForeignKeyDef) -> String {
+    let list = |cols: &[String]| {
+        cols.iter()
+            .map(|c| d.quote_ident(c))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let ref_db = if fk.ref_database.trim().is_empty() {
+        db
+    } else {
+        fk.ref_database.trim()
+    };
+    let mut sql = format!(
+        "CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {} ({})",
+        d.quote_ident(&fk.name),
+        list(&fk.columns),
+        d.qualified(ref_db, fk.ref_table.trim()),
+        list(&fk.ref_columns)
+    );
+    for (clause, action) in [("ON DELETE", &fk.on_delete), ("ON UPDATE", &fk.on_update)] {
+        if !action.trim().is_empty() {
+            sql.push(' ');
+            sql.push_str(clause);
+            sql.push(' ');
+            sql.push_str(&action.trim().to_ascii_uppercase());
+        }
+    }
+    sql
 }
 
 /// `col` or `col(10)` quoted as `` `col` `` / `` `col`(10) ``.
@@ -146,7 +220,15 @@ impl TableDesign {
                     _ if i.unique => IndexKind::Unique,
                     _ => IndexKind::Index,
                 },
-                columns: i.columns.clone(),
+                columns: i
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .map(|(n, c)| match i.prefix_lengths.get(n).copied().flatten() {
+                        Some(len) => format!("{c}({len})"),
+                        None => c.clone(),
+                    })
+                    .collect(),
                 original_name: Some(i.name.clone()),
             })
             .collect();
@@ -154,7 +236,39 @@ impl TableDesign {
             name: name.to_owned(),
             columns,
             indexes,
+            foreign_keys: Vec::new(),
+            options: TableOptions::default(),
         }
+    }
+
+    /// Adds the table's foreign keys and options; `db` is the table's own database, so
+    /// references within it are shown without a database name.
+    #[must_use]
+    pub fn with_constraints(
+        mut self,
+        db: &str,
+        foreign_keys: &[ForeignKeyInfo],
+        options: TableOptions,
+    ) -> Self {
+        self.foreign_keys = foreign_keys
+            .iter()
+            .map(|fk| ForeignKeyDef {
+                name: fk.name.clone(),
+                columns: fk.columns.clone(),
+                ref_database: if fk.ref_database == db {
+                    String::new()
+                } else {
+                    fk.ref_database.clone()
+                },
+                ref_table: fk.ref_table.clone(),
+                ref_columns: fk.ref_columns.clone(),
+                on_update: fk.on_update.clone(),
+                on_delete: fk.on_delete.clone(),
+                original_name: Some(fk.name.clone()),
+            })
+            .collect();
+        self.options = options;
+        self
     }
 
     /// Points index columns at renamed columns: an index that names a column by its old name
@@ -169,6 +283,16 @@ impl TableDesign {
             })
             .collect();
         let current: Vec<String> = self.columns.iter().map(|c| c.name.to_lowercase()).collect();
+        for fk in &mut self.foreign_keys {
+            for column in &mut fk.columns {
+                if current.contains(&column.to_lowercase()) {
+                    continue;
+                }
+                if let Some((_, new)) = renames.iter().find(|(old, _)| old == column) {
+                    column.clone_from(new);
+                }
+            }
+        }
         for index in &mut self.indexes {
             for column in &mut index.columns {
                 let name = index_column_name(column).to_owned();
@@ -234,6 +358,47 @@ impl TableDesign {
                 }
             }
         }
+        let mut fk_names = std::collections::HashSet::new();
+        for fk in &self.foreign_keys {
+            if fk.name.trim().is_empty() {
+                return Err("Every foreign key needs a name.".into());
+            }
+            if !fk_names.insert(fk.name.to_lowercase()) {
+                return Err(format!("Foreign key {} appears twice.", fk.name));
+            }
+            if fk.columns.is_empty() {
+                return Err(format!(
+                    "Foreign key {} needs at least one column.",
+                    fk.name
+                ));
+            }
+            if let Some(c) = fk
+                .columns
+                .iter()
+                .find(|c| !seen.contains(&c.to_lowercase()))
+            {
+                return Err(format!("Foreign key {} uses unknown column {c}.", fk.name));
+            }
+            if fk.ref_table.trim().is_empty() {
+                return Err(format!("Foreign key {} needs a referenced table.", fk.name));
+            }
+            if fk.ref_columns.len() != fk.columns.len() {
+                return Err(format!(
+                    "Foreign key {} needs as many referenced columns as columns.",
+                    fk.name
+                ));
+            }
+            for action in [&fk.on_update, &fk.on_delete] {
+                let action = action.trim();
+                if !action.is_empty()
+                    && !REFERENTIAL_ACTIONS
+                        .iter()
+                        .any(|a| a.eq_ignore_ascii_case(action))
+                {
+                    return Err(format!("Foreign key {}: unknown action {action}.", fk.name));
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -278,11 +443,31 @@ pub fn create_sql(d: Dialect, db: &str, design: &TableDesign) -> String {
             .iter()
             .map(|i| format!("  {}", index_sql(d, i))),
     );
-    format!(
+    lines.extend(
+        design
+            .foreign_keys
+            .iter()
+            .map(|fk| format!("  {}", foreign_key_sql(d, db, fk))),
+    );
+    let mut sql = format!(
         "CREATE TABLE {} (\n{}\n)",
         d.qualified(db, &design.name),
         lines.join(",\n")
-    )
+    );
+    for option in options_sql(d, &design.options) {
+        sql.push(' ');
+        sql.push_str(&option);
+    }
+    sql
+}
+
+/// `after` when it differs from `before` (ignoring case), otherwise empty.
+fn changed_text(before: &str, after: &str) -> String {
+    if before.trim().eq_ignore_ascii_case(after.trim()) {
+        String::new()
+    } else {
+        after.trim().to_owned()
+    }
 }
 
 /// One `ALTER TABLE` turning `before` into `after`, or `None` when nothing changed. Columns
@@ -294,6 +479,40 @@ pub fn alter_sql(
     after: &TableDesign,
 ) -> Option<String> {
     let mut clauses = Vec::new();
+
+    // Foreign keys that went away or changed are dropped first, as they may need an index
+    // that is dropped below; changed ones are re-added at the end.
+    let mut renamed = before.clone();
+    renamed.columns.clone_from(&after.columns);
+    renamed.follow_renames();
+    let mut added_fks = Vec::new();
+    for (old, old_renamed) in before.foreign_keys.iter().zip(&renamed.foreign_keys) {
+        let new = after
+            .foreign_keys
+            .iter()
+            .find(|fk| fk.original_name.as_deref() == Some(old.name.as_str()));
+        let unchanged = new.is_some_and(|new| {
+            ForeignKeyDef {
+                original_name: None,
+                ..new.clone()
+            } == ForeignKeyDef {
+                original_name: None,
+                ..old_renamed.clone()
+            }
+        });
+        if !unchanged {
+            clauses.push(format!("DROP FOREIGN KEY {}", d.quote_ident(&old.name)));
+            if let Some(new) = new {
+                added_fks.push(new);
+            }
+        }
+    }
+    added_fks.extend(
+        after
+            .foreign_keys
+            .iter()
+            .filter(|fk| fk.original_name.is_none()),
+    );
 
     // Indexes that went away or changed are dropped before any column, so dropping a column
     // can't remove an index this statement still refers to; changed ones are re-added last.
@@ -400,6 +619,18 @@ pub fn alter_sql(
     for index in added_indexes {
         clauses.push(format!("ADD {}", index_sql(d, index)));
     }
+    for fk in added_fks {
+        clauses.push(format!("ADD {}", foreign_key_sql(d, db, fk)));
+    }
+    let changed_options = TableOptions {
+        engine: changed_text(&before.options.engine, &after.options.engine),
+        collation: changed_text(&before.options.collation, &after.options.collation),
+        comment: String::new(),
+    };
+    clauses.extend(options_sql(d, &changed_options));
+    if before.options.comment != after.options.comment {
+        clauses.push(format!("COMMENT={}", d.quote_str(&after.options.comment)));
+    }
     if before.name != after.name {
         clauses.push(format!("RENAME TO {}", d.qualified(db, &after.name)));
     }
@@ -446,7 +677,57 @@ mod tests {
                 },
             ],
             indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+            options: TableOptions::default(),
         }
+    }
+
+    #[test]
+    fn foreign_keys_and_options() {
+        let mut t = table();
+        t.options = TableOptions {
+            engine: "InnoDB".into(),
+            collation: "utf8mb4_unicode_ci".into(),
+            comment: "people's".into(),
+        };
+        t.foreign_keys.push(ForeignKeyDef {
+            name: "fk_owner".into(),
+            columns: vec!["name".into()],
+            ref_table: "owners".into(),
+            ref_columns: vec!["login".into()],
+            on_delete: "cascade".into(),
+            ..ForeignKeyDef::default()
+        });
+        assert!(t.validate().is_ok());
+        assert!(create_sql(D, "s", &t).ends_with(
+            "  CONSTRAINT `fk_owner` FOREIGN KEY (`name`) REFERENCES `s`.`owners` (`login`) \
+             ON DELETE CASCADE\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 \
+             COLLATE=utf8mb4_unicode_ci COMMENT='people\\'s'"
+        ));
+
+        let mut before = t.clone();
+        before.foreign_keys[0].original_name = Some("fk_owner".into());
+        let mut after = before.clone();
+        after.columns[1].name = "owner".into();
+        after.follow_renames();
+        after.options.engine = "innodb".into();
+        // A rename alone keeps the constraint; only the column changes.
+        let sql = alter_sql(D, "s", &before, &after).unwrap();
+        assert!(!sql.contains("FOREIGN KEY"), "{sql}");
+        assert!(!sql.contains("ENGINE"), "{sql}");
+
+        after.foreign_keys[0].on_update = "SET NULL".into();
+        after.options.comment = String::new();
+        let sql = alter_sql(D, "s", &before, &after).unwrap();
+        assert!(sql.contains("  DROP FOREIGN KEY `fk_owner`,"), "{sql}");
+        assert!(
+            sql.contains("ADD CONSTRAINT `fk_owner` FOREIGN KEY (`owner`)"),
+            "{sql}"
+        );
+        assert!(sql.ends_with("ON UPDATE SET NULL,\n  COMMENT=''"), "{sql}");
+
+        after.foreign_keys[0].ref_columns.push("x".into());
+        assert!(after.validate().unwrap_err().contains("as many"));
     }
 
     fn index(name: &str, kind: IndexKind, columns: &[&str]) -> IndexDef {
@@ -588,12 +869,14 @@ mod tests {
                 columns: vec!["id".into()],
                 unique: true,
                 index_type: "BTREE".into(),
+                prefix_lengths: Vec::new(),
             },
             IndexInfo {
                 name: "by_status".into(),
                 columns: vec!["status".into(), "at".into()],
                 unique: true,
                 index_type: "BTREE".into(),
+                prefix_lengths: vec![Some(4), None],
             },
         ];
         let design = TableDesign::from_table("t", &columns, &indexes);
@@ -602,7 +885,7 @@ mod tests {
         assert_eq!(design.columns[2].default_sql, "CURRENT_TIMESTAMP");
         assert_eq!(
             design.indexes,
-            [index("by_status", IndexKind::Unique, &["status", "at"])]
+            [index("by_status", IndexKind::Unique, &["status(4)", "at"])]
         );
         assert!(design.validate().is_ok());
     }

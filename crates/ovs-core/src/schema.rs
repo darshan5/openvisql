@@ -88,6 +88,29 @@ pub struct IndexInfo {
     pub unique: bool,
     /// `BTREE`, `HASH`, `FULLTEXT`, ...
     pub index_type: String,
+    /// Per column, the indexed prefix length (`name(10)`); empty when no column has one.
+    pub prefix_lengths: Vec<Option<u32>>,
+}
+
+/// A foreign key constraint, its columns in order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ForeignKeyInfo {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub ref_database: String,
+    pub ref_table: String,
+    pub ref_columns: Vec<String>,
+    /// `RESTRICT`, `CASCADE`, `SET NULL`, `NO ACTION`, ...
+    pub on_update: String,
+    pub on_delete: String,
+}
+
+/// Table-level options.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TableOptions {
+    pub engine: String,
+    pub collation: String,
+    pub comment: String,
 }
 
 impl IndexInfo {

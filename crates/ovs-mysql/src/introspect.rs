@@ -1,7 +1,10 @@
 //! Schema queries behind the object browser.
 
 use ovs_core::sql::Dialect;
-use ovs_core::{ColumnInfo, Error, IndexInfo, ObjectKind, Result, ResultSet, SchemaObject, Value};
+use ovs_core::{
+    ColumnInfo, Error, ForeignKeyInfo, IndexInfo, ObjectKind, Result, ResultSet, SchemaObject,
+    TableOptions, Value,
+};
 
 use crate::MySqlSession;
 
@@ -121,18 +124,90 @@ pub(crate) async fn indexes(s: &mut MySqlSession, db: &str, table: &str) -> Resu
     for r in &rs.rows {
         let name = text(&rs, r, "Key_name");
         let column = text(&rs, r, "Column_name");
-        if let Some(idx) = out.iter_mut().find(|i| i.name == name) {
+        let prefix = text(&rs, r, "Sub_part").parse::<u32>().ok();
+        let idx = if let Some(idx) = out.iter_mut().find(|i| i.name == name) {
             idx.columns.push(column);
+            idx
         } else {
             out.push(IndexInfo {
                 unique: text(&rs, r, "Non_unique") == "0",
                 index_type: text(&rs, r, "Index_type"),
                 columns: vec![column],
                 name,
+                prefix_lengths: Vec::new(),
             });
+            out.last_mut().expect("just pushed")
+        };
+        if prefix.is_some() || !idx.prefix_lengths.is_empty() {
+            idx.prefix_lengths.resize(idx.columns.len() - 1, None);
+            idx.prefix_lengths.push(prefix);
         }
     }
     Ok(out)
+}
+
+pub(crate) async fn foreign_keys(
+    s: &mut MySqlSession,
+    db: &str,
+    table: &str,
+) -> Result<Vec<ForeignKeyInfo>> {
+    let sql = format!(
+        "SELECT k.CONSTRAINT_NAME AS name, k.COLUMN_NAME AS col, \
+         k.REFERENCED_TABLE_SCHEMA AS ref_db, k.REFERENCED_TABLE_NAME AS ref_table, \
+         k.REFERENCED_COLUMN_NAME AS ref_col, r.UPDATE_RULE AS on_update, \
+         r.DELETE_RULE AS on_delete \
+         FROM information_schema.KEY_COLUMN_USAGE k \
+         JOIN information_schema.REFERENTIAL_CONSTRAINTS r \
+           ON r.CONSTRAINT_SCHEMA = k.CONSTRAINT_SCHEMA \
+          AND r.CONSTRAINT_NAME = k.CONSTRAINT_NAME AND r.TABLE_NAME = k.TABLE_NAME \
+         WHERE k.TABLE_SCHEMA = {} AND k.TABLE_NAME = {} \
+           AND k.REFERENCED_TABLE_NAME IS NOT NULL \
+         ORDER BY k.CONSTRAINT_NAME, k.ORDINAL_POSITION",
+        D.quote_str(db),
+        D.quote_str(table)
+    );
+    let rs = s.query_set(&sql).await?;
+    let mut out: Vec<ForeignKeyInfo> = Vec::new();
+    for r in &rs.rows {
+        let name = text(&rs, r, "name");
+        if out.last().is_none_or(|fk| fk.name != name) {
+            out.push(ForeignKeyInfo {
+                name,
+                ref_database: text(&rs, r, "ref_db"),
+                ref_table: text(&rs, r, "ref_table"),
+                on_update: text(&rs, r, "on_update"),
+                on_delete: text(&rs, r, "on_delete"),
+                ..ForeignKeyInfo::default()
+            });
+        }
+        let fk = out.last_mut().expect("pushed above");
+        fk.columns.push(text(&rs, r, "col"));
+        fk.ref_columns.push(text(&rs, r, "ref_col"));
+    }
+    Ok(out)
+}
+
+pub(crate) async fn table_options(
+    s: &mut MySqlSession,
+    db: &str,
+    table: &str,
+) -> Result<TableOptions> {
+    let sql = format!(
+        "SELECT ENGINE AS engine, TABLE_COLLATION AS collation, TABLE_COMMENT AS comment \
+         FROM information_schema.TABLES WHERE TABLE_SCHEMA = {} AND TABLE_NAME = {}",
+        D.quote_str(db),
+        D.quote_str(table)
+    );
+    let rs = s.query_set(&sql).await?;
+    let row = rs
+        .rows
+        .first()
+        .ok_or_else(|| Error::Other(format!("table {table} not found")))?;
+    Ok(TableOptions {
+        engine: text(&rs, row, "engine"),
+        collation: text(&rs, row, "collation"),
+        comment: text(&rs, row, "comment"),
+    })
 }
 
 pub(crate) async fn ddl(

@@ -26,5 +26,5 @@ pub use connection::{ConnectionConfig, Engine, PasswordStore, SshAuthMethod, Ssh
 pub use driver::{CancelHandle, Driver, Session};
 pub use error::{Error, Result};
 pub use result::{Column, QueryOutcome, ResultSet, StatementReport};
-pub use schema::{ColumnInfo, IndexInfo, ObjectKind, SchemaObject};
+pub use schema::{ColumnInfo, ForeignKeyInfo, IndexInfo, ObjectKind, SchemaObject, TableOptions};
 pub use value::Value;

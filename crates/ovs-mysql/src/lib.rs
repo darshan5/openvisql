@@ -11,8 +11,8 @@ use mysql_async::prelude::Queryable;
 use mysql_async::{Conn, Opts, OptsBuilder, SslOpts};
 use ovs_core::sql::Dialect;
 use ovs_core::{
-    CancelHandle, ColumnInfo, ConnectionConfig, Driver, Engine, Error, IndexInfo, ObjectKind,
-    QueryOutcome, Result, ResultSet, SchemaObject, Session, SslMode,
+    CancelHandle, ColumnInfo, ConnectionConfig, Driver, Engine, Error, ForeignKeyInfo, IndexInfo,
+    ObjectKind, QueryOutcome, Result, ResultSet, SchemaObject, Session, SslMode, TableOptions,
 };
 
 /// Server error raised in the session whose statement was killed by `KILL QUERY`.
@@ -224,6 +224,18 @@ impl Session for MySqlSession {
 
     async fn list_indexes(&mut self, database: &str, table: &str) -> Result<Vec<IndexInfo>> {
         introspect::indexes(self, database, table).await
+    }
+
+    async fn list_foreign_keys(
+        &mut self,
+        database: &str,
+        table: &str,
+    ) -> Result<Vec<ForeignKeyInfo>> {
+        introspect::foreign_keys(self, database, table).await
+    }
+
+    async fn table_options(&mut self, database: &str, table: &str) -> Result<TableOptions> {
+        introspect::table_options(self, database, table).await
     }
 
     async fn object_ddl(&mut self, database: &str, name: &str, kind: ObjectKind) -> Result<String> {

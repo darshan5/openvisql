@@ -338,6 +338,7 @@ mod tests {
             columns: cols.iter().map(|c| (*c).to_owned()).collect(),
             unique,
             index_type: "BTREE".into(),
+            prefix_lengths: Vec::new(),
         }
     }
 

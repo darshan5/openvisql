@@ -17,8 +17,12 @@ use gpui_kit::{
     ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
     Subscription, Window, div, px,
 };
+use ovs_core::TableOptions;
 use ovs_core::sql::Dialect;
-use ovs_core::sql::design::{ColumnDef, IndexDef, IndexKind, TableDesign, alter_sql, create_sql};
+use ovs_core::sql::design::{
+    ColumnDef, ForeignKeyDef, IndexDef, IndexKind, REFERENTIAL_ACTIONS, TableDesign, alter_sql,
+    create_sql,
+};
 
 use crate::runtime::{self, SharedSession};
 
@@ -46,6 +50,27 @@ struct IndexRow {
     original_name: Option<String>,
 }
 
+struct ForeignKeyRow {
+    id: usize,
+    name: Entity<InputState>,
+    columns: Entity<InputState>,
+    /// `table` or `db.table`.
+    ref_table: Entity<InputState>,
+    ref_columns: Entity<InputState>,
+    on_delete: String,
+    on_update: String,
+    original_name: Option<String>,
+}
+
+/// Splits a comma-separated list of names.
+fn names(text: &str) -> Vec<String> {
+    text.split(',')
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 pub struct TableDesigner {
     db: String,
     /// The table as loaded; `None` when creating a new table.
@@ -53,6 +78,10 @@ pub struct TableDesigner {
     name: Entity<InputState>,
     rows: Vec<Row>,
     indexes: Vec<IndexRow>,
+    foreign_keys: Vec<ForeignKeyRow>,
+    engine: Entity<InputState>,
+    collation: Entity<InputState>,
+    table_comment: Entity<InputState>,
     next_id: usize,
     subscriptions: Vec<Subscription>,
 }
@@ -73,24 +102,47 @@ impl TableDesigner {
                 auto_increment: true,
                 ..ColumnDef::default()
             }],
-            indexes: Vec::new(),
+            ..TableDesign::default()
         });
         let name = cx.new(|cx| InputState::new(window, cx).default_value(start.name.clone()));
+        let option = |value: &str,
+                      placeholder: &'static str,
+                      window: &mut Window,
+                      cx: &mut Context<Self>| {
+            let value = value.to_owned();
+            cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder(placeholder)
+                    .default_value(value)
+            })
+        };
+        let engine = option(&start.options.engine, "server default", window, cx);
+        let collation = option(&start.options.collation, "server default", window, cx);
+        let table_comment = option(&start.options.comment, "", window, cx);
         let mut designer = Self {
             db,
             original,
             name: name.clone(),
             rows: Vec::new(),
             indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+            engine: engine.clone(),
+            collation: collation.clone(),
+            table_comment: table_comment.clone(),
             next_id: 0,
             subscriptions: Vec::new(),
         };
-        designer.watch(&name, cx);
+        for input in [&name, &engine, &collation, &table_comment] {
+            designer.watch(input, cx);
+        }
         for column in start.columns {
             designer.push_row(column, window, cx);
         }
         for index in start.indexes {
             designer.push_index(index, window, cx);
+        }
+        for fk in start.foreign_keys {
+            designer.push_foreign_key(fk, window, cx);
         }
         designer
     }
@@ -158,6 +210,37 @@ impl TableDesigner {
         cx.notify();
     }
 
+    fn push_foreign_key(&mut self, fk: ForeignKeyDef, window: &mut Window, cx: &mut Context<Self>) {
+        let id = self.next_id;
+        let mut input = |value: String, placeholder: &'static str| {
+            let input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder(placeholder)
+                    .default_value(value)
+            });
+            self.watch(&input, cx);
+            input
+        };
+        let ref_table = if fk.ref_database.is_empty() {
+            fk.ref_table
+        } else {
+            format!("{}.{}", fk.ref_database, fk.ref_table)
+        };
+        let row = ForeignKeyRow {
+            id,
+            name: input(fk.name, "constraint name"),
+            columns: input(fk.columns.join(", "), "col_a, col_b"),
+            ref_table: input(ref_table, "table or db.table"),
+            ref_columns: input(fk.ref_columns.join(", "), "id"),
+            on_delete: fk.on_delete,
+            on_update: fk.on_update,
+            original_name: fk.original_name,
+        };
+        self.next_id += 1;
+        self.foreign_keys.push(row);
+        cx.notify();
+    }
+
     fn design(&self, cx: &App) -> TableDesign {
         let text = |input: &Entity<InputState>| input.read(cx).value().trim().to_owned();
         TableDesign {
@@ -182,18 +265,36 @@ impl TableDesigner {
                 .map(|index| IndexDef {
                     name: text(&index.name),
                     kind: index.kind,
-                    columns: index
-                        .columns
-                        .read(cx)
-                        .value()
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|c| !c.is_empty())
-                        .map(str::to_owned)
-                        .collect(),
+                    columns: names(&index.columns.read(cx).value()),
                     original_name: index.original_name.clone(),
                 })
                 .collect(),
+            foreign_keys: self
+                .foreign_keys
+                .iter()
+                .map(|fk| {
+                    let target = text(&fk.ref_table);
+                    let (ref_database, ref_table) = match target.split_once('.') {
+                        Some((db, table)) => (db.trim().to_owned(), table.trim().to_owned()),
+                        None => (String::new(), target),
+                    };
+                    ForeignKeyDef {
+                        name: text(&fk.name),
+                        columns: names(&fk.columns.read(cx).value()),
+                        ref_database,
+                        ref_table,
+                        ref_columns: names(&fk.ref_columns.read(cx).value()),
+                        on_update: fk.on_update.clone(),
+                        on_delete: fk.on_delete.clone(),
+                        original_name: fk.original_name.clone(),
+                    }
+                })
+                .collect(),
+            options: TableOptions {
+                engine: text(&self.engine),
+                collation: text(&self.collation),
+                comment: self.table_comment.read(cx).value().to_string(),
+            },
         }
     }
 
@@ -330,6 +431,82 @@ impl TableDesigner {
     }
 }
 
+impl TableDesigner {
+    fn action_menu(
+        id: (&'static str, usize),
+        current: &str,
+        ix: usize,
+        set: fn(&mut ForeignKeyRow, String),
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let this = cx.entity().downgrade();
+        let label = if current.is_empty() {
+            "default".to_owned()
+        } else {
+            current.to_owned()
+        };
+        Button::new(id)
+            .xsmall()
+            .outline()
+            .w(px(96.))
+            .label(label)
+            .dropdown_menu(move |menu, _, _| {
+                REFERENTIAL_ACTIONS.into_iter().fold(menu, |menu, action| {
+                    let this = this.clone();
+                    menu.item(PopupMenuItem::new(action).on_click(move |_, _, cx| {
+                        this.update(cx, |this, cx| {
+                            if let Some(fk) = this.foreign_keys.get_mut(ix) {
+                                set(fk, action.to_owned());
+                            }
+                            cx.notify();
+                        })
+                        .ok();
+                    }))
+                })
+            })
+    }
+
+    fn render_foreign_key(
+        ix: usize,
+        fk: &ForeignKeyRow,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        h_flex()
+            .gap_1()
+            .child(div().w(px(150.)).child(Input::new(&fk.name).xsmall()))
+            .child(div().w(px(150.)).child(Input::new(&fk.columns).xsmall()))
+            .child(div().w(px(150.)).child(Input::new(&fk.ref_table).xsmall()))
+            .child(div().flex_1().child(Input::new(&fk.ref_columns).xsmall()))
+            .child(Self::action_menu(
+                ("on-delete", fk.id),
+                &fk.on_delete,
+                ix,
+                |fk, v| fk.on_delete = v,
+                cx,
+            ))
+            .child(Self::action_menu(
+                ("on-update", fk.id),
+                &fk.on_update,
+                ix,
+                |fk, v| fk.on_update = v,
+                cx,
+            ))
+            .child(
+                Button::new(("remove-fk", fk.id))
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::Close)
+                    .tooltip("Remove foreign key")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if ix < this.foreign_keys.len() {
+                            this.foreign_keys.remove(ix);
+                        }
+                        cx.notify();
+                    })),
+            )
+    }
+}
+
 impl Render for TableDesigner {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
@@ -357,13 +534,29 @@ impl Render for TableDesigner {
             .enumerate()
             .map(|(ix, index)| Self::render_index(ix, index, cx).into_any_element())
             .collect();
+        let foreign_keys: Vec<_> = self
+            .foreign_keys
+            .iter()
+            .enumerate()
+            .map(|(ix, fk)| Self::render_foreign_key(ix, fk, cx).into_any_element())
+            .collect();
         v_flex()
             .gap_2()
             .child(
                 h_flex()
                     .gap_2()
                     .child(div().text_sm().child("Table name"))
-                    .child(div().w(px(260.)).child(Input::new(&self.name).small())),
+                    .child(div().w(px(220.)).child(Input::new(&self.name).small()))
+                    .child(div().text_sm().child("Engine"))
+                    .child(div().w(px(110.)).child(Input::new(&self.engine).small()))
+                    .child(div().text_sm().child("Collation"))
+                    .child(div().w(px(170.)).child(Input::new(&self.collation).small()))
+                    .child(div().text_sm().child("Comment"))
+                    .child(
+                        div()
+                            .flex_1()
+                            .child(Input::new(&self.table_comment).small()),
+                    ),
             )
             .child(
                 h_flex()
@@ -445,6 +638,45 @@ impl Render for TableDesigner {
                 ),
             )
             .child(
+                h_flex()
+                    .gap_1()
+                    .child(header("Foreign key", Some(150.)))
+                    .child(header("Columns", Some(150.)))
+                    .child(header("References table", Some(150.)))
+                    .child(header("Referenced columns", None))
+                    .child(header("On delete", Some(96.)))
+                    .child(header("On update", Some(96.)))
+                    .child(div().w(px(28.))),
+            )
+            .child(
+                v_flex()
+                    .id("designer-fks")
+                    .gap_1()
+                    .max_h(px(120.))
+                    .overflow_y_scroll()
+                    .children(foreign_keys),
+            )
+            .child(
+                h_flex().child(
+                    Button::new("add-fk")
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::Plus)
+                        .label("Foreign key")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            let name = this.design(cx).name;
+                            this.push_foreign_key(
+                                ForeignKeyDef {
+                                    name: format!("fk_{name}_{}", this.foreign_keys.len() + 1),
+                                    ..ForeignKeyDef::default()
+                                },
+                                window,
+                                cx,
+                            );
+                        })),
+                ),
+            )
+            .child(
                 div()
                     .id("designer-preview")
                     .p_2()
@@ -470,32 +702,39 @@ pub fn open(
 ) {
     window
         .spawn(cx, async move |cx| {
-            let original = match table {
-                Some(table) => {
-                    let (d, t) = (db.clone(), table.clone());
-                    let loaded = runtime::run(async move {
-                        let mut s = session.lock().await;
-                        let columns = s.list_columns(&d, &t).await?;
-                        let indexes = s.list_indexes(&d, &t).await?;
-                        Ok::<_, ovs_core::Error>(TableDesign::from_table(&t, &columns, &indexes))
-                    })
-                    .await;
-                    match loaded {
-                        Ok(design) => Some(design),
-                        Err(err) => {
-                            cx.update(|window, cx| {
-                                window.push_notification(
-                                    format!("Could not load {table}: {err}"),
-                                    cx,
-                                );
+            let original =
+                match table {
+                    Some(table) => {
+                        let (d, t) = (db.clone(), table.clone());
+                        let loaded =
+                            runtime::run(async move {
+                                let mut s = session.lock().await;
+                                let columns = s.list_columns(&d, &t).await?;
+                                let indexes = s.list_indexes(&d, &t).await?;
+                                let foreign_keys = s.list_foreign_keys(&d, &t).await?;
+                                let options = s.table_options(&d, &t).await?;
+                                Ok::<_, ovs_core::Error>(
+                                    TableDesign::from_table(&t, &columns, &indexes)
+                                        .with_constraints(&d, &foreign_keys, options),
+                                )
                             })
-                            .ok();
-                            return;
+                            .await;
+                        match loaded {
+                            Ok(design) => Some(design),
+                            Err(err) => {
+                                cx.update(|window, cx| {
+                                    window.push_notification(
+                                        format!("Could not load {table}: {err}"),
+                                        cx,
+                                    );
+                                })
+                                .ok();
+                                return;
+                            }
                         }
                     }
-                }
-                None => None,
-            };
+                    None => None,
+                };
             cx.update(|window, cx| show(db, original, apply, window, cx))
                 .ok();
         })
@@ -518,7 +757,7 @@ fn show(
         let (designer, apply) = (designer.clone(), apply.clone());
         dialog
             .title(title.clone())
-            .w(px(980.))
+            .w(px(1080.))
             .child(designer.clone())
             .footer(
                 h_flex()

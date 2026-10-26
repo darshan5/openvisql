@@ -5,7 +5,9 @@ use async_trait::async_trait;
 use crate::connection::{ConnectionConfig, Engine};
 use crate::error::Result;
 use crate::result::QueryOutcome;
-use crate::schema::{ColumnInfo, IndexInfo, ObjectKind, SchemaObject};
+use crate::schema::{
+    ColumnInfo, ForeignKeyInfo, IndexInfo, ObjectKind, SchemaObject, TableOptions,
+};
 use crate::sql::Dialect;
 
 /// Entry point for one database engine.
@@ -47,6 +49,12 @@ pub trait Session: Send {
     -> Result<Vec<SchemaObject>>;
     async fn list_columns(&mut self, database: &str, table: &str) -> Result<Vec<ColumnInfo>>;
     async fn list_indexes(&mut self, database: &str, table: &str) -> Result<Vec<IndexInfo>>;
+    async fn list_foreign_keys(
+        &mut self,
+        database: &str,
+        table: &str,
+    ) -> Result<Vec<ForeignKeyInfo>>;
+    async fn table_options(&mut self, database: &str, table: &str) -> Result<TableOptions>;
 
     /// The `CREATE ...` statement for an object.
     async fn object_ddl(&mut self, database: &str, name: &str, kind: ObjectKind) -> Result<String>;

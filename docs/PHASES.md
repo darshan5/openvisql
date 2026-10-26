@@ -86,7 +86,9 @@ Phase 2 is complete.
     live `CREATE TABLE` / `ALTER TABLE` preview; opened from the object browser.
   - ✅ Indexes (INDEX, UNIQUE, FULLTEXT, SPATIAL, prefix lengths); renamed columns carry
     their indexes along.
-  - Foreign keys, checks and advanced options (engine, charset).
+  - ✅ Foreign keys (multi-column, cross-database, ON DELETE / ON UPDATE) and table options
+    (engine, collation, comment).
+  - CHECK constraints, partitions.
 - ✅ SQL dump backup and restore (run script) with abort-on-error.
 - ✅ Import CSV (batched `INSERT`s in one transaction, rolled back on error).
 - ✅ Process list, variables and status views. User manager still to do.
