@@ -1123,3 +1123,113 @@ async fn copy_database_between_sessions() {
         .unwrap();
     cleanup(src, &db).await;
 }
+
+#[tokio::test]
+async fn table_designer_partitions() {
+    use ovs_core::sql::Dialect;
+    use ovs_core::sql::design::{ColumnDef, TableDesign, alter_sql, create_statements};
+
+    async fn load(s: &mut Box<dyn Session>, db: &str) -> TableDesign {
+        let columns = s.list_columns(db, "events").await.unwrap();
+        let indexes = s.list_indexes(db, "events").await.unwrap();
+        let options = s.table_options(db, "events").await.unwrap();
+        TableDesign::from_table(Dialect::MySql, "events", &columns, &indexes).with_constraints(
+            db,
+            &[],
+            options,
+        )
+    }
+    async fn partitions(s: &mut Box<dyn Session>, db: &str) -> Vec<Value> {
+        let out = s
+            .execute(
+                &format!(
+                    "SELECT PARTITION_NAME FROM information_schema.PARTITIONS \
+                     WHERE TABLE_SCHEMA = '{db}' AND TABLE_NAME = 'events' \
+                     AND PARTITION_NAME IS NOT NULL ORDER BY PARTITION_ORDINAL_POSITION"
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        rows(&out[0]).iter().map(|r| r[0].clone()).collect()
+    }
+    let Some((mut s, db)) = scratch("designer_parts").await else {
+        return;
+    };
+    let d = Dialect::MySql;
+    let mut design = TableDesign {
+        name: "events".into(),
+        columns: vec![
+            ColumnDef {
+                name: "id".into(),
+                data_type: "INT".into(),
+                primary_key: true,
+                ..ColumnDef::default()
+            },
+            ColumnDef {
+                name: "what".into(),
+                data_type: "VARCHAR(20)".into(),
+                nullable: true,
+                ..ColumnDef::default()
+            },
+        ],
+        ..TableDesign::default()
+    };
+    design.options.partitioning =
+        "PARTITION BY RANGE (id) (\n  PARTITION low VALUES LESS THAN (100),\n  \
+                                   PARTITION high VALUES LESS THAN MAXVALUE\n)"
+            .into();
+    design.validate_for(d).unwrap();
+    for sql in create_statements(d, &db, &design) {
+        s.execute(&sql, None)
+            .await
+            .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+    }
+    s.execute("INSERT INTO events VALUES (1, 'a'), (500, 'b')", None)
+        .await
+        .unwrap();
+    assert_eq!(
+        partitions(&mut s, &db).await,
+        [Value::Text("low".into()), Value::Text("high".into())]
+    );
+
+    // Loaded back, the clause is what the server shows, and unchanged means no statements.
+    let before = load(&mut s, &db).await;
+    assert!(
+        before
+            .options
+            .partitioning
+            .starts_with("PARTITION BY RANGE"),
+        "{}",
+        before.options.partitioning
+    );
+    assert!(!before.options.partitioning.contains("*/"));
+    assert_eq!(alter_sql(d, &db, &before, &before).len(), 0);
+
+    // Repartition along with a column change, then remove partitioning; the rows stay.
+    let mut after = before.clone();
+    after.columns[1].data_type = "VARCHAR(40)".into();
+    after.options.partitioning = "PARTITION BY HASH (id) PARTITIONS 3".into();
+    for sql in alter_sql(d, &db, &before, &after) {
+        s.execute(&sql, None)
+            .await
+            .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+    }
+    assert_eq!(partitions(&mut s, &db).await.len(), 3);
+    let before = load(&mut s, &db).await;
+    let mut after = before.clone();
+    after.options.partitioning = String::new();
+    for sql in alter_sql(d, &db, &before, &after) {
+        s.execute(&sql, None)
+            .await
+            .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+    }
+    assert_eq!(partitions(&mut s, &db).await.len(), 0);
+    assert_eq!(load(&mut s, &db).await.options.partitioning, "");
+    let out = s
+        .execute("SELECT COUNT(*) FROM events", None)
+        .await
+        .unwrap();
+    assert_eq!(rows(&out[0])[0][0], Value::Int(2));
+    cleanup(s, &db).await;
+}

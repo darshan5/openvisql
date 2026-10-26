@@ -147,6 +147,8 @@ pub struct TableOptions {
     pub engine: String,
     pub collation: String,
     pub comment: String,
+    /// MySQL: the table's `PARTITION BY …` clause; empty when it isn't partitioned.
+    pub partitioning: String,
 }
 
 impl IndexInfo {

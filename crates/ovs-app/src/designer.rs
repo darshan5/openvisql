@@ -8,13 +8,13 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,
     h_flex,
-    input::{Input, InputEvent, InputState},
+    input::{Input, InputEvent, InputState, Textarea, TextareaState},
     menu::{DropdownMenu as _, PopupMenuItem},
     tab::{Tab, TabBar},
     v_flex,
 };
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
+    App, AppContext as _, Context, Entity, EventEmitter, InteractiveElement as _, IntoElement,
     ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
     Subscription, Window, div, prelude::FluentBuilder as _, px,
 };
@@ -88,15 +88,27 @@ enum Section {
     Indexes,
     ForeignKeys,
     Checks,
+    /// MySQL only.
+    Partitions,
 }
 
 impl Section {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::Columns,
         Self::Indexes,
         Self::ForeignKeys,
         Self::Checks,
+        Self::Partitions,
     ];
+
+    /// The sections shown for tables of dialect `d`.
+    fn all_for(d: Dialect) -> &'static [Self] {
+        if d == Dialect::MySql {
+            &Self::ALL
+        } else {
+            &Self::ALL[..4]
+        }
+    }
 
     fn label(self) -> &'static str {
         match self {
@@ -104,6 +116,7 @@ impl Section {
             Self::Indexes => "Indexes",
             Self::ForeignKeys => "Foreign keys",
             Self::Checks => "Checks",
+            Self::Partitions => "Partitions",
         }
     }
 }
@@ -122,6 +135,7 @@ pub struct TableDesigner {
     engine: Entity<InputState>,
     collation: Entity<InputState>,
     table_comment: Entity<InputState>,
+    partitioning: Entity<TextareaState>,
     next_id: usize,
     subscriptions: Vec<Subscription>,
 }
@@ -165,6 +179,15 @@ impl TableDesigner {
         let engine = option(&start.options.engine, "server default", window, cx);
         let collation = option(&start.options.collation, "server default", window, cx);
         let table_comment = option(&start.options.comment, "", window, cx);
+        let partitioning = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .rows(8)
+                .placeholder(
+                    "PARTITION BY RANGE (id) (\n  PARTITION p0 VALUES LESS THAN (1000000),\n  \
+                     PARTITION p1 VALUES LESS THAN MAXVALUE\n)",
+                )
+                .default_value(start.options.partitioning.clone())
+        });
         let mut designer = Self {
             dialect,
             db,
@@ -178,12 +201,14 @@ impl TableDesigner {
             engine: engine.clone(),
             collation: collation.clone(),
             table_comment: table_comment.clone(),
+            partitioning: partitioning.clone(),
             next_id: 0,
             subscriptions: Vec::new(),
         };
         for input in [&name, &engine, &collation, &table_comment] {
             designer.watch(input, cx);
         }
+        designer.watch(&partitioning, cx);
         for column in start.columns {
             designer.push_row(column, window, cx);
         }
@@ -200,7 +225,7 @@ impl TableDesigner {
     }
 
     /// Re-renders the SQL preview whenever `input` changes.
-    fn watch(&mut self, input: &Entity<InputState>, cx: &mut Context<Self>) {
+    fn watch<T: EventEmitter<InputEvent>>(&mut self, input: &Entity<T>, cx: &mut Context<Self>) {
         self.subscriptions
             .push(cx.subscribe(input, |_, _, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
@@ -397,6 +422,7 @@ impl TableDesigner {
                 engine: text(&self.engine),
                 collation: text(&self.collation),
                 comment: self.table_comment.read(cx).value().to_string(),
+                partitioning: self.partitioning.read(cx).value().trim().to_owned(),
             },
         }
     }
@@ -677,7 +703,7 @@ impl Render for TableDesigner {
                 .icon(IconName::Plus)
                 .label(label)
         };
-        let (headers, rows, add_button): (Vec<_>, Vec<_>, Button) = match self.section {
+        let (headers, rows, add_button): (Vec<_>, Vec<_>, Option<Button>) = match self.section {
             Section::Columns => (
                 vec![
                     header("Column", Some(150.)),
@@ -694,18 +720,20 @@ impl Render for TableDesigner {
                     .enumerate()
                     .map(|(ix, row)| Self::render_row(ix, row, comments, cx).into_any_element())
                     .collect(),
-                add("add-column", "Column").on_click(cx.listener(|this, _, window, cx| {
-                    this.push_row(
-                        ColumnDef {
-                            name: format!("column_{}", this.rows.len() + 1),
-                            data_type: "VARCHAR(100)".into(),
-                            nullable: true,
-                            ..ColumnDef::default()
-                        },
-                        window,
-                        cx,
-                    );
-                })),
+                Some(
+                    add("add-column", "Column").on_click(cx.listener(|this, _, window, cx| {
+                        this.push_row(
+                            ColumnDef {
+                                name: format!("column_{}", this.rows.len() + 1),
+                                data_type: "VARCHAR(100)".into(),
+                                nullable: true,
+                                ..ColumnDef::default()
+                            },
+                            window,
+                            cx,
+                        );
+                    })),
+                ),
             ),
             Section::Indexes => (
                 vec![
@@ -719,16 +747,18 @@ impl Render for TableDesigner {
                     .enumerate()
                     .map(|(ix, index)| Self::render_index(ix, index, kinds, cx).into_any_element())
                     .collect(),
-                add("add-index", "Index").on_click(cx.listener(|this, _, window, cx| {
-                    this.push_index(
-                        IndexDef {
-                            name: format!("idx_{}", this.indexes.len() + 1),
-                            ..IndexDef::default()
-                        },
-                        window,
-                        cx,
-                    );
-                })),
+                Some(
+                    add("add-index", "Index").on_click(cx.listener(|this, _, window, cx| {
+                        this.push_index(
+                            IndexDef {
+                                name: format!("idx_{}", this.indexes.len() + 1),
+                                ..IndexDef::default()
+                            },
+                            window,
+                            cx,
+                        );
+                    })),
+                ),
             ),
             Section::ForeignKeys => (
                 vec![
@@ -745,17 +775,19 @@ impl Render for TableDesigner {
                     .enumerate()
                     .map(|(ix, fk)| Self::render_foreign_key(ix, fk, cx).into_any_element())
                     .collect(),
-                add("add-fk", "Foreign key").on_click(cx.listener(|this, _, window, cx| {
-                    let name = this.design(cx).name;
-                    this.push_foreign_key(
-                        ForeignKeyDef {
-                            name: format!("fk_{name}_{}", this.foreign_keys.len() + 1),
-                            ..ForeignKeyDef::default()
-                        },
-                        window,
-                        cx,
-                    );
-                })),
+                Some(
+                    add("add-fk", "Foreign key").on_click(cx.listener(|this, _, window, cx| {
+                        let name = this.design(cx).name;
+                        this.push_foreign_key(
+                            ForeignKeyDef {
+                                name: format!("fk_{name}_{}", this.foreign_keys.len() + 1),
+                                ..ForeignKeyDef::default()
+                            },
+                            window,
+                            cx,
+                        );
+                    })),
+                ),
             ),
             Section::Checks => (
                 vec![
@@ -768,29 +800,40 @@ impl Render for TableDesigner {
                     .enumerate()
                     .map(|(ix, check)| Self::render_check(ix, check, cx).into_any_element())
                     .collect(),
-                add("add-check", "Check").on_click(cx.listener(|this, _, window, cx| {
-                    let name = this.design(cx).name;
-                    this.push_check(
-                        CheckDef {
-                            name: format!("{name}_chk_{}", this.checks.len() + 1),
-                            ..CheckDef::default()
-                        },
-                        window,
-                        cx,
-                    );
-                })),
+                Some(
+                    add("add-check", "Check").on_click(cx.listener(|this, _, window, cx| {
+                        let name = this.design(cx).name;
+                        this.push_check(
+                            CheckDef {
+                                name: format!("{name}_chk_{}", this.checks.len() + 1),
+                                ..CheckDef::default()
+                            },
+                            window,
+                            cx,
+                        );
+                    })),
+                ),
+            ),
+            Section::Partitions => (
+                vec![header(
+                    "The table's PARTITION BY clause, as MySQL takes it. Leave empty for none.",
+                    None,
+                )],
+                vec![Textarea::new(&self.partitioning).into_any_element()],
+                None,
             ),
         };
-        let counts = [
-            self.rows.len(),
-            self.indexes.len(),
-            self.foreign_keys.len(),
-            self.checks.len(),
-        ];
-        let tabs = Section::ALL
-            .iter()
-            .zip(counts)
-            .map(|(section, count)| Tab::new().label(format!("{} ({count})", section.label())));
+        let sections = Section::all_for(self.dialect);
+        let tabs = sections.iter().map(|section| {
+            let count = match section {
+                Section::Columns => self.rows.len(),
+                Section::Indexes => self.indexes.len(),
+                Section::ForeignKeys => self.foreign_keys.len(),
+                Section::Checks => self.checks.len(),
+                Section::Partitions => return Tab::new().label(section.label()),
+            };
+            Tab::new().label(format!("{} ({count})", section.label()))
+        });
         v_flex()
             .gap_2()
             .child(
@@ -816,9 +859,14 @@ impl Render for TableDesigner {
                 TabBar::new("designer-sections")
                     .underline()
                     .small()
-                    .selected_index(self.section as usize)
+                    .selected_index(
+                        sections
+                            .iter()
+                            .position(|s| *s == self.section)
+                            .unwrap_or(0),
+                    )
                     .on_click(cx.listener(|this, ix: &usize, _, cx| {
-                        this.section = Section::ALL[*ix];
+                        this.section = Section::all_for(this.dialect)[*ix];
                         cx.notify();
                     }))
                     .children(tabs),
@@ -832,7 +880,7 @@ impl Render for TableDesigner {
                     .overflow_y_scroll()
                     .children(rows),
             )
-            .child(h_flex().child(add_button))
+            .child(h_flex().children(add_button))
             .child(
                 div()
                     .id("designer-preview")

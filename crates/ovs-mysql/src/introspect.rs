@@ -246,11 +246,45 @@ pub(crate) async fn table_options(
         .rows
         .first()
         .ok_or_else(|| Error::Other(format!("table {table} not found")))?;
+    let (engine, collation, comment) = (
+        text(&rs, row, "engine"),
+        text(&rs, row, "collation"),
+        text(&rs, row, "comment"),
+    );
+    let create = ddl(s, db, table, ObjectKind::Table).await?;
     Ok(TableOptions {
-        engine: text(&rs, row, "engine"),
-        collation: text(&rs, row, "collation"),
-        comment: text(&rs, row, "comment"),
+        engine,
+        collation,
+        comment,
+        partitioning: partition_clause(&create),
     })
+}
+
+/// The `PARTITION BY …` clause of a `SHOW CREATE TABLE`, without the version comment MySQL
+/// wraps it in (MariaDB doesn't); empty when the table isn't partitioned.
+fn partition_clause(create: &str) -> String {
+    let mut offset = 0;
+    for line in create.split_inclusive('\n') {
+        let body = line.trim_start();
+        let body = match body.strip_prefix("/*!") {
+            Some(rest) => rest
+                .trim_start_matches(|c: char| c.is_ascii_digit())
+                .trim_start(),
+            None => body,
+        };
+        if body.starts_with("PARTITION BY") {
+            let start = offset + (line.len() - body.len());
+            let clause = create[start..].trim_end();
+            let clause = if line.trim_start().starts_with("/*!") {
+                clause.strip_suffix("*/").unwrap_or(clause).trim_end()
+            } else {
+                clause
+            };
+            return clause.to_owned();
+        }
+        offset += line.len();
+    }
+    String::new()
 }
 
 pub(crate) async fn ddl(
@@ -291,6 +325,27 @@ pub(crate) async fn ddl(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finds_partition_clauses() {
+        let mysql = "CREATE TABLE `t` (\n  `id` int NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB\n\
+                     /*!50100 PARTITION BY RANGE (`id`)\n(PARTITION p0 VALUES LESS THAN (10) ENGINE = InnoDB,\n \
+                     PARTITION p1 VALUES LESS THAN MAXVALUE ENGINE = InnoDB) */";
+        assert_eq!(
+            partition_clause(mysql),
+            "PARTITION BY RANGE (`id`)\n(PARTITION p0 VALUES LESS THAN (10) ENGINE = InnoDB,\n \
+             PARTITION p1 VALUES LESS THAN MAXVALUE ENGINE = InnoDB)"
+        );
+        let mariadb = "CREATE TABLE `t` (\n  `id` int(11) NOT NULL\n) ENGINE=InnoDB\n \
+                       PARTITION BY HASH (`id`)\nPARTITIONS 4";
+        assert_eq!(
+            partition_clause(mariadb),
+            "PARTITION BY HASH (`id`)\nPARTITIONS 4"
+        );
+        // A column's comment mentioning partitions isn't the clause.
+        let plain = "CREATE TABLE `t` (\n  `p` int COMMENT 'PARTITION BY x'\n) ENGINE=InnoDB";
+        assert_eq!(partition_clause(plain), "");
+    }
 
     #[test]
     fn parses_checks_from_create_table() {

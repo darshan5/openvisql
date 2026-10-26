@@ -90,7 +90,9 @@ Phase 2 is complete.
     (engine, collation, comment).
   - ✅ CHECK constraints (re-created when a column they use is renamed).
   - ✅ Sections in tabs (columns, indexes, foreign keys, checks) with the SQL preview below.
-  - Partitions (later).
+  - ✅ Partitions (MySQL and MariaDB): the table's `PARTITION BY` clause, edited as SQL in
+    its own tab. A change repartitions with `ALTER TABLE … PARTITION BY`; clearing it runs
+    `REMOVE PARTITIONING`. Partitioned tables can't have foreign keys, which is checked first.
 - ✅ SQL dump backup and restore (run script) with abort-on-error.
 - ✅ Import CSV (batched `INSERT`s in one transaction, rolled back on error).
 - ✅ Process list, variables and status views.

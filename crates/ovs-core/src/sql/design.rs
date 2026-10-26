@@ -357,6 +357,18 @@ impl TableDesign {
     /// `validate`, plus the limits of `d`.
     pub fn validate_for(&self, d: Dialect) -> Result<(), String> {
         self.validate()?;
+        let partitioning = self.options.partitioning.trim();
+        if !partitioning.is_empty() {
+            if !partitioning
+                .get(..12)
+                .is_some_and(|start| start.eq_ignore_ascii_case("PARTITION BY"))
+            {
+                return Err("Partitioning starts with PARTITION BY.".into());
+            }
+            if !self.foreign_keys.is_empty() {
+                return Err("A partitioned table can't have foreign keys.".into());
+            }
+        }
         if d == Dialect::Postgres {
             for index in &self.indexes {
                 if !matches!(index.kind, IndexKind::Index | IndexKind::Unique) {
@@ -846,7 +858,18 @@ pub fn create_sql(d: Dialect, db: &str, design: &TableDesign) -> String {
         sql.push(' ');
         sql.push_str(&option);
     }
+    let partitioning = design.options.partitioning.trim();
+    if !partitioning.is_empty() {
+        sql.push('\n');
+        sql.push_str(partitioning);
+    }
     sql
+}
+
+/// Whether two `PARTITION BY` clauses differ, other than in spacing.
+fn partitioning_changed(before: &str, after: &str) -> bool {
+    let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    words(before) != words(after)
 }
 
 /// `CONSTRAINT name CHECK (expression)`.
@@ -1401,7 +1424,7 @@ fn alter_mysql(d: Dialect, db: &str, before: &TableDesign, after: &TableDesign) 
     let changed_options = TableOptions {
         engine: changed_text(&before.options.engine, &after.options.engine),
         collation: changed_text(&before.options.collation, &after.options.collation),
-        comment: String::new(),
+        ..TableOptions::default()
     };
     clauses.extend(options_sql(d, &changed_options));
     if before.options.comment != after.options.comment {
@@ -1416,6 +1439,19 @@ fn alter_mysql(d: Dialect, db: &str, before: &TableDesign, after: &TableDesign) 
             "ALTER TABLE {}\n  {}",
             d.qualified(db, &before.name),
             clauses.join(",\n  ")
+        ));
+    }
+    // Partitioning goes last and on its own: it can't be combined with most other changes.
+    if partitioning_changed(&before.options.partitioning, &after.options.partitioning) {
+        let partitioning = after.options.partitioning.trim();
+        out.push(format!(
+            "ALTER TABLE {}\n  {}",
+            d.qualified(db, &after.name),
+            if partitioning.is_empty() {
+                "REMOVE PARTITIONING"
+            } else {
+                partitioning
+            }
         ));
     }
     if !deferred.is_empty() {
@@ -1550,12 +1586,57 @@ mod tests {
     }
 
     #[test]
+    fn partitioning() {
+        let mut t = table();
+        t.options.partitioning = "PARTITION BY HASH (`id`) PARTITIONS 4".into();
+        t.validate_for(D).unwrap();
+        assert!(
+            create_sql(D, "s", &t).ends_with(")\nPARTITION BY HASH (`id`) PARTITIONS 4"),
+            "{}",
+            create_sql(D, "s", &t)
+        );
+
+        let before = t.clone();
+        let mut after = t.clone();
+        // Spacing alone isn't a change.
+        after.options.partitioning = "PARTITION BY  HASH (`id`)\n  PARTITIONS 4".into();
+        assert_eq!(alter_sql(D, "s", &before, &after).len(), 0);
+        after.options.partitioning = "PARTITION BY KEY (`id`) PARTITIONS 2".into();
+        after.columns[1].name = "label".into();
+        let sql = alter_sql(D, "s", &before, &after);
+        assert_eq!(sql.len(), 2, "{sql:?}");
+        assert_eq!(
+            sql[1],
+            "ALTER TABLE `s`.`t`\n  PARTITION BY KEY (`id`) PARTITIONS 2"
+        );
+        after.options.partitioning = String::new();
+        assert!(
+            alter_sql(D, "s", &before, &after)[1].ends_with("REMOVE PARTITIONING"),
+            "{:?}",
+            alter_sql(D, "s", &before, &after)
+        );
+
+        after.options.partitioning = "HASH (`id`)".into();
+        assert!(after.validate_for(D).unwrap_err().contains("PARTITION BY"));
+        after.options.partitioning = "partition by hash (id)".into();
+        after.foreign_keys.push(ForeignKeyDef {
+            name: "fk".into(),
+            columns: vec!["id".into()],
+            ref_table: "o".into(),
+            ref_columns: vec!["id".into()],
+            ..ForeignKeyDef::default()
+        });
+        assert!(after.validate_for(D).unwrap_err().contains("foreign keys"));
+    }
+
+    #[test]
     fn foreign_keys_and_options() {
         let mut t = table();
         t.options = TableOptions {
             engine: "InnoDB".into(),
             collation: "utf8mb4_unicode_ci".into(),
             comment: "people's".into(),
+            ..TableOptions::default()
         };
         t.foreign_keys.push(ForeignKeyDef {
             name: "fk_owner".into(),
