@@ -41,7 +41,10 @@ pub fn generate_edit(dialect: Dialect, schema: &str, table: &str, edit: &RowEdit
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!("UPDATE {target} SET {set}{}", where_clause(dialect, key))
+            format!(
+                "UPDATE {target} SET {set}{}",
+                where_clause(dialect, &target, key)
+            )
         }
         RowEdit::Insert { values } => {
             let cols = values
@@ -57,15 +60,18 @@ pub fn generate_edit(dialect: Dialect, schema: &str, table: &str, edit: &RowEdit
             format!("INSERT INTO {target} ({cols}) VALUES ({vals})")
         }
         RowEdit::Delete { key } => {
-            format!("DELETE FROM {target}{}", where_clause(dialect, key))
+            format!(
+                "DELETE FROM {target}{}",
+                where_clause(dialect, &target, key)
+            )
         }
     }
 }
 
-fn where_clause(dialect: Dialect, key: &RowKey) -> String {
+fn where_clause(dialect: Dialect, target: &str, key: &RowKey) -> String {
     let (cols, limit) = match key {
-        RowKey::Unique(cols) => (cols, ""),
-        RowKey::AllColumns(cols) => (cols, " LIMIT 1"),
+        RowKey::Unique(cols) => (cols, false),
+        RowKey::AllColumns(cols) => (cols, true),
     };
     let preds = cols
         .iter()
@@ -79,12 +85,31 @@ fn where_clause(dialect: Dialect, key: &RowKey) -> String {
         })
         .collect::<Vec<_>>()
         .join(" AND ");
-    format!(" WHERE {preds}{limit}")
+    match (limit, dialect) {
+        (false, _) => format!(" WHERE {preds}"),
+        (true, Dialect::MySql) => format!(" WHERE {preds} LIMIT 1"),
+        // SQLite's UPDATE and DELETE take no LIMIT, but every keyless table has a rowid.
+        (true, Dialect::Sqlite) => {
+            format!(" WHERE rowid = (SELECT rowid FROM {target} WHERE {preds} LIMIT 1)")
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sqlite_keyless_edits_use_the_rowid() {
+        let edit = RowEdit::Delete {
+            key: RowKey::AllColumns(vec![("a".into(), Value::Int(1))]),
+        };
+        assert_eq!(
+            generate_edit(Dialect::Sqlite, "main", "t", &edit),
+            "DELETE FROM \"main\".\"t\" WHERE rowid = (SELECT rowid FROM \"main\".\"t\" \
+             WHERE \"a\" = 1 LIMIT 1)"
+        );
+    }
 
     fn cell(column: &str, value: Value) -> CellEdit {
         CellEdit {

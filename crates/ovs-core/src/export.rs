@@ -62,6 +62,8 @@ pub struct ExportOptions {
     pub table: String,
     /// Rows per `INSERT` statement.
     pub rows_per_insert: usize,
+    /// How SQL `INSERT`s quote names and values.
+    pub dialect: Dialect,
 }
 
 impl Default for ExportOptions {
@@ -73,6 +75,7 @@ impl Default for ExportOptions {
             null_text: String::new(),
             escape_formulas: false,
             table: "result".to_owned(),
+            dialect: Dialect::default(),
             rows_per_insert: 100,
         }
     }
@@ -195,7 +198,7 @@ fn json(rs: &ResultSet, out: &mut impl Write) -> io::Result<()> {
 }
 
 fn sql_insert(rs: &ResultSet, options: &ExportOptions, out: &mut impl Write) -> io::Result<()> {
-    let d = Dialect::MySql;
+    let d = options.dialect;
     let cols = rs
         .columns
         .iter()

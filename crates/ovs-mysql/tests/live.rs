@@ -386,10 +386,10 @@ async fn paging_filtering_and_sorting_queries_run() {
 
 #[tokio::test]
 async fn object_templates_and_info_queries_run() {
-    use ovs_core::sql::split_statements;
     use ovs_core::sql::templates::{
         create_template, database_info, drop_object, rename_table, table_info, truncate_table,
     };
+    use ovs_core::sql::{Dialect, split_statements};
 
     let Some((mut s, db)) = scratch("templates").await else {
         return;
@@ -403,16 +403,21 @@ async fn object_templates_and_info_queries_run() {
         ObjectKind::Trigger,
         ObjectKind::Event,
     ] {
-        for stmt in split_statements(&create_template(kind, &db, Some("new_table"))) {
+        for stmt in split_statements(&create_template(
+            Dialect::MySql,
+            kind,
+            &db,
+            Some("new_table"),
+        )) {
             s.execute(&stmt.sql, None)
                 .await
                 .unwrap_or_else(|e| panic!("{kind:?}: {e}\n{}", stmt.sql));
         }
     }
-    for stmt in split_statements(&table_info(&db, "new_table")) {
+    for stmt in split_statements(&table_info(Dialect::MySql, &db, "new_table")) {
         s.execute(&stmt.sql, None).await.unwrap();
     }
-    for stmt in split_statements(&database_info(&db)) {
+    for stmt in split_statements(&database_info(Dialect::MySql, &db)) {
         s.execute(&stmt.sql, None).await.unwrap();
     }
     for sql in [
@@ -427,18 +432,27 @@ async fn object_templates_and_info_queries_run() {
                 .unwrap_or_else(|e| panic!("{e}\n{}", stmt.sql));
         }
     }
-    s.execute(&truncate_table(&db, "new_table"), None)
+    s.execute(&truncate_table(Dialect::MySql, &db, "new_table"), None)
         .await
         .unwrap();
-    s.execute(&rename_table(&db, "new_table", "renamed"), None)
-        .await
-        .unwrap();
-    s.execute(&drop_object(ObjectKind::Trigger, &db, "new_trigger"), None)
-        .await
-        .unwrap();
-    s.execute(&drop_object(ObjectKind::Table, &db, "renamed"), None)
-        .await
-        .unwrap();
+    s.execute(
+        &rename_table(Dialect::MySql, &db, "new_table", "renamed"),
+        None,
+    )
+    .await
+    .unwrap();
+    s.execute(
+        &drop_object(Dialect::MySql, ObjectKind::Trigger, &db, "new_trigger"),
+        None,
+    )
+    .await
+    .unwrap();
+    s.execute(
+        &drop_object(Dialect::MySql, ObjectKind::Table, &db, "renamed"),
+        None,
+    )
+    .await
+    .unwrap();
     cleanup(s, &db).await;
 }
 

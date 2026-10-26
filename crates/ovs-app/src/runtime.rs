@@ -42,6 +42,7 @@ where
 pub fn driver_for(config: &ConnectionConfig) -> Arc<dyn Driver> {
     match config.engine {
         ovs_core::Engine::MySql => Arc::new(ovs_mysql::MySqlDriver),
+        ovs_core::Engine::Sqlite => Arc::new(ovs_sqlite::SqliteDriver),
     }
 }
 
@@ -148,6 +149,32 @@ mod tests {
     use ovs_ssh::SshAuth;
 
     use super::*;
+
+    #[test]
+    fn connects_to_sqlite_files() {
+        let path = std::env::temp_dir().join(format!("ovs-app-{}.sqlite", std::process::id()));
+        let config = ConnectionConfig {
+            engine: ovs_core::Engine::Sqlite,
+            path: path.to_string_lossy().into_owned(),
+            ..ConnectionConfig::default()
+        };
+        let rows = runtime().block_on(async {
+            let session = connect(config, None).await.unwrap();
+            run(async move {
+                let mut s = session.lock().await;
+                s.execute("CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (4)", None)
+                    .await
+                    .unwrap();
+                s.execute("SELECT a FROM t", None).await.unwrap()
+            })
+            .await
+        });
+        let _ = std::fs::remove_file(&path);
+        let QueryOutcome::Rows(rs) = &rows[0] else {
+            panic!("{rows:?}")
+        };
+        assert_eq!(rs.rows[0][0], Value::Int(4));
+    }
 
     /// End to end through a real SSH server. Skipped unless `OVS_TEST_SSH` is
     /// `ssh_host:ssh_port:ssh_user:ssh_password:db_host:db_port` (the database as seen from the

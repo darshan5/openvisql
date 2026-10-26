@@ -8,18 +8,40 @@ pub enum Engine {
     /// MySQL and MariaDB share one wire protocol and driver.
     #[default]
     MySql,
+    /// A database file opened in-process.
+    Sqlite,
 }
 
 impl Engine {
+    pub const ALL: [Self; 2] = [Self::MySql, Self::Sqlite];
+
     pub fn default_port(self) -> u16 {
         match self {
             Self::MySql => 3306,
+            Self::Sqlite => 0,
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
             Self::MySql => "MySQL / MariaDB",
+            Self::Sqlite => "SQLite",
+        }
+    }
+
+    pub fn dialect(self) -> crate::sql::Dialect {
+        match self {
+            Self::MySql => crate::sql::Dialect::MySql,
+            Self::Sqlite => crate::sql::Dialect::Sqlite,
+        }
+    }
+
+    /// Whether connecting means reaching a server (host, user, password, SSL, SSH), rather
+    /// than opening a file.
+    pub fn is_server(self) -> bool {
+        match self {
+            Self::MySql => true,
+            Self::Sqlite => false,
         }
     }
 }
@@ -107,6 +129,8 @@ pub struct ConnectionConfig {
     /// Ask before running UPDATE/DELETE without a WHERE clause.
     pub safe_updates: bool,
     pub ssh: SshConfig,
+    /// The database file, for engines that open one (SQLite).
+    pub path: String,
 }
 
 impl Default for ConnectionConfig {
@@ -129,6 +153,7 @@ impl Default for ConnectionConfig {
             connect_timeout_secs: 10,
             safe_updates: true,
             ssh: SshConfig::default(),
+            path: String::new(),
         }
     }
 }
@@ -145,7 +170,11 @@ impl ConnectionConfig {
 
     /// `user@host:port`, used in window titles and the status bar.
     pub fn endpoint(&self) -> String {
-        format!("{}@{}:{}", self.user, self.host, self.port)
+        if self.engine.is_server() {
+            format!("{}@{}:{}", self.user, self.host, self.port)
+        } else {
+            self.path.clone()
+        }
     }
 }
 

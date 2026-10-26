@@ -366,10 +366,9 @@ impl ResultGrid {
     }
 
     /// The SQL that saves every pending change.
-    pub fn save_statements(&self) -> Vec<String> {
+    pub fn save_statements(&self, dialect: ovs_core::sql::Dialect) -> Vec<String> {
         self.target().map_or_else(Vec::new, |target| {
-            self.pending
-                .statements(target, &self.data, ovs_core::sql::Dialect::MySql)
+            self.pending.statements(target, &self.data, dialect)
         })
     }
 }

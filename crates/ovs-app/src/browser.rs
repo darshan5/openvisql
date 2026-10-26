@@ -240,6 +240,7 @@ impl EventEmitter<BrowserEvent> for ObjectBrowser {}
 
 pub struct ObjectBrowser {
     session: SharedSession,
+    dialect: Dialect,
     /// Databases the connection is restricted to; empty means all.
     allowed: Vec<String>,
     tree: Entity<TreeState>,
@@ -255,6 +256,7 @@ pub struct ObjectBrowser {
 impl ObjectBrowser {
     pub fn new(
         session: SharedSession,
+        dialect: Dialect,
         allowed: Vec<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -277,6 +279,7 @@ impl ObjectBrowser {
         ];
         let mut browser = Self {
             session,
+            dialect,
             allowed,
             tree,
             filter,
@@ -449,7 +452,20 @@ impl ObjectBrowser {
         }
         let expanded = self.expanded.contains(&id);
         let children: Vec<Node> = match node.static_children() {
-            Some(children) => children,
+            // Only the kinds of object the engine has (SQLite has no routines or events).
+            Some(children) => children
+                .into_iter()
+                .filter(|child| match child {
+                    Node::Folder { kind, .. } => {
+                        self.dialect == Dialect::MySql
+                            || matches!(
+                                kind,
+                                ObjectKind::Table | ObjectKind::View | ObjectKind::Trigger
+                            )
+                    }
+                    _ => true,
+                })
+                .collect(),
             None => match self.children.get(&id) {
                 None | Some(Loaded::Loading) => vec![Node::Note("Loading…".into())],
                 Some(Loaded::Failed(err)) => vec![Node::Note(err.clone())],
@@ -467,7 +483,14 @@ impl ObjectBrowser {
         item.expanded(expanded)
     }
 
-    fn context_menu(this: &WeakEntity<Self>, node: Option<&Node>, menu: PopupMenu) -> PopupMenu {
+    fn context_menu(
+        this: &WeakEntity<Self>,
+        d: Dialect,
+        node: Option<&Node>,
+        menu: PopupMenu,
+    ) -> PopupMenu {
+        // Server-only features: routines, events, backups, copying, the designer.
+        let mysql = d == Dialect::MySql;
         let emit = |event: BrowserEvent| {
             let this = this.clone();
             move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| {
@@ -490,7 +513,7 @@ impl ObjectBrowser {
             emit(BrowserEvent::OpenSql {
                 title: format!("New {}", kind.sql_keyword().to_lowercase()),
                 db: Some(db.to_owned()),
-                sql: templates::create_template(kind, db, table),
+                sql: templates::create_template(d, kind, db, table),
                 run: false,
             })
         };
@@ -507,7 +530,7 @@ impl ObjectBrowser {
                 _ => "",
             };
             emit(BrowserEvent::ConfirmExecute {
-                sql: templates::drop_object(kind, db, name),
+                sql: templates::drop_object(d, kind, db, name),
                 title: format!("Drop {what} {name}?"),
                 description: format!(
                     "This permanently deletes the {what} \u{201c}{name}\u{201d} {detail}. It can't be undone."
@@ -517,88 +540,120 @@ impl ObjectBrowser {
         };
 
         let menu = match node {
-            Some(Node::Database(db)) => menu
-                .item(
-                    PopupMenuItem::new("Use in query tab")
-                        .on_click(emit(BrowserEvent::UseDatabase(db.clone()))),
-                )
-                .item(
-                    PopupMenuItem::new("Info").on_click(emit(BrowserEvent::OpenSql {
-                        title: format!("{db} (info)"),
-                        db: Some(db.clone()),
-                        sql: templates::database_info(db),
-                        run: true,
-                    })),
-                )
-                .item(PopupMenuItem::new("Show CREATE DATABASE").on_click(emit(
-                    BrowserEvent::ShowDdl {
-                        db: db.clone(),
-                        name: db.clone(),
-                        kind: ObjectKind::Database,
-                    },
-                )))
-                .separator()
-                .item(PopupMenuItem::new("New table (designer)…").on_click(emit(
-                    BrowserEvent::DesignTable {
-                        db: db.clone(),
-                        table: None,
-                    },
-                )))
-                .item(
-                    PopupMenuItem::new("New table (SQL template)…").on_click(new_object(
-                        ObjectKind::Table,
-                        db,
-                        None,
-                    )),
-                )
-                .item(PopupMenuItem::new("New view…").on_click(new_object(
-                    ObjectKind::View,
-                    db,
-                    None,
-                )))
-                .item(
-                    PopupMenuItem::new("New stored procedure…").on_click(new_object(
-                        ObjectKind::Procedure,
-                        db,
-                        None,
-                    )),
-                )
-                .item(PopupMenuItem::new("New function…").on_click(new_object(
-                    ObjectKind::Function,
-                    db,
-                    None,
-                )))
-                .item(PopupMenuItem::new("New event…").on_click(new_object(
-                    ObjectKind::Event,
-                    db,
-                    None,
-                )))
-                .separator()
-                .item(
-                    PopupMenuItem::new("Back up database…")
-                        .on_click(emit(BrowserEvent::Backup(db.clone()))),
-                )
-                .item(
-                    PopupMenuItem::new("Copy to another connection…").on_click(emit(
-                        BrowserEvent::CopyTo {
+            Some(Node::Database(db)) => {
+                let mut menu = menu
+                    .item(
+                        PopupMenuItem::new("Use in query tab")
+                            .on_click(emit(BrowserEvent::UseDatabase(db.clone()))),
+                    )
+                    .item(
+                        PopupMenuItem::new("Info").on_click(emit(BrowserEvent::OpenSql {
+                            title: format!("{db} (info)"),
+                            db: Some(db.clone()),
+                            sql: templates::database_info(d, db),
+                            run: true,
+                        })),
+                    );
+                if mysql {
+                    menu = menu.item(PopupMenuItem::new("Show CREATE DATABASE").on_click(emit(
+                        BrowserEvent::ShowDdl {
+                            db: db.clone(),
+                            name: db.clone(),
+                            kind: ObjectKind::Database,
+                        },
+                    )));
+                }
+                menu = menu.separator();
+                if mysql {
+                    menu = menu.item(PopupMenuItem::new("New table (designer)…").on_click(emit(
+                        BrowserEvent::DesignTable {
                             db: db.clone(),
                             table: None,
                         },
-                    )),
-                )
-                .item(
-                    PopupMenuItem::new("Run SQL script…")
-                        .on_click(emit(BrowserEvent::RunScript(db.clone()))),
-                )
-                .separator()
-                .item(PopupMenuItem::new("Create database…").on_click(create_database))
-                .item(PopupMenuItem::new("Copy name").on_click(copy(db.clone())))
-                .item(PopupMenuItem::new("Drop database…").on_click(drop(
-                    ObjectKind::Database,
-                    db,
-                    db,
-                )))
-                .separator(),
+                    )));
+                }
+                menu = menu
+                    .item(
+                        PopupMenuItem::new(if mysql {
+                            "New table (SQL template)…"
+                        } else {
+                            "New table…"
+                        })
+                        .on_click(new_object(ObjectKind::Table, db, None)),
+                    )
+                    .item(PopupMenuItem::new("New view…").on_click(new_object(
+                        ObjectKind::View,
+                        db,
+                        None,
+                    )));
+                if mysql {
+                    menu = menu
+                        .item(
+                            PopupMenuItem::new("New stored procedure…").on_click(new_object(
+                                ObjectKind::Procedure,
+                                db,
+                                None,
+                            )),
+                        )
+                        .item(PopupMenuItem::new("New function…").on_click(new_object(
+                            ObjectKind::Function,
+                            db,
+                            None,
+                        )))
+                        .item(PopupMenuItem::new("New event…").on_click(new_object(
+                            ObjectKind::Event,
+                            db,
+                            None,
+                        )));
+                }
+                menu = menu.separator();
+                if mysql {
+                    menu = menu
+                        .item(
+                            PopupMenuItem::new("Back up database…")
+                                .on_click(emit(BrowserEvent::Backup(db.clone()))),
+                        )
+                        .item(
+                            PopupMenuItem::new("Copy to another connection…").on_click(emit(
+                                BrowserEvent::CopyTo {
+                                    db: db.clone(),
+                                    table: None,
+                                },
+                            )),
+                        );
+                }
+                menu = menu
+                    .item(
+                        PopupMenuItem::new("Run SQL script…")
+                            .on_click(emit(BrowserEvent::RunScript(db.clone()))),
+                    )
+                    .separator();
+                if mysql {
+                    menu =
+                        menu.item(PopupMenuItem::new("Create database…").on_click(create_database));
+                }
+                menu = menu.item(PopupMenuItem::new("Copy name").on_click(copy(db.clone())));
+                // SQLite's main database can't be removed; attached ones are detached.
+                if mysql {
+                    menu = menu.item(PopupMenuItem::new("Drop database…").on_click(drop(
+                        ObjectKind::Database,
+                        db,
+                        db,
+                    )));
+                } else if db != "main" {
+                    menu = menu.item(PopupMenuItem::new("Detach database").on_click(emit(
+                        BrowserEvent::ConfirmExecute {
+                            sql: templates::drop_object(d, ObjectKind::Database, db, db),
+                            title: format!("Detach {db}?"),
+                            description: format!(
+                                "\u{201c}{db}\u{201d} is closed for this connection; its file is kept."
+                            ),
+                            action: "Detach".into(),
+                        },
+                    )));
+                }
+                menu.separator()
+            }
             Some(Node::Folder { db, kind }) if *kind != ObjectKind::Trigger => menu
                 .item(
                     PopupMenuItem::new(format!("New {}…", kind.sql_keyword().to_lowercase()))
@@ -620,7 +675,7 @@ impl ObjectBrowser {
                         BrowserEvent::OpenSql {
                             title: format!("{name} (info)"),
                             db: Some(db.clone()),
-                            sql: templates::table_info(db, name),
+                            sql: templates::table_info(d, db, name),
                             run: true,
                         },
                     )));
@@ -653,19 +708,22 @@ impl ObjectBrowser {
                 menu = menu.separator();
                 if *kind == ObjectKind::Table {
                     let (rename_db, rename_from) = (db.clone(), name.clone());
+                    if mysql {
+                        menu = menu
+                            .item(PopupMenuItem::new("Copy table to…").on_click(emit(
+                                BrowserEvent::CopyTo {
+                                    db: db.clone(),
+                                    table: Some(name.clone()),
+                                },
+                            )))
+                            .item(PopupMenuItem::new("Design table…").on_click(emit(
+                                BrowserEvent::DesignTable {
+                                    db: db.clone(),
+                                    table: Some(name.clone()),
+                                },
+                            )));
+                    }
                     menu = menu
-                        .item(PopupMenuItem::new("Copy table to…").on_click(emit(
-                            BrowserEvent::CopyTo {
-                                db: db.clone(),
-                                table: Some(name.clone()),
-                            },
-                        )))
-                        .item(PopupMenuItem::new("Design table…").on_click(emit(
-                            BrowserEvent::DesignTable {
-                                db: db.clone(),
-                                table: Some(name.clone()),
-                            },
-                        )))
                         .item(PopupMenuItem::new("New trigger…").on_click(new_object(
                             ObjectKind::Trigger,
                             db,
@@ -676,7 +734,7 @@ impl ObjectBrowser {
                                 title: format!("Rename table {name}"),
                                 initial: name.clone(),
                                 build: Rc::new(move |to| {
-                                    templates::rename_table(&rename_db, &rename_from, to)
+                                    templates::rename_table(d, &rename_db, &rename_from, to)
                                 }),
                             },
                         )))
@@ -688,7 +746,7 @@ impl ObjectBrowser {
                         )))
                         .item(PopupMenuItem::new("Truncate…").on_click(emit(
                             BrowserEvent::ConfirmExecute {
-                                sql: templates::truncate_table(db, name),
+                                sql: templates::truncate_table(d, db, name),
                                 title: format!("Truncate table {name}?"),
                                 description: format!(
                                     "This deletes every row of \u{201c}{name}\u{201d}. It can't be undone."
@@ -722,13 +780,16 @@ impl ObjectBrowser {
         cx: &mut Context<Self>,
     ) {
         let session = self.session.clone();
+        let d = self.dialect;
         cx.spawn(async move |this, cx| {
-            let (d, t) = (db.clone(), table.clone());
+            let (schema, t) = (db.clone(), table.clone());
             let columns =
-                runtime::run(async move { session.lock().await.list_columns(&d, &t).await }).await;
+                runtime::run(async move { session.lock().await.list_columns(&schema, &t).await })
+                    .await;
             this.update(cx, |_, cx| {
                 if let Ok(columns) = columns {
                     let sql = templates::statement_template(
+                        d,
                         template,
                         &db,
                         &table,
@@ -763,7 +824,7 @@ impl ObjectBrowser {
                 kind: LeafKind::Column { .. },
                 label,
                 ..
-            } => BrowserEvent::InsertText(Dialect::MySql.quote_ident(label)),
+            } => BrowserEvent::InsertText(self.dialect.quote_ident(label)),
             _ => return,
         };
         cx.emit(event);
@@ -839,6 +900,7 @@ impl Render for ObjectBrowser {
         let menu_nodes = self.nodes.clone();
         let this = cx.entity().downgrade();
         let menu_this = this.clone();
+        let dialect = self.dialect;
         let muted = cx.theme().muted_foreground;
 
         v_flex()
@@ -878,7 +940,7 @@ impl Render for ObjectBrowser {
                 })
                 .context_menu(move |_, entry, menu, _, _| {
                     let node = menu_nodes.get(entry.item().id.as_ref());
-                    Self::context_menu(&menu_this, node, menu)
+                    Self::context_menu(&menu_this, dialect, node, menu)
                 })
                 .flex_1(),
             )

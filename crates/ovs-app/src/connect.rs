@@ -14,10 +14,11 @@ use gpui_kit::component::{
 };
 use gpui_kit::{
     App, AppContext as _, Axis, Context, Entity, EventEmitter, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Subscription, Window, div, prelude::FluentBuilder as _, px,
+    IntoElement, ParentElement as _, PathPromptOptions, Render, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Window, div,
+    prelude::FluentBuilder as _, px,
 };
-use ovs_core::{ConnectionConfig, PasswordStore, SshAuthMethod, SshConfig, SslMode};
+use ovs_core::{ConnectionConfig, Engine, PasswordStore, SshAuthMethod, SshConfig, SslMode};
 use ovs_ssh::{SshAuth, SshSettings};
 use ovs_store::Store;
 use uuid::Uuid;
@@ -73,6 +74,8 @@ pub struct ConnectView {
     port: Entity<InputState>,
     user: Entity<InputState>,
     password: Entity<InputState>,
+    /// The database file, for SQLite.
+    path: Entity<InputState>,
     databases: Entity<InputState>,
     ssl_ca: Entity<InputState>,
     init_commands: Entity<InputState>,
@@ -129,6 +132,7 @@ impl ConnectView {
             port: input("3306", window, cx),
             user: input("root", window, cx),
             password: password.clone(),
+            path: input("/path/to/database.sqlite", window, cx),
             databases: input("All databases (or db1;db2)", window, cx),
             ssl_ca: input("Path to CA certificate (PEM), optional", window, cx),
             init_commands: input("SET NAMES utf8mb4; SET time_zone = '+00:00'", window, cx),
@@ -158,6 +162,7 @@ impl ConnectView {
         set(&self.host, config.host.clone(), window, cx);
         set(&self.port, config.port.to_string(), window, cx);
         set(&self.user, config.user.clone(), window, cx);
+        set(&self.path, config.path.clone(), window, cx);
         // Left empty: a saved password stays in the keychain until it's needed.
         set(&self.password, String::new(), window, cx);
         self.password_edited = false;
@@ -187,6 +192,35 @@ impl ConnectView {
     /// Reads the form back into a config, validating what the driver can't.
     fn collect(&self, cx: &App) -> Result<Collected, String> {
         let text = |state: &Entity<InputState>| state.read(cx).value().trim().to_owned();
+        if !self.editing.engine.is_server() {
+            let path = text(&self.path);
+            if path.is_empty() {
+                return Err("Choose the database file.".into());
+            }
+            let name = match text(&self.name) {
+                n if n.is_empty() => std::path::Path::new(&path)
+                    .file_stem()
+                    .map_or_else(|| path.clone(), |s| s.to_string_lossy().into_owned()),
+                n => n,
+            };
+            // A file needs no password, so nothing is read from or written to a keychain.
+            let config = ConnectionConfig {
+                name,
+                path: expand_home(&path).to_string_lossy().into_owned(),
+                save_password: false,
+                ssh: SshConfig {
+                    enabled: false,
+                    ..self.editing.ssh.clone()
+                },
+                init_commands: text(&self.init_commands),
+                ..self.editing.clone()
+            };
+            return Ok(Collected {
+                config,
+                password: String::new(),
+                ssh_secret: String::new(),
+            });
+        }
         let host = text(&self.host);
         if host.is_empty() {
             return Err("Host is required.".into());
@@ -661,6 +695,71 @@ impl ConnectView {
         }
     }
 
+    fn set_engine(&mut self, engine: Engine, window: &mut Window, cx: &mut Context<Self>) {
+        if self.editing.engine == engine {
+            return;
+        }
+        self.editing.engine = engine;
+        if engine.is_server()
+            && self
+                .port
+                .read(cx)
+                .value()
+                .trim()
+                .parse::<u16>()
+                .unwrap_or(0)
+                == 0
+        {
+            let port = engine.default_port().to_string();
+            self.port.update(cx, |s, cx| s.set_value(port, window, cx));
+        }
+        cx.notify();
+    }
+
+    /// Picks an existing database file, or (`create`) where to make a new one.
+    fn choose_file(&mut self, create: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let input = self.path.clone();
+        if create {
+            let dir = dirs::document_dir()
+                .or_else(dirs::home_dir)
+                .unwrap_or_else(|| ".".into());
+            let chosen = cx.prompt_for_new_path(&dir, Some("database.sqlite"));
+            window
+                .spawn(cx, async move |cx| {
+                    if let Ok(Ok(Some(path))) = chosen.await {
+                        cx.update(|window, cx| {
+                            input.update(cx, |s, cx| {
+                                s.set_value(path.to_string_lossy().into_owned(), window, cx);
+                            });
+                        })
+                        .ok();
+                    }
+                })
+                .detach();
+        } else {
+            let chosen = cx.prompt_for_paths(PathPromptOptions {
+                files: true,
+                directories: false,
+                multiple: false,
+                prompt: Some("Open".into()),
+            });
+            window
+                .spawn(cx, async move |cx| {
+                    if let Ok(Ok(Some(paths))) = chosen.await
+                        && let Some(path) = paths.into_iter().next()
+                    {
+                        cx.update(|window, cx| {
+                            input.update(cx, |s, cx| {
+                                s.set_value(path.to_string_lossy().into_owned(), window, cx);
+                            });
+                        })
+                        .ok();
+                    }
+                })
+                .detach();
+        }
+    }
+
     fn render_form(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let ssl_ix = SSL_MODES.iter().position(|m| *m == self.editing.ssl);
         let busy = matches!(self.status, Status::Busy(_));
@@ -754,7 +853,46 @@ impl ConnectView {
                     .child(
                         Form::new()
                             .label_layout(Axis::Horizontal)
+                            .child(
+                                Field::new().label("Type").child(
+                                    RadioGroup::horizontal("engine")
+                                        .children(Engine::ALL.map(Engine::label))
+                                        .selected_index(
+                                            Engine::ALL.iter().position(|e| *e == self.editing.engine),
+                                        )
+                                        .on_change(cx.listener(|this, ix: &usize, window, cx| {
+                                            this.set_engine(Engine::ALL[*ix], window, cx);
+                                        })),
+                                ),
+                            )
                             .child(Field::new().label("Name").child(Input::new(&self.name)))
+                            .when(!self.editing.engine.is_server(), |form| {
+                                form.child(
+                                    Field::new()
+                                        .label("Database file")
+                                        .description("Opened directly; a new file is created if it doesn't exist.")
+                                        .child(
+                                            h_flex()
+                                                .gap_2()
+                                                .child(div().flex_1().child(Input::new(&self.path)))
+                                                .child(
+                                                    Button::new("sqlite-open")
+                                                        .label("Open…")
+                                                        .on_click(cx.listener(|this, _, window, cx| {
+                                                            this.choose_file(false, window, cx);
+                                                        })),
+                                                )
+                                                .child(
+                                                    Button::new("sqlite-new")
+                                                        .label("New…")
+                                                        .on_click(cx.listener(|this, _, window, cx| {
+                                                            this.choose_file(true, window, cx);
+                                                        })),
+                                                ),
+                                        ),
+                                )
+                            })
+                            .when(self.editing.engine.is_server(), |form| form
                             .child(Field::new().label("Host").child(Input::new(&self.host)))
                             .child(Field::new().label("Port").child(Input::new(&self.port)))
                             .child(Field::new().label("User").child(Input::new(&self.user)))
@@ -910,14 +1048,14 @@ impl ConnectView {
                                         })
                                         .child(Input::new(&self.ssh_secret).mask_toggle()),
                                 )
-                            })
+                            }))
                             .child(
                                 Field::new()
                                     .label("Init commands")
                                     .description("Run after connecting, separated by ';'.")
                                     .child(Input::new(&self.init_commands)),
                             )
-                            .child(
+                            .when(self.editing.engine.is_server(), |form| form.child(
                                 Field::new().label_indent(true).child(
                                     Checkbox::new("compress")
                                         .label("Use compressed protocol")
@@ -927,7 +1065,7 @@ impl ConnectView {
                                             cx.notify();
                                         })),
                                 ),
-                            )
+                            ))
                             .child(
                                 Field::new().label_indent(true).child(
                                     Checkbox::new("safe-updates")

@@ -13,6 +13,7 @@ rust-version = "1.92"
 [workspace.dependencies]
 ovs-core = { path = "crates/ovs-core" }
 ovs-mysql = { path = "crates/ovs-mysql" }
+ovs-sqlite = { path = "crates/ovs-sqlite" }
 ovs-ssh = { path = "crates/ovs-ssh" }
 ovs-store = { path = "crates/ovs-store" }
 
@@ -26,6 +27,7 @@ dirs = "6"
 futures = "0.3"
 getrandom = "0.4"
 keyring = { version = "3", features = ["apple-native", "windows-native"] }
+rusqlite = { version = "0.41", default-features = false, features = ["bundled", "column_decltype", "column_metadata"] }
 mysql_async = { version = "0.37", default-features = false, features = ["minimal-rust", "rustls-tls", "ring", "tls12", "client_ed25519"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"

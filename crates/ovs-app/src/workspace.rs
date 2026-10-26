@@ -18,9 +18,9 @@ use gpui_kit::component::{
 use gpui_kit::{
     App, AppContext as _, Context, Entity, EntityId, EventEmitter, InteractiveElement as _,
     IntoElement, ParentElement as _, PathPromptOptions, Render, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, px,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Window, div,
+    prelude::FluentBuilder as _, px,
 };
-use ovs_core::sql::Dialect;
 use ovs_core::sql::templates;
 use ovs_core::{ConnectionConfig, ObjectKind};
 use ovs_store::SavedConnectionTab;
@@ -125,7 +125,9 @@ impl Workspace {
             .into_iter()
             .map(str::to_owned)
             .collect();
-        let browser = cx.new(|cx| ObjectBrowser::new(session.clone(), allowed, window, cx));
+        let dialect = config.engine.dialect();
+        let browser =
+            cx.new(|cx| ObjectBrowser::new(session.clone(), dialect, allowed, window, cx));
         let completion = CompletionSource::new(session.clone());
         let sub = cx.subscribe_in(&browser, window, Self::on_browser_event);
 
@@ -325,7 +327,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let d = Dialect::MySql;
+        let d = self.config.engine.dialect();
         match event {
             BrowserEvent::OpenData { db, name } => {
                 let sql = format!(
@@ -663,63 +665,70 @@ impl Workspace {
                     .tooltip("Refresh object browser (F5)")
                     .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
             )
-            .child({
-                let this = cx.entity().downgrade();
-                Button::new("server-menu")
-                    .ghost()
-                    .small()
-                    .label("Server")
-                    .dropdown_caret(true)
-                    .dropdown_menu(move |menu, _, _| {
-                        let open = |title: &'static str, sql: &'static str| {
-                            let this = this.clone();
-                            move |_: &gpui_kit::ClickEvent, window: &mut Window, cx: &mut App| {
-                                this.update(cx, |this, cx| {
-                                    let db = this.active_database(cx);
-                                    this.add_tab(
-                                        Some(title.into()),
-                                        db,
-                                        sql.into(),
-                                        true,
-                                        window,
-                                        cx,
-                                    );
-                                })
-                                .ok();
-                            }
-                        };
-                        menu.item(
-                            PopupMenuItem::new("Process list")
-                                .on_click(open("Process list", templates::PROCESS_LIST)),
-                        )
-                        .item(
-                            PopupMenuItem::new("Server info")
-                                .on_click(open("Server info", templates::SERVER_INFO)),
-                        )
-                        .item(
-                            PopupMenuItem::new("Status variables")
-                                .on_click(open("Status", templates::STATUS_VARIABLES)),
-                        )
-                        .item(
-                            PopupMenuItem::new("System variables")
-                                .on_click(open("Variables", templates::SYSTEM_VARIABLES)),
-                        )
-                        .separator()
-                        .item(
-                            PopupMenuItem::new("Users and privileges…").on_click({
+            // Server tools need a server; SQLite is a file.
+            .when(self.config.engine.is_server(), |bar| {
+                bar.child({
+                    let this = cx.entity().downgrade();
+                    Button::new("server-menu")
+                        .ghost()
+                        .small()
+                        .label("Server")
+                        .dropdown_caret(true)
+                        .dropdown_menu(move |menu, _, _| {
+                            let open = |title: &'static str, sql: &'static str| {
                                 let this = this.clone();
-                                move |_, window, cx| {
-                                    let Some(session) = this
-                                        .read_with(cx, |this, _| this.completion.session.clone())
-                                        .ok()
-                                    else {
-                                        return;
-                                    };
-                                    crate::users::open(session, window, cx);
+                                move |_: &gpui_kit::ClickEvent,
+                                      window: &mut Window,
+                                      cx: &mut App| {
+                                    this.update(cx, |this, cx| {
+                                        let db = this.active_database(cx);
+                                        this.add_tab(
+                                            Some(title.into()),
+                                            db,
+                                            sql.into(),
+                                            true,
+                                            window,
+                                            cx,
+                                        );
+                                    })
+                                    .ok();
                                 }
-                            }),
-                        )
-                    })
+                            };
+                            menu.item(
+                                PopupMenuItem::new("Process list")
+                                    .on_click(open("Process list", templates::PROCESS_LIST)),
+                            )
+                            .item(
+                                PopupMenuItem::new("Server info")
+                                    .on_click(open("Server info", templates::SERVER_INFO)),
+                            )
+                            .item(
+                                PopupMenuItem::new("Status variables")
+                                    .on_click(open("Status", templates::STATUS_VARIABLES)),
+                            )
+                            .item(
+                                PopupMenuItem::new("System variables")
+                                    .on_click(open("Variables", templates::SYSTEM_VARIABLES)),
+                            )
+                            .separator()
+                            .item(
+                                PopupMenuItem::new("Users and privileges…").on_click({
+                                    let this = this.clone();
+                                    move |_, window, cx| {
+                                        let Some(session) = this
+                                            .read_with(cx, |this, _| {
+                                                this.completion.session.clone()
+                                            })
+                                            .ok()
+                                        else {
+                                            return;
+                                        };
+                                        crate::users::open(session, window, cx);
+                                    }
+                                }),
+                            )
+                        })
+                })
             })
             .child(div().flex_1())
             .child(

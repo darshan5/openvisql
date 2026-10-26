@@ -26,6 +26,13 @@ pub struct Statement {
 /// ```
 ///
 /// come out as a single statement. `DELIMITER` lines themselves are not returned.
+///
+/// Without a custom delimiter, a trigger's `BEGIN ... END` body is kept together too, as
+/// SQLite (which has no `DELIMITER`) writes them:
+///
+/// ```sql
+/// CREATE TRIGGER t AFTER INSERT ON a BEGIN INSERT INTO log VALUES (1); END;
+/// ```
 pub fn split_statements(src: &str) -> Vec<Statement> {
     let tokens = tokenize(src);
     let mut out = Vec::new();
@@ -34,6 +41,8 @@ pub fn split_statements(src: &str) -> Vec<Statement> {
     let mut first_code: Option<usize> = None;
     let mut last_code_end = 0;
     let mut i = 0;
+    // Inside `CREATE ... TRIGGER`: whether the statement is one, and how deep in its body.
+    let mut trigger = Trigger::default();
 
     let push = |out: &mut Vec<Statement>, first: Option<usize>, end: usize, span: Range<usize>| {
         if let Some(start) = first {
@@ -72,6 +81,26 @@ pub fn split_statements(src: &str) -> Vec<Statement> {
             continue;
         }
 
+        if delimiter == ";" {
+            if first_code.is_none() {
+                trigger = Trigger::default();
+            }
+            let starts = first_code.is_none();
+            if tok.kind == TokenKind::Word {
+                let next = tokens[i + 1..]
+                    .iter()
+                    .find(|t| !t.kind.is_trivia())
+                    .map(|t| t.text(src));
+                trigger.word(tok.text(src), next, starts);
+            }
+            if trigger.depth > 0 && tok.kind == TokenKind::Semicolon {
+                first_code.get_or_insert(tok.range.start);
+                last_code_end = tok.range.end;
+                i += 1;
+                continue;
+            }
+        }
+
         // A custom delimiter can be glued to the previous word (`END$$`, since `$` is an
         // identifier character), so look inside unquoted tokens, not just at their start.
         let found = if matches!(tok.kind, TokenKind::Word | TokenKind::Number) {
@@ -103,6 +132,54 @@ pub fn split_statements(src: &str) -> Vec<Statement> {
     }
     push(&mut out, first_code, last_code_end, span_start..src.len());
     out
+}
+
+/// Tracks a `CREATE TRIGGER` statement's `BEGIN ... END` body while splitting.
+#[derive(Debug, Default)]
+struct Trigger {
+    create: bool,
+    confirmed: bool,
+    depth: usize,
+    /// The word after `END` that closes a MySQL block (`END CASE`), already counted.
+    skip_next: bool,
+}
+
+impl Trigger {
+    fn word(&mut self, word: &str, next: Option<&str>, starts_statement: bool) {
+        if starts_statement {
+            self.create = word.eq_ignore_ascii_case("CREATE");
+            return;
+        }
+        if std::mem::take(&mut self.skip_next) {
+            return;
+        }
+        if !self.create {
+            return;
+        }
+        if self.depth == 0 && !self.confirmed {
+            self.confirmed = word.eq_ignore_ascii_case("TRIGGER");
+            return;
+        }
+        let upper = word.to_ascii_uppercase();
+        match upper.as_str() {
+            "BEGIN" if self.confirmed => self.depth += 1,
+            "CASE" if self.depth > 0 => self.depth += 1,
+            "END" if self.depth > 0 => {
+                let next = next.map(str::to_ascii_uppercase);
+                match next.as_deref() {
+                    // MySQL's `END IF` / `END LOOP` / ... close blocks whose start isn't
+                    // counted (IF is also a function), so they don't change the depth.
+                    Some("IF" | "LOOP" | "WHILE" | "REPEAT") => self.skip_next = true,
+                    Some("CASE") => {
+                        self.skip_next = true;
+                        self.depth -= 1;
+                    }
+                    _ => self.depth -= 1,
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// The statement the cursor (a byte offset) is in. If the cursor is still on the line where the
@@ -145,6 +222,22 @@ mod tests {
             sqls("select ';'; -- x;\nselect \"a;b\" /* ; */ ;\n\nselect `c;d`"),
             ["select ';'", "select \"a;b\"", "select `c;d`"]
         );
+    }
+
+    #[test]
+    fn keeps_trigger_bodies_together() {
+        let src = "CREATE TRIGGER t AFTER INSERT ON a BEGIN\n  INSERT INTO log VALUES (1);\n  \
+                   UPDATE n SET c = CASE WHEN c > 1 THEN 0 ELSE c + 1 END;\nEND;\nSELECT 1;\n\
+                   CREATE TRIGGER m BEFORE UPDATE ON a FOR EACH ROW BEGIN IF NEW.x < 0 THEN \
+                   SET NEW.x = 0; END IF; END;\nSELECT begin FROM t;";
+        let out = sqls(src);
+        assert_eq!(out.len(), 4, "{out:#?}");
+        assert!(out[0].ends_with("c + 1 END;\nEND"), "{}", out[0]);
+        assert_eq!(out[1], "SELECT 1");
+        assert!(out[2].ends_with("END IF; END"), "{}", out[2]);
+        assert_eq!(out[3], "SELECT begin FROM t");
+        // Not a trigger: BEGIN starts a transaction.
+        assert_eq!(sqls("BEGIN; INSERT INTO a VALUES (1); COMMIT;").len(), 3);
     }
 
     #[test]

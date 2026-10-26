@@ -5,6 +5,8 @@ use crate::value::Value;
 pub enum Dialect {
     #[default]
     MySql,
+    /// SQLite: double-quoted identifiers, standard string literals.
+    Sqlite,
 }
 
 impl Dialect {
@@ -12,6 +14,15 @@ impl Dialect {
     pub fn quote_ident(self, ident: &str) -> String {
         match self {
             Self::MySql => format!("`{}`", ident.replace('`', "``")),
+            Self::Sqlite => format!("\"{}\"", ident.replace('"', "\"\"")),
+        }
+    }
+
+    /// The statement that starts a transaction.
+    pub fn begin_transaction(self) -> &'static str {
+        match self {
+            Self::MySql => "START TRANSACTION",
+            Self::Sqlite => "BEGIN",
         }
     }
 
@@ -44,6 +55,8 @@ impl Dialect {
                 out.push('\'');
                 out
             }
+            // Standard SQL: only the quote is special, and it is doubled.
+            Self::Sqlite => format!("'{}'", s.replace('\'', "''")),
         }
     }
 
@@ -57,9 +70,10 @@ impl Dialect {
             Value::Null | Value::Float(_) => "NULL".to_owned(),
             Value::Text(s) => self.quote_str(s),
             Value::Bytes(b) if b.is_empty() => "''".to_owned(),
-            Value::Bytes(b) => {
-                format!("0x{}", crate::value::hex(b))
-            }
+            Value::Bytes(b) => match self {
+                Self::MySql => format!("0x{}", crate::value::hex(b)),
+                Self::Sqlite => format!("X'{}'", crate::value::hex(b)),
+            },
         }
     }
 }
@@ -91,5 +105,14 @@ mod tests {
         assert_eq!(d.literal(&Value::UInt(7)), "7");
         assert_eq!(d.literal(&Value::Bytes(vec![1, 0xab])), "0x01AB");
         assert_eq!(d.literal(&Value::Float(f64::NAN)), "NULL");
+    }
+
+    #[test]
+    fn sqlite_spelling() {
+        let d = Dialect::Sqlite;
+        assert_eq!(d.qualified("main", "a\"b"), "\"main\".\"a\"\"b\"");
+        assert_eq!(d.quote_str("it's \\ ok"), "'it''s \\ ok'");
+        assert_eq!(d.literal(&Value::Bytes(vec![1, 0xab])), "X'01AB'");
+        assert_eq!(d.begin_transaction(), "BEGIN");
     }
 }

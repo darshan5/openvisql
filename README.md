@@ -2,7 +2,7 @@
 
 A fast, native desktop SQL client written in Rust, for macOS and Windows.
 
-OpenViSQL connects to **MySQL** and **MariaDB** today; **SQLite** and **PostgreSQL** are next.
+OpenViSQL connects to **MySQL**, **MariaDB** and **SQLite** today; **PostgreSQL** is next.
 The layout is the classic one for MySQL tools: an object browser on the left, query tabs on
 the right, and results below.
 
@@ -10,6 +10,8 @@ the right, and results below.
 
 ## Features
 
+- **SQLite** database files, opened or created from the connection manager, with the same
+  editor, grid editing, export and CSV import. Server-only tools are hidden for them.
 - Several connections open at once as tabs across the top, with tabs that shrink to fit. The
   app starts on the connection manager with nothing connected. Each connection's query tabs
   (titles, SQL, database) come back when you connect to it again.
@@ -49,10 +51,22 @@ the right, and results below.
     binary values).
   - You're warned before unsaved edits would be lost.
   - **Save** applies the changes in one transaction, then re-fetches the rows.
-  - Rows are matched by primary key, or a NOT NULL unique key; without either, by all columns
-    plus `LIMIT 1`.
+  - Rows are matched by primary key, or a NOT NULL unique key. Without either, they're matched
+    by all columns and only one row is changed (`LIMIT 1`, or the rowid on SQLite).
 - Virtualized result grid that stays fast with tens of thousands of rows. Sort by column, and
   copy rows as TSV.
+- **Table designer** for new and existing tables, with a live `CREATE TABLE` / `ALTER TABLE`
+  preview. It covers columns (type, NULL, key, auto-increment, default, comment, order),
+  indexes (including FULLTEXT and prefix lengths), foreign keys, CHECK constraints and
+  table options (engine, collation, comment).
+- **Backup** a database to a SQL file (structure, data, views, routines, triggers, events;
+  DEFINER clauses optional) and **run SQL scripts** to restore, stopping at the first error.
+- **Import CSV** into a table: header matching or by position, NULL markers, one transaction
+  that rolls back on error.
+- **Copy** a database or table to another open connection, or to another database on the same
+  one. Collations are adapted between MySQL and MariaDB.
+- **Server tools**: process list with kill, server info, status and system variables, and a
+  **user manager** (accounts, passwords, global and per-database privileges).
 - Asks for confirmation before running `UPDATE`/`DELETE` without a `WHERE` clause.
 - Query history is saved locally.
 - **Settings** (⌘, / Ctrl+,):
@@ -81,6 +95,8 @@ See [docs/SETUP.md](docs/SETUP.md) for development setup and running the integra
 | --- | --- |
 | `ovs-core` | Engine-agnostic types, driver traits, SQL lexer/splitter, quoting, grid-edit SQL |
 | `ovs-mysql` | MySQL/MariaDB driver built on `mysql_async` |
+| `ovs-sqlite` | SQLite driver built on `rusqlite` (SQLite compiled in) |
+| `ovs-ssh` | SSH tunnels built on `russh` |
 | `ovs-store` | Saved connections, passwords (keychain or encrypted file), history, session |
 | `ovs-app` | The desktop app, built with [GPUI Kit](https://gpui-kit.com) |
 

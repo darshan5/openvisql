@@ -102,9 +102,16 @@ Phase 2 is complete.
 
 ## Phase 4: SQLite
 
-- `ovs-sqlite` driver (`rusqlite`, bundled), file-picker connections, `Dialect::Sqlite`
-  (double-quoted identifiers, no `USE`).
-- An object browser without the database level (attached schemas instead).
+- ✅ `ovs-sqlite` driver (`rusqlite`, bundled), with column origins for grid editing, cancel
+  through the interrupt handle, and introspection from `sqlite_master` and pragmas.
+- ✅ File connections: open or create a file from the connection manager; no password or
+  keychain involved.
+- ✅ `Dialect::Sqlite` (double-quoted identifiers, `BEGIN`, rowid-targeted keyless edits) used
+  by templates, paging, grid edits, export and CSV import.
+- ✅ Object browser shows `main` and attached databases with tables, views and triggers;
+  server-only menus are hidden.
+- Table designer for SQLite (its limited `ALTER TABLE` means rebuilding the table), and
+  backup/copy for SQLite files.
 
 ## Phase 5: PostgreSQL
 

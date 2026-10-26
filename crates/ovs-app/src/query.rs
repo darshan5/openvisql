@@ -884,7 +884,8 @@ impl QueryTab {
         let Some(result) = self.results.get(self.active_result) else {
             return;
         };
-        let statements = result.table.read(cx).delegate().save_statements();
+        let dialect = self.config.engine.dialect();
+        let statements = result.table.read(cx).delegate().save_statements(dialect);
         let Some(source_sql) = result.source_sql.clone() else {
             return;
         };
@@ -897,7 +898,7 @@ impl QueryTab {
         self.running = Some(cx.spawn_in(window, async move |this, cx| {
             let outcome = runtime::run(async move {
                 let mut session = session.lock().await;
-                session.execute("START TRANSACTION", None).await?;
+                session.execute(dialect.begin_transaction(), None).await?;
                 let mut reports = Vec::new();
                 for sql in statements {
                     let t0 = Instant::now();
@@ -1097,6 +1098,7 @@ impl QueryTab {
             return;
         };
         let session = session.clone();
+        let dialect = self.config.engine.dialect();
         let Some(result) = self.results.get_mut(ix) else {
             return;
         };
@@ -1114,7 +1116,7 @@ impl QueryTab {
         if paging.loading {
             return;
         }
-        let page_sql = paging.spec.page_query(ovs_core::sql::Dialect::MySql);
+        let page_sql = paging.spec.page_query(dialect);
         let count_sql = (paging.counted_filter.as_deref() != Some(paging.spec.filter.as_str())
             || total.is_none())
         .then(|| paging.spec.count_query());
@@ -1247,6 +1249,7 @@ impl QueryTab {
         let form = cx.new(|cx| ExportForm::new(shown, has_more, table, window, cx));
         let this = cx.entity().downgrade();
         let title = self.title.clone();
+        let dialect = self.config.engine.dialect();
         window.open_dialog(cx, move |dialog, _, _| {
             let (form, this, data) = (form.clone(), this.clone(), data.clone());
             let (fetch_sql, title) = (fetch_sql.clone(), title.clone());
@@ -1272,6 +1275,7 @@ impl QueryTab {
                                         let form = form.read(cx);
                                         (form.options(cx), form.all_rows())
                                     };
+                                    let options = ExportOptions { dialect, ..options };
                                     window.close_dialog(cx);
                                     let fetch = fetch_sql.clone().filter(|_| all);
                                     let (data, title) = (data.clone(), title.clone());

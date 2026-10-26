@@ -37,7 +37,8 @@ OVS_TEST_MYSQL=127.0.0.1:33306:root:secret cargo test -p ovs-mysql --test live
 OVS_TEST_MYSQL=127.0.0.1:33307:root:secret cargo test -p ovs-mysql --test live
 ```
 
-Without the variable these tests return early and pass, so `cargo test` works offline.
+Without the variable these tests return early and pass, so `cargo test` works offline. The
+SQLite driver's tests (`crates/ovs-sqlite/tests/sqlite.rs`) need no server and always run.
 
 Set `OVS_TEST_MYSQL_TARGET` as well to also copy a database across servers (in both
 directions, run it twice with the two swapped):
@@ -74,6 +75,7 @@ crates/
   ovs-core/    src/sql/{lexer,splitter,analyze,dialect,edit,keywords}.rs  SQL text utilities
                src/{driver,connection,result,schema,value}.rs             core types and traits
   ovs-mysql/   src/{lib,convert,introspect}.rs, tests/live.rs             MySQL/MariaDB driver
+  ovs-sqlite/  src/lib.rs, tests/sqlite.rs                                SQLite driver
   ovs-store/   src/lib.rs                                                 persistence and secrets
   ovs-app/     src/main.rs        app bootstrap, actions, keybindings, menus
                src/connect.rs     connection manager window

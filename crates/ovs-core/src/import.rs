@@ -167,7 +167,9 @@ pub async fn import_csv(
     let columns = session.list_columns(db, table).await?;
     let plan = plan(&data, &columns)?;
     let statements = insert_statements(session.dialect(), db, table, &plan, &data.rows, options);
-    session.execute("START TRANSACTION", None).await?;
+    session
+        .execute(session.dialect().begin_transaction(), None)
+        .await?;
     for (i, sql) in statements.iter().enumerate() {
         if let Err(err) = session.execute(sql, None).await {
             let _ = session.execute("ROLLBACK", None).await;

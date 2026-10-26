@@ -36,8 +36,8 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
-      - run: cargo clippy -p ovs-core -p ovs-mysql -p ovs-store --all-targets
-      - run: cargo test -p ovs-core -p ovs-mysql -p ovs-store
+      - run: cargo clippy -p ovs-core -p ovs-mysql -p ovs-sqlite -p ovs-store --all-targets
+      - run: cargo test -p ovs-core -p ovs-mysql -p ovs-sqlite -p ovs-store
         env:
           OVS_TEST_MYSQL: 127.0.0.1:3306:root:secret
 

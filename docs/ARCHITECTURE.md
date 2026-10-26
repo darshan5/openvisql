@@ -157,3 +157,22 @@ OpenViSQL is MIT-licensed, so its code must stay compatible with MIT:
     "encrypt only" is the practical SSL mode through a tunnel.
   - Live tests run against an Alpine sshd container.
 
+## ADR-008: SQLite through rusqlite on the blocking pool
+
+- **Date:** 2026-10-26
+- **Decision:**
+  - `ovs-sqlite` uses `rusqlite` with SQLite compiled in (`bundled`), so no system library is
+    needed on macOS or Windows. Both are MIT or public domain.
+  - SQLite calls are synchronous. Each runs on tokio's blocking pool behind the async
+    `Session` trait. Cancel uses SQLite's interrupt handle.
+  - Like a server connection, each session opens the file itself, with a busy timeout so
+    concurrent tabs wait for each other's write locks.
+  - `PRAGMA foreign_keys = ON` is set on connect.
+  - The schemas (`main` and attached databases) appear as databases in the object browser.
+  - `Dialect::Sqlite` quotes with `"`, and begins transactions with `BEGIN`. Keyless grid
+    edits target one row through `rowid`, since SQLite's UPDATE/DELETE take no `LIMIT`.
+  - The splitter keeps `CREATE TRIGGER … BEGIN … END;` together without `DELIMITER`.
+- **Consequences:**
+  - Server-only features are hidden for SQLite connections: the designer's ALTER syntax,
+    backup, copy, the user manager and server tools.
+  - Driver tests use temp files and run in CI everywhere, with no services.
