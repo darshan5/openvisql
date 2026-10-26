@@ -200,5 +200,6 @@ OpenViSQL is MIT-licensed, so its code must stay compatible with MIT:
     to `LIMIT n OFFSET m`, which all three engines accept.
 - **Consequences:**
   - Every query costs one extra round trip for the prepare.
-  - TLS isn't supported yet. SSH tunnels work.
+  - TLS uses rustls with ring, as MySQL does. "Encrypt only" accepts any certificate but
+    still checks handshake signatures. "Verify" uses `webpki-roots` plus the CA file.
 

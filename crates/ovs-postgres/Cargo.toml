@@ -13,6 +13,9 @@ ovs-core.workspace = true
 tokio.workspace = true
 tokio-postgres.workspace = true
 futures.workspace = true
+rustls.workspace = true
+tokio-postgres-rustls.workspace = true
+webpki-roots.workspace = true
 
 [lints]
 workspace = true

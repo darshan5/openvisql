@@ -32,6 +32,9 @@ rusqlite = { version = "0.41", default-features = false, features = ["bundled", 
 mysql_async = { version = "0.37", default-features = false, features = ["minimal-rust", "rustls-tls", "ring", "tls12", "client_ed25519"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+tokio-postgres-rustls = { version = "0.14", default-features = false, features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
 tokio-postgres = { version = "0.7", default-features = false, features = ["runtime"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 toml = "0.9"

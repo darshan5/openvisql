@@ -129,8 +129,9 @@ Phase 4 is complete.
   the catalogs.
 - ✅ Templates, info queries and server tools (`pg_stat_activity` with cancel/terminate,
   settings, statistics).
+- ✅ TLS: "encrypt only" or full verification against the web roots plus an optional CA
+  file. Cancel requests are encrypted too.
 - Still to do:
-  - TLS
   - the table designer, backup and copy for PostgreSQL
   - sequences, types and materialized-view refresh in the browser
 

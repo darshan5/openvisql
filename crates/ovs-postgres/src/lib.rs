@@ -8,6 +8,7 @@
 //! own formatting, so any type displays and round-trips.
 
 mod introspect;
+mod tls;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -19,7 +20,7 @@ use ovs_core::sql::Dialect;
 use ovs_core::{
     CancelHandle, CheckInfo, Column, ColumnInfo, ConnectionConfig, Driver, Engine, Error,
     ForeignKeyInfo, IndexInfo, ObjectKind, QueryOutcome, Result, ResultSet, SchemaObject, Session,
-    SslMode, TableOptions, Value,
+    TableOptions, Value,
 };
 use tokio_postgres::types::Type;
 use tokio_postgres::{CancelToken, Client, NoTls, SimpleQueryMessage};
@@ -40,13 +41,7 @@ impl Driver for PostgresDriver {
         config: &ConnectionConfig,
         password: Option<&str>,
     ) -> Result<Box<dyn Session>> {
-        if config.ssl != SslMode::Disabled {
-            return Err(Error::Unsupported(
-                "SSL for PostgreSQL connections isn't available yet; turn SSL off or use an \
-                 SSH tunnel"
-                    .into(),
-            ));
-        }
+        let tls = tls::connector(config)?;
         let mut pg = tokio_postgres::Config::new();
         pg.host(&config.host)
             .port(config.port)
@@ -61,11 +56,21 @@ impl Driver for PostgresDriver {
         if let Some(password) = password {
             pg.password(password);
         }
-        let (client, connection) = pg.connect(NoTls).await.map_err(map_err)?;
         // The connection object drives the socket until the client is dropped.
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
+        let client = if let Some(tls) = &tls {
+            pg.ssl_mode(tokio_postgres::config::SslMode::Require);
+            let (client, connection) = pg.connect(tls.clone()).await.map_err(map_err)?;
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            client
+        } else {
+            let (client, connection) = pg.connect(NoTls).await.map_err(map_err)?;
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            client
+        };
         if !config.init_commands.trim().is_empty() {
             client
                 .batch_execute(&config.init_commands)
@@ -86,7 +91,10 @@ impl Driver for PostgresDriver {
             .await?
             .unwrap_or_else(|| "public".to_owned());
         Ok(Box::new(PostgresSession {
-            cancel: Arc::new(PostgresCancel(client.cancel_token())),
+            cancel: Arc::new(PostgresCancel {
+                token: client.cancel_token(),
+                tls,
+            }),
             client,
             version: format!("PostgreSQL {version}"),
             current,
@@ -129,15 +137,31 @@ pub(crate) fn map_err(err: tokio_postgres::Error) -> Error {
     if err.is_closed() {
         return Error::Connection("the connection was closed".into());
     }
-    Error::Connection(err.to_string())
+    // The cause (e.g. which certificate check failed) is in the source chain.
+    let mut message = err.to_string();
+    let mut source = std::error::Error::source(&err);
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    Error::Connection(message)
 }
 
-struct PostgresCancel(CancelToken);
+/// The cancel request goes over a new connection, encrypted like the session's.
+struct PostgresCancel {
+    token: CancelToken,
+    tls: Option<tokio_postgres_rustls::MakeRustlsConnect>,
+}
 
 #[async_trait]
 impl CancelHandle for PostgresCancel {
     async fn cancel(&self) -> Result<()> {
-        self.0.cancel_query(NoTls).await.map_err(map_err)
+        match &self.tls {
+            Some(tls) => self.token.cancel_query(tls.clone()).await,
+            None => self.token.cancel_query(NoTls).await,
+        }
+        .map_err(map_err)
     }
 }
 

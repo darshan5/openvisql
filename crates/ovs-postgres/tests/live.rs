@@ -385,3 +385,59 @@ async fn long_queries_can_be_cancelled() {
     assert!(matches!(err, Error::Cancelled), "{err:?}");
     assert_eq!(rows(&mut s, "SELECT 7").await.rows[0][0], Value::Int(7));
 }
+
+/// Needs a server with SSL on and a self-signed certificate (the image's snakeoil one), and
+/// `OVS_TEST_PG_TLS=1`:
+///
+/// ```sh
+/// docker run -d --name ovs-postgres -e POSTGRES_PASSWORD=secret -p 35432:5432 postgres:17 \
+///   -c ssl=on -c ssl_cert_file=/etc/ssl/certs/ssl-cert-snakeoil.pem \
+///   -c ssl_key_file=/etc/ssl/private/ssl-cert-snakeoil.key
+/// ```
+#[tokio::test]
+async fn tls_encrypts_and_verifies() {
+    if std::env::var("OVS_TEST_PG_TLS").is_err() {
+        return;
+    }
+    let Some((cfg, password)) = config() else {
+        return;
+    };
+    let encrypted = ConnectionConfig {
+        ssl: ovs_core::SslMode::Preferred,
+        ..cfg.clone()
+    };
+    let mut s = PostgresDriver
+        .connect(&encrypted, Some(&password))
+        .await
+        .unwrap();
+    let rs = rows(
+        &mut s,
+        "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()",
+    )
+    .await;
+    assert_eq!(rs.rows[0][0], Value::Text("true".into()));
+    // Cancelling goes over TLS too.
+    let cancel = s.cancel_handle();
+    let stopper = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        cancel.cancel().await.unwrap();
+    });
+    assert!(matches!(
+        s.execute("SELECT pg_sleep(30)", None).await,
+        Err(Error::Cancelled)
+    ));
+    stopper.await.unwrap();
+
+    // A self-signed certificate doesn't verify.
+    let verified = ConnectionConfig {
+        ssl: ovs_core::SslMode::Required,
+        ..cfg
+    };
+    let Err(err) = PostgresDriver.connect(&verified, Some(&password)).await else {
+        panic!("connected with an untrusted certificate");
+    };
+    assert!(
+        err.to_string().to_lowercase().contains("certificate"),
+        "{err}"
+    );
+}
