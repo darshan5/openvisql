@@ -218,6 +218,10 @@ pub enum BrowserEvent {
         description: String,
         action: String,
     },
+    /// Back up a database to a SQL file.
+    Backup(String),
+    /// Run a SQL script file against a database.
+    RunScript(String),
     /// Ask for a name, then run the statement built from it and refresh.
     PromptExecute {
         title: String,
@@ -555,6 +559,15 @@ impl ObjectBrowser {
                     db,
                     None,
                 )))
+                .separator()
+                .item(
+                    PopupMenuItem::new("Back up database…")
+                        .on_click(emit(BrowserEvent::Backup(db.clone()))),
+                )
+                .item(
+                    PopupMenuItem::new("Run SQL script…")
+                        .on_click(emit(BrowserEvent::RunScript(db.clone()))),
+                )
                 .separator()
                 .item(PopupMenuItem::new("Create database…").on_click(create_database))
                 .item(PopupMenuItem::new("Copy name").on_click(copy(db.clone())))

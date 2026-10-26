@@ -1,5 +1,6 @@
 //! OpenViSQL desktop client.
 
+mod backup;
 mod browser;
 mod completion;
 mod connect;

@@ -402,6 +402,26 @@ impl Workspace {
                 initial,
                 build,
             } => self.prompt_execute(title.clone(), initial.clone(), build.clone(), window, cx),
+            BrowserEvent::Backup(db) => crate::backup::open_backup(
+                db.clone(),
+                self.config.clone(),
+                self.password.clone(),
+                window,
+                cx,
+            ),
+            BrowserEvent::RunScript(db) => {
+                let this = cx.entity().downgrade();
+                crate::backup::open_run_script(
+                    Some(db.clone()),
+                    self.config.clone(),
+                    self.password.clone(),
+                    move |_, cx| {
+                        this.update(cx, Workspace::refresh).ok();
+                    },
+                    window,
+                    cx,
+                );
+            }
         }
     }
 

@@ -4,12 +4,14 @@
 //! - [`driver`]: the async traits each database engine implements.
 //! - [`result`] / [`value`]: query results as the UI consumes them.
 //! - [`schema`]: objects shown in the object browser.
+//! - [`dump`]: SQL dumps of a database and running scripts to restore them.
 //! - [`editing`]: deciding how grid edits are written back, and pending changes.
 //! - [`export`]: CSV, JSON, SQL, Markdown and HTML output of result sets.
 //! - [`sql`]: lexing, statement splitting, quoting and grid-edit SQL generation.
 
 pub mod connection;
 pub mod driver;
+pub mod dump;
 pub mod editing;
 pub mod error;
 pub mod export;

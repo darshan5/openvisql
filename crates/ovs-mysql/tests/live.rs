@@ -441,3 +441,99 @@ async fn object_templates_and_info_queries_run() {
         .unwrap();
     cleanup(s, &db).await;
 }
+
+#[tokio::test]
+async fn dump_and_restore_round_trip() {
+    use ovs_core::dump::{DumpOptions, dump_database, run_script};
+
+    let Some((mut s, db)) = scratch("dump_src").await else {
+        return;
+    };
+    for sql in [
+        "CREATE TABLE digits (d INT PRIMARY KEY)",
+        "INSERT INTO digits VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9)",
+        "CREATE TABLE big (n INT PRIMARY KEY, half INT AS (n DIV 2) VIRTUAL)",
+        "INSERT INTO big (n) SELECT a.d + 10*b.d + 100*c.d + 1000*e.d FROM digits a, digits b, digits c, digits e",
+        "INSERT INTO big (n) SELECT 10000 + a.d + 10*b.d + 100*c.d FROM digits a, digits b, digits c",
+        "CREATE TABLE odd (id INT PRIMARY KEY, txt TEXT NULL, bin VARBINARY(8) NULL, d DECIMAL(10,3))",
+        "INSERT INTO odd VALUES (1, 'it''s a \\\\ path\\n€', 0x00FF10, 1.250), (2, NULL, NULL, -0.001)",
+        "CREATE TABLE nokey (a INT, b VARCHAR(5))",
+        "INSERT INTO nokey VALUES (1, 'x'), (1, 'x'), (NULL, NULL)",
+        "CREATE VIEW v_odd AS SELECT id, txt FROM odd",
+        "CREATE PROCEDURE p_count() BEGIN SELECT COUNT(*) FROM big; END",
+        "CREATE FUNCTION f_double(x INT) RETURNS INT DETERMINISTIC RETURN x * 2",
+        "CREATE TRIGGER t_odd BEFORE INSERT ON odd FOR EACH ROW SET NEW.d = COALESCE(NEW.d, 0)",
+        "CREATE EVENT e_noop ON SCHEDULE EVERY 1 DAY DISABLE DO SELECT 1",
+    ] {
+        s.execute(sql, None)
+            .await
+            .unwrap_or_else(|e| panic!("{e}: {sql}"));
+    }
+
+    let mut out = Vec::new();
+    let stats = dump_database(
+        s.as_mut(),
+        &db,
+        &DumpOptions::default(),
+        &mut out,
+        &mut |_| {},
+    )
+    .await
+    .unwrap();
+    assert_eq!(stats.tables, 4);
+    assert_eq!(stats.rows, 10 + 11_000 + 2 + 3);
+    assert_eq!(stats.other_objects, 5);
+    let script = String::from_utf8(out).unwrap();
+    assert!(!script.contains("DEFINER="), "definer should be stripped");
+
+    // Restore into a second database and compare.
+    let target = format!("{db}_copy");
+    s.execute(&format!("DROP DATABASE IF EXISTS {target}"), None)
+        .await
+        .unwrap();
+    s.execute(&format!("CREATE DATABASE {target}"), None)
+        .await
+        .unwrap();
+    s.use_database(&target).await.unwrap();
+    let restored = run_script(s.as_mut(), &script, true, &mut |_, _| {}).await;
+    assert!(restored.errors.is_empty(), "{:?}", restored.errors);
+
+    // Compare the rows themselves: MariaDB's CHECKSUM TABLE depends on how virtual columns
+    // are stored internally, so identical tables can checksum differently.
+    for table in ["digits", "big", "odd", "nokey"] {
+        let mut copies = Vec::new();
+        for schema in [&db, &target] {
+            let out = s
+                .execute(&format!("SELECT * FROM {schema}.{table}"), None)
+                .await
+                .unwrap();
+            let mut data = rows(&out[0]).clone();
+            data.sort_by(|x, y| {
+                x.iter()
+                    .zip(y)
+                    .map(|(a, b)| a.sort_cmp(b))
+                    .find(|o| o.is_ne())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            copies.push(data);
+        }
+        assert_eq!(copies[0], copies[1], "{table} differs");
+    }
+    for (kind, name) in [
+        (ObjectKind::View, "v_odd"),
+        (ObjectKind::Procedure, "p_count"),
+        (ObjectKind::Function, "f_double"),
+        (ObjectKind::Trigger, "t_odd"),
+        (ObjectKind::Event, "e_noop"),
+    ] {
+        let objects = s.list_objects(&target, kind).await.unwrap();
+        assert!(
+            objects.iter().any(|o| o.name == name),
+            "{kind:?} {name} missing"
+        );
+    }
+    s.execute(&format!("DROP DATABASE {target}"), None)
+        .await
+        .unwrap();
+    cleanup(s, &db).await;
+}
