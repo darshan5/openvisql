@@ -632,3 +632,31 @@ async fn query_builder_sql_runs() {
         ]
     );
 }
+
+#[tokio::test]
+async fn diagram_loads_tables_and_keys() {
+    use ovs_core::diagram::Diagram;
+
+    let db = TempDb::new("diagram");
+    let mut s = db.open().await;
+    exec(&mut s, SCHEMA).await;
+    let diagram = Diagram::load(s.as_mut(), "main").await.unwrap();
+    let names: Vec<&str> = diagram.tables.iter().map(|t| t.name.as_str()).collect();
+    assert_eq!(names, ["log", "owners", "pets"]);
+    assert_eq!(diagram.relations.len(), 1);
+    assert_eq!(
+        (
+            diagram.relations[0].from_table.as_str(),
+            diagram.relations[0].to_table.as_str()
+        ),
+        ("pets", "owners")
+    );
+    let pets = diagram.table("pets").unwrap();
+    assert!(pets.columns[0].primary && pets.columns[0].foreign);
+    // owners is referred to, so it's left of pets.
+    assert!(diagram.table("owners").unwrap().x < pets.x);
+
+    let empty = TempDb::new("diagram-empty");
+    let mut e = empty.open().await;
+    assert!(Diagram::load(e.as_mut(), "main").await.is_err());
+}

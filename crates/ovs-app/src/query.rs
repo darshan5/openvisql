@@ -1216,7 +1216,7 @@ impl QueryTab {
                 .child(
                     div()
                         .text_xs()
-                        .font_family("monospace")
+                        .font_family(cx.theme().mono_font_family.clone())
                         .text_color(cx.theme().muted_foreground)
                         .child("WHERE"),
                 )
@@ -1508,7 +1508,7 @@ impl QueryTab {
                             .id("hex")
                             .max_h(px(320.))
                             .overflow_y_scroll()
-                            .font_family("monospace")
+                            .font_family(cx.theme().mono_font_family.clone())
                             .text_xs()
                             .whitespace_normal()
                             .child(hex)
@@ -1949,7 +1949,11 @@ impl QueryTab {
                     .border_b_1()
                     .border_color(border)
                     .when(!sql.is_empty(), |el| {
-                        el.child(div().font_family("monospace").child(sql))
+                        el.child(
+                            div()
+                                .font_family(cx.theme().mono_font_family.clone())
+                                .child(sql),
+                        )
                     })
                     .child(
                         div()

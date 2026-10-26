@@ -202,7 +202,7 @@ pub fn open(window: &mut Window, cx: &mut App) {
                             .child(
                                 div()
                                     .text_sm()
-                                    .font_family("monospace")
+                                    .font_family(cx.theme().mono_font_family.clone())
                                     .child(alternatives.join("   or   ")),
                             )
                     },

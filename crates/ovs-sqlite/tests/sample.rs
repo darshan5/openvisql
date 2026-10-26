@@ -273,3 +273,29 @@ async fn designer_rebuilds_a_referenced_table() {
     assert_eq!(reloaded.columns.last().unwrap().name, "Country");
     assert!(reloaded.columns[0].auto_increment);
 }
+
+#[tokio::test]
+async fn diagram_covers_every_table_and_key() {
+    use ovs_core::diagram::Diagram;
+
+    let Some(db) = Copy::of_sample("diagram") else {
+        return;
+    };
+    let mut s = db.open().await;
+    let diagram = Diagram::load(s.as_mut(), "main").await.unwrap();
+    let tables = s.list_objects("main", ObjectKind::Table).await.unwrap();
+    assert_eq!(diagram.tables.len(), tables.len());
+    let mut keys = 0;
+    for t in &tables {
+        keys += s.list_foreign_keys("main", &t.name).await.unwrap().len();
+    }
+    assert_eq!(diagram.relations.len(), keys);
+    for relation in &diagram.relations {
+        assert!(diagram.link(relation).is_some(), "{}", relation.name);
+    }
+    let svg = diagram.to_svg();
+    if let Ok(out) = std::env::var("OVS_DIAGRAM_SVG") {
+        std::fs::write(out, &svg).unwrap();
+    }
+    assert!(svg.ends_with("</svg>\n"));
+}

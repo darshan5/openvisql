@@ -453,6 +453,9 @@ impl Workspace {
                     cx,
                 );
             }
+            BrowserEvent::Diagram(db) => {
+                crate::diagram_view::open(db.clone(), self.completion.session.clone(), window, cx);
+            }
             BrowserEvent::QueryBuilder { db, table } => {
                 let this = cx.entity().downgrade();
                 let tab_db = db.clone();

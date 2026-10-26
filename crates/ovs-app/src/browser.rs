@@ -232,6 +232,8 @@ pub enum BrowserEvent {
     DesignTable { db: String, table: Option<String> },
     /// Open the query builder on `db`, starting with `table` when set.
     QueryBuilder { db: String, table: Option<String> },
+    /// Open the ER diagram of a database.
+    Diagram(String),
     /// Ask for a name, then run the statement built from it and refresh.
     PromptExecute {
         title: String,
@@ -576,6 +578,10 @@ impl ObjectBrowser {
                         table: None,
                     },
                 )));
+                menu = menu.item(
+                    PopupMenuItem::new("ER diagram…")
+                        .on_click(emit(BrowserEvent::Diagram(db.clone()))),
+                );
                 menu = menu.item(PopupMenuItem::new("New table…").on_click(emit(
                     BrowserEvent::DesignTable {
                         db: db.clone(),

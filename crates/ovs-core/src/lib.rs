@@ -11,6 +11,7 @@
 //! - [`sql`]: lexing, statement splitting, quoting and grid-edit SQL generation.
 
 pub mod connection;
+pub mod diagram;
 pub mod driver;
 pub mod dump;
 pub mod editing;

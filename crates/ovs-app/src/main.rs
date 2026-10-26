@@ -10,6 +10,7 @@ mod completion;
 mod connect;
 mod copy_dialog;
 mod designer;
+mod diagram_view;
 mod export_dialog;
 mod grid;
 mod import_dialog;

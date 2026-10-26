@@ -982,7 +982,7 @@ impl Render for QueryBuilder {
                     .overflow_y_scroll()
                     .rounded(cx.theme().radius)
                     .bg(cx.theme().muted)
-                    .font_family("monospace")
+                    .font_family(cx.theme().mono_font_family.clone())
                     .text_xs()
                     .child(preview),
             )

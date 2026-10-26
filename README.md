@@ -72,6 +72,8 @@ the right, and results below.
   from foreign keys), tick columns, add aggregates, conditions, sorting and a limit, and
   combine several queries with UNION, UNION ALL, INTERSECT or EXCEPT. The SQL is previewed
   live and opened or run in a query tab.
+- **ER diagram** of a database in its own window: tables with their columns and foreign-key
+  lines, laid out automatically; pan, zoom, drag tables, and export as SVG.
 - **Copy** a database or table straight to another server of the same engine (open in a tab
   or just saved, directly or through its SSH tunnel), or to another database on the same one.
   Collations are adapted between MySQL and MariaDB.

@@ -158,8 +158,11 @@ Phase 5 is complete.
   further queries combined with UNION, UNION ALL, INTERSECT or EXCEPT. Live SQL preview;
   "Open in editor" or "Run". The generated SQL is tested on MySQL, MariaDB, PostgreSQL and
   SQLite.
-- ER diagram of a database: tables as boxes with their columns and foreign-key lines,
-  arranged automatically, exportable as an image (next).
+- ✅ ER diagram (right-click a database → "ER diagram…"), in a window of its own: tables as
+  boxes listing their columns (primary keys `#`, foreign keys `→`), lines between key
+  columns. Laid out automatically: referenced tables left of the tables referring to them,
+  each column ordered to avoid crossings and boxes level with what they connect to;
+  unrelated tables below. Pan, zoom, drag tables, rearrange, and export as SVG.
 
 ## Packaging
 
