@@ -10,8 +10,9 @@ the right, and results below.
 
 ## Features
 
-- **SQLite** database files, opened or created from the connection manager, with the same
-  editor, grid editing, export and CSV import. Server-only tools are hidden for them.
+- **SQLite** database files, opened or created from the connection manager. They get the same
+  editor, grid editing, export, CSV import, backup/restore and table designer (which rebuilds
+  the table safely). Server-only tools are hidden for them.
 - Several connections open at once as tabs across the top, with tabs that shrink to fit. The
   app starts on the connection manager with nothing connected. Each connection's query tabs
   (titles, SQL, database) come back when you connect to it again.

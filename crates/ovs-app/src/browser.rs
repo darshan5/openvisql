@@ -489,7 +489,7 @@ impl ObjectBrowser {
         node: Option<&Node>,
         menu: PopupMenu,
     ) -> PopupMenu {
-        // Server-only features: routines, events, creating databases, the designer.
+        // Server-only features: routines, events, creating databases.
         let mysql = d == Dialect::MySql;
         let emit = |event: BrowserEvent| {
             let this = this.clone();
@@ -564,22 +564,19 @@ impl ObjectBrowser {
                     )));
                 }
                 menu = menu.separator();
-                if mysql {
-                    menu = menu.item(PopupMenuItem::new("New table (designer)…").on_click(emit(
-                        BrowserEvent::DesignTable {
-                            db: db.clone(),
-                            table: None,
-                        },
-                    )));
-                }
+                menu = menu.item(PopupMenuItem::new("New table (designer)…").on_click(emit(
+                    BrowserEvent::DesignTable {
+                        db: db.clone(),
+                        table: None,
+                    },
+                )));
                 menu = menu
                     .item(
-                        PopupMenuItem::new(if mysql {
-                            "New table (SQL template)…"
-                        } else {
-                            "New table…"
-                        })
-                        .on_click(new_object(ObjectKind::Table, db, None)),
+                        PopupMenuItem::new("New table (SQL template)…").on_click(new_object(
+                            ObjectKind::Table,
+                            db,
+                            None,
+                        )),
                     )
                     .item(PopupMenuItem::new("New view…").on_click(new_object(
                         ObjectKind::View,
@@ -711,14 +708,12 @@ impl ObjectBrowser {
                             table: Some(name.clone()),
                         },
                     )));
-                    if mysql {
-                        menu = menu.item(PopupMenuItem::new("Design table…").on_click(emit(
-                            BrowserEvent::DesignTable {
-                                db: db.clone(),
-                                table: Some(name.clone()),
-                            },
-                        )));
-                    }
+                    menu = menu.item(PopupMenuItem::new("Design table…").on_click(emit(
+                        BrowserEvent::DesignTable {
+                            db: db.clone(),
+                            table: Some(name.clone()),
+                        },
+                    )));
                     menu = menu
                         .item(PopupMenuItem::new("New trigger…").on_click(new_object(
                             ObjectKind::Trigger,

@@ -438,6 +438,7 @@ impl Workspace {
             BrowserEvent::DesignTable { db, table } => {
                 let this = cx.entity().downgrade();
                 crate::designer::open(
+                    d,
                     db.clone(),
                     table.clone(),
                     self.completion.session.clone(),
@@ -490,11 +491,18 @@ impl Workspace {
     ) {
         let session = self.completion.session.clone();
         let summary = statements.join(";\n");
+        let recovery = ovs_core::sql::design::recovery_statements(self.config.engine.dialect());
         cx.spawn_in(window, async move |this, cx| {
             let result = runtime::run(async move {
                 let mut session = session.lock().await;
                 for statement in &statements {
-                    session.execute(statement, None).await?;
+                    if let Err(err) = session.execute(statement, None).await {
+                        // Undo a half-applied table rebuild; these may fail harmlessly.
+                        for undo in recovery {
+                            let _ = session.execute(undo, None).await;
+                        }
+                        return Err(err);
+                    }
                 }
                 Ok::<_, ovs_core::Error>(())
             })

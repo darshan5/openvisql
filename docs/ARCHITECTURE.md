@@ -173,6 +173,11 @@ OpenViSQL is MIT-licensed, so its code must stay compatible with MIT:
     edits target one row through `rowid`, since SQLite's UPDATE/DELETE take no `LIMIT`.
   - The splitter keeps `CREATE TRIGGER … BEGIN … END;` together without `DELIMITER`.
 - **Consequences:**
-  - Server-only features are hidden for SQLite connections: the designer's ALTER syntax,
-    backup, copy, the user manager and server tools.
+  - Server-only features are hidden for SQLite connections: the user manager, server tools,
+    routines and events. Backup, restore and copy work between SQLite files.
+  - The table designer rebuilds a SQLite table for any change except a rename: it creates
+    the new design under a temporary name, copies the rows, drops the old table, renames, and
+    re-creates indexes and triggers. All of this runs in one transaction with foreign keys
+    off, and is rolled back if any step fails. Generated columns block a rebuild, because
+    their expressions aren't loaded.
   - Driver tests use temp files and run in CI everywhere, with no services.

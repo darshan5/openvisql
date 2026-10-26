@@ -374,3 +374,172 @@ async fn dumps_restores_and_copies_databases() {
         Value::Int(0)
     );
 }
+
+#[tokio::test]
+async fn table_designer_rebuilds_tables() {
+    use ovs_core::sql::Dialect;
+    use ovs_core::sql::design::{
+        ColumnDef, IndexDef, IndexKind, TableDesign, alter_sql, create_statements,
+    };
+
+    async fn load(s: &mut Box<dyn Session>, table: &str) -> TableDesign {
+        let columns = s.list_columns("main", table).await.unwrap();
+        let indexes = s.list_indexes("main", table).await.unwrap();
+        let fks = s.list_foreign_keys("main", table).await.unwrap();
+        let create = s
+            .object_ddl("main", table, ObjectKind::Table)
+            .await
+            .unwrap();
+        let mut triggers = Vec::new();
+        for t in s.list_objects("main", ObjectKind::Trigger).await.unwrap() {
+            if t.detail == table {
+                triggers.push(
+                    s.object_ddl("main", &t.name, ObjectKind::Trigger)
+                        .await
+                        .unwrap(),
+                );
+            }
+        }
+        TableDesign::from_table(Dialect::Sqlite, table, &columns, &indexes)
+            .with_constraints("main", &fks, ovs_core::TableOptions::default())
+            .with_sqlite_parts(&create, triggers)
+    }
+
+    let db = TempDb::new("designer");
+    let mut s = db.open().await;
+    let d = s.dialect();
+    exec(&mut s, SCHEMA).await;
+    exec(
+        &mut s,
+        "INSERT INTO owners (name) VALUES ('ada'), ('bob');
+         INSERT INTO pets (owner, tag, weight) VALUES (1, 'rex', 12.5);",
+    )
+    .await;
+
+    let before = load(&mut s, "owners").await;
+    assert_eq!(before.triggers.len(), 1);
+    assert_eq!(alter_sql(d, "main", &before, &before).len(), 0);
+
+    // Rename a column, change a type, drop one, add one and an index.
+    let mut after = before.clone();
+    after.columns[1].name = "full_name".into();
+    after.columns.retain(|c| c.name != "born");
+    after.columns[2].data_type = "BLOB".into();
+    after.columns.push(ColumnDef {
+        name: "score".into(),
+        data_type: "INTEGER".into(),
+        nullable: false,
+        default_sql: "0".into(),
+        ..ColumnDef::default()
+    });
+    after.indexes.push(IndexDef {
+        name: "owners_score".into(),
+        kind: IndexKind::Index,
+        columns: vec!["score".into(), "full_name".into()],
+        original_name: None,
+    });
+    after.validate_for(d).unwrap();
+    after.validate_change(d, &before).unwrap();
+    for sql in alter_sql(d, "main", &before, &after) {
+        exec(&mut s, &sql).await;
+    }
+
+    let rs = rows(
+        &mut s,
+        "SELECT id, full_name, score FROM owners ORDER BY id",
+    )
+    .await;
+    assert_eq!(
+        rs.rows,
+        [
+            vec![Value::Int(1), Value::Text("ada".into()), Value::Int(0)],
+            vec![Value::Int(2), Value::Text("bob".into()), Value::Int(0)],
+        ]
+    );
+    let reloaded = load(&mut s, "owners").await;
+    let names: Vec<&str> = reloaded.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["id", "full_name", "data", "score"]);
+    assert_eq!(reloaded.indexes.len(), 1);
+    // The trigger came back and still fires.
+    exec(&mut s, "INSERT INTO owners (full_name) VALUES ('cy')").await;
+    assert_eq!(
+        rows(&mut s, "SELECT COUNT(*) FROM log").await.rows[0][0],
+        Value::Int(3)
+    );
+    // pets still references owners, and nothing broke the link.
+    assert_eq!(
+        rows(&mut s, "SELECT COUNT(*) FROM pragma_foreign_key_check")
+            .await
+            .rows[0][0],
+        Value::Int(0)
+    );
+    assert!(
+        s.execute("INSERT INTO pets (owner, tag) VALUES (99, 'ghost')", None)
+            .await
+            .is_err()
+    );
+
+    // A failed rebuild leaves the table as it was.
+    let mut bad = reloaded.clone();
+    bad.columns[1].nullable = false;
+    bad.columns.push(ColumnDef {
+        name: "must".into(),
+        data_type: "TEXT".into(),
+        nullable: false,
+        ..ColumnDef::default()
+    });
+    let statements = alter_sql(d, "main", &reloaded, &bad);
+    let mut failed = false;
+    for sql in &statements {
+        if s.execute(sql, None).await.is_err() {
+            failed = true;
+            for undo in ovs_core::sql::design::recovery_statements(d) {
+                let _ = s.execute(undo, None).await;
+            }
+            break;
+        }
+    }
+    assert!(
+        failed,
+        "NOT NULL without a default should fail on existing rows"
+    );
+    assert_eq!(
+        rows(&mut s, "SELECT COUNT(*) FROM owners").await.rows[0][0],
+        Value::Int(3)
+    );
+
+    // New tables, with their indexes.
+    let mut new = TableDesign {
+        name: "tags".into(),
+        columns: vec![
+            ColumnDef {
+                name: "id".into(),
+                data_type: "INTEGER".into(),
+                primary_key: true,
+                auto_increment: true,
+                ..ColumnDef::default()
+            },
+            ColumnDef {
+                name: "label".into(),
+                data_type: "TEXT".into(),
+                ..ColumnDef::default()
+            },
+        ],
+        ..TableDesign::default()
+    };
+    new.indexes.push(IndexDef {
+        name: "tags_label".into(),
+        kind: IndexKind::Unique,
+        columns: vec!["label".into()],
+        original_name: None,
+    });
+    for sql in create_statements(d, "main", &new) {
+        exec(&mut s, &sql).await;
+    }
+    exec(&mut s, "INSERT INTO tags (label) VALUES ('a')").await;
+    assert!(
+        s.execute("INSERT INTO tags (label) VALUES ('a')", None)
+            .await
+            .is_err()
+    );
+}

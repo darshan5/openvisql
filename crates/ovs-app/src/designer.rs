@@ -16,14 +16,14 @@ use gpui_kit::component::{
 use gpui_kit::{
     App, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
     ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
-    Subscription, Window, div, px,
+    Subscription, Window, div, prelude::FluentBuilder as _, px,
 };
-use ovs_core::TableOptions;
 use ovs_core::sql::Dialect;
 use ovs_core::sql::design::{
     CheckDef, ColumnDef, ForeignKeyDef, IndexDef, IndexKind, REFERENTIAL_ACTIONS, TableDesign,
-    alter_sql, create_sql,
+    alter_sql, create_statements,
 };
+use ovs_core::{ObjectKind, TableOptions};
 
 use crate::runtime::{self, SharedSession};
 
@@ -41,6 +41,7 @@ struct Row {
     auto_increment: bool,
     /// Not edited here; kept so a changed column keeps its collation.
     collation: String,
+    generated: bool,
     original_name: Option<String>,
 }
 
@@ -108,6 +109,7 @@ impl Section {
 }
 
 pub struct TableDesigner {
+    dialect: Dialect,
     db: String,
     /// The table as loaded; `None` when creating a new table.
     original: Option<TableDesign>,
@@ -126,6 +128,7 @@ pub struct TableDesigner {
 
 impl TableDesigner {
     fn new(
+        dialect: Dialect,
         db: String,
         original: Option<TableDesign>,
         window: &mut Window,
@@ -135,7 +138,11 @@ impl TableDesigner {
             name: "new_table".into(),
             columns: vec![ColumnDef {
                 name: "id".into(),
-                data_type: "INT UNSIGNED".into(),
+                data_type: match dialect {
+                    Dialect::MySql => "INT UNSIGNED",
+                    Dialect::Sqlite => "INTEGER",
+                }
+                .into(),
                 primary_key: true,
                 auto_increment: true,
                 ..ColumnDef::default()
@@ -158,6 +165,7 @@ impl TableDesigner {
         let collation = option(&start.options.collation, "server default", window, cx);
         let table_comment = option(&start.options.comment, "", window, cx);
         let mut designer = Self {
+            dialect,
             db,
             original,
             name: name.clone(),
@@ -220,6 +228,7 @@ impl TableDesigner {
             primary_key: column.primary_key,
             auto_increment: column.auto_increment,
             collation: column.collation,
+            generated: column.generated,
             original_name: column.original_name,
         };
         self.next_id += 1;
@@ -324,6 +333,7 @@ impl TableDesigner {
                     primary_key: row.primary_key,
                     comment: row.comment.read(cx).value().to_string(),
                     collation: row.collation.clone(),
+                    generated: row.generated,
                     original_name: row.original_name.clone(),
                 })
                 .collect(),
@@ -367,6 +377,16 @@ impl TableDesigner {
                     original_name: check.original_name.clone(),
                 })
                 .collect(),
+            triggers: self
+                .original
+                .as_ref()
+                .map(|o| o.triggers.clone())
+                .unwrap_or_default(),
+            suffix: self
+                .original
+                .as_ref()
+                .map(|o| o.suffix.clone())
+                .unwrap_or_default(),
             options: TableOptions {
                 engine: text(&self.engine),
                 collation: text(&self.collation),
@@ -379,10 +399,13 @@ impl TableDesigner {
     fn sql(&self, cx: &App) -> Result<Vec<String>, String> {
         let mut design = self.design(cx);
         design.follow_renames();
-        design.validate()?;
+        design.validate_for(self.dialect)?;
         Ok(match &self.original {
-            None => vec![create_sql(Dialect::MySql, &self.db, &design)],
-            Some(original) => alter_sql(Dialect::MySql, &self.db, original, &design),
+            None => create_statements(self.dialect, &self.db, &design),
+            Some(original) => {
+                design.validate_change(self.dialect, original)?;
+                alter_sql(self.dialect, &self.db, original, &design)
+            }
         })
     }
 
@@ -394,7 +417,12 @@ impl TableDesigner {
         }
     }
 
-    fn render_row(ix: usize, row: &Row, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_row(
+        ix: usize,
+        row: &Row,
+        comments: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let flag =
             |id: &'static str, checked: bool, set: fn(&mut Row, bool), cx: &mut Context<Self>| {
                 Checkbox::new((id, row.id))
@@ -433,7 +461,9 @@ impl TableDesigner {
                     .w(px(140.))
                     .child(Input::new(&row.default_sql).xsmall()),
             )
-            .child(div().flex_1().child(Input::new(&row.comment).xsmall()))
+            .child(div().flex_1().when(comments, |cell| {
+                cell.child(Input::new(&row.comment).xsmall())
+            }))
             .child(
                 Button::new(("up", row.id))
                     .ghost()
@@ -465,7 +495,12 @@ impl TableDesigner {
 }
 
 impl TableDesigner {
-    fn render_index(ix: usize, index: &IndexRow, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_index(
+        ix: usize,
+        index: &IndexRow,
+        kinds: &'static [IndexKind],
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let this = cx.entity().downgrade();
         h_flex()
             .gap_1()
@@ -477,7 +512,7 @@ impl TableDesigner {
                     .w(px(96.))
                     .label(index.kind.label())
                     .dropdown_menu(move |menu, _, _| {
-                        IndexKind::ALL.into_iter().fold(menu, |menu, kind| {
+                        kinds.iter().copied().fold(menu, |menu, kind| {
                             let this = this.clone();
                             menu.item(PopupMenuItem::new(kind.label()).on_click(move |_, _, cx| {
                                 this.update(cx, |this, cx| {
@@ -608,6 +643,12 @@ impl TableDesigner {
 
 impl Render for TableDesigner {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let mysql = self.dialect == Dialect::MySql;
+        let kinds: &'static [IndexKind] = if mysql {
+            &IndexKind::ALL
+        } else {
+            &IndexKind::ALL[..2]
+        };
         let muted = cx.theme().muted_foreground;
         let header = |text: &'static str, width: Option<f32>| {
             let cell = div().text_xs().text_color(muted).child(text);
@@ -637,13 +678,13 @@ impl Render for TableDesigner {
                     header("PK", Some(36.)),
                     header("Auto", Some(36.)),
                     header("Default (SQL)", Some(140.)),
-                    header("Comment", None),
+                    header(if mysql { "Comment" } else { "" }, None),
                     div().w(px(84.)),
                 ],
                 self.rows
                     .iter()
                     .enumerate()
-                    .map(|(ix, row)| Self::render_row(ix, row, cx).into_any_element())
+                    .map(|(ix, row)| Self::render_row(ix, row, mysql, cx).into_any_element())
                     .collect(),
                 add("add-column", "Column").on_click(cx.listener(|this, _, window, cx| {
                     this.push_row(
@@ -668,7 +709,7 @@ impl Render for TableDesigner {
                 self.indexes
                     .iter()
                     .enumerate()
-                    .map(|(ix, index)| Self::render_index(ix, index, cx).into_any_element())
+                    .map(|(ix, index)| Self::render_index(ix, index, kinds, cx).into_any_element())
                     .collect(),
                 add("add-index", "Index").on_click(cx.listener(|this, _, window, cx| {
                     this.push_index(
@@ -749,16 +790,18 @@ impl Render for TableDesigner {
                     .gap_2()
                     .child(div().text_sm().child("Table name"))
                     .child(div().w(px(220.)).child(Input::new(&self.name).small()))
-                    .child(div().text_sm().child("Engine"))
-                    .child(div().w(px(110.)).child(Input::new(&self.engine).small()))
-                    .child(div().text_sm().child("Collation"))
-                    .child(div().w(px(170.)).child(Input::new(&self.collation).small()))
-                    .child(div().text_sm().child("Comment"))
-                    .child(
-                        div()
-                            .flex_1()
-                            .child(Input::new(&self.table_comment).small()),
-                    ),
+                    .when(mysql, |row| {
+                        row.child(div().text_sm().child("Engine"))
+                            .child(div().w(px(110.)).child(Input::new(&self.engine).small()))
+                            .child(div().text_sm().child("Collation"))
+                            .child(div().w(px(170.)).child(Input::new(&self.collation).small()))
+                            .child(div().text_sm().child("Comment"))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .child(Input::new(&self.table_comment).small()),
+                            )
+                    }),
             )
             .child(
                 TabBar::new("designer-sections")
@@ -798,6 +841,7 @@ impl Render for TableDesigner {
 
 /// Opens the designer for `table` in `db` (loading it on `session`), or for a new table.
 pub fn open(
+    dialect: Dialect,
     db: String,
     table: Option<String>,
     session: SharedSession,
@@ -817,11 +861,24 @@ pub fn open(
                         let foreign_keys = s.list_foreign_keys(&d, &t).await?;
                         let options = s.table_options(&d, &t).await?;
                         let checks = s.list_checks(&d, &t).await?;
-                        Ok::<_, ovs_core::Error>(
-                            TableDesign::from_table(&t, &columns, &indexes)
-                                .with_constraints(&d, &foreign_keys, options)
-                                .with_checks(&checks),
-                        )
+                        let mut design = TableDesign::from_table(dialect, &t, &columns, &indexes)
+                            .with_constraints(&d, &foreign_keys, options)
+                            .with_checks(&checks);
+                        // A SQLite rebuild re-creates the table's triggers and keeps its options.
+                        if dialect == Dialect::Sqlite {
+                            let create = s.object_ddl(&d, &t, ObjectKind::Table).await?;
+                            let mut triggers = Vec::new();
+                            for trigger in s.list_objects(&d, ObjectKind::Trigger).await? {
+                                if trigger.detail == t {
+                                    triggers.push(
+                                        s.object_ddl(&d, &trigger.name, ObjectKind::Trigger)
+                                            .await?,
+                                    );
+                                }
+                            }
+                            design = design.with_sqlite_parts(&create, triggers);
+                        }
+                        Ok::<_, ovs_core::Error>(design)
                     })
                     .await;
                     match loaded {
@@ -840,13 +897,14 @@ pub fn open(
                 }
                 None => None,
             };
-            cx.update(|window, cx| show(db, original, apply, window, cx))
+            cx.update(|window, cx| show(dialect, db, original, apply, window, cx))
                 .ok();
         })
         .detach();
 }
 
 fn show(
+    dialect: Dialect,
     db: String,
     original: Option<TableDesign>,
     apply: ApplySql,
@@ -857,7 +915,7 @@ fn show(
         Some(t) => format!("Design table {}", t.name),
         None => format!("New table in {db}"),
     };
-    let designer = cx.new(|cx| TableDesigner::new(db, original, window, cx));
+    let designer = cx.new(|cx| TableDesigner::new(dialect, db, original, window, cx));
     window.open_dialog(cx, move |dialog, _, _| {
         let (designer, apply) = (designer.clone(), apply.clone());
         dialog

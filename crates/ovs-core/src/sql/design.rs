@@ -19,6 +19,9 @@ pub struct ColumnDef {
     /// Kept from the existing column so changing it doesn't reset it to the table default;
     /// empty for the default.
     pub collation: String,
+    /// A generated (computed) column. Its expression isn't loaded, so it can be kept or
+    /// dropped but not changed.
+    pub generated: bool,
     /// The column's name in the existing table; `None` for a new column.
     pub original_name: Option<String>,
 }
@@ -96,6 +99,12 @@ pub struct TableDesign {
     pub indexes: Vec<IndexDef>,
     pub foreign_keys: Vec<ForeignKeyDef>,
     pub checks: Vec<CheckDef>,
+    /// SQLite: the table's triggers as `CREATE TRIGGER` statements, re-created after the
+    /// table is rebuilt.
+    pub triggers: Vec<String>,
+    /// SQLite: what follows the column list in the table's `CREATE`, e.g. `WITHOUT ROWID` or
+    /// `STRICT`, kept when the table is rebuilt.
+    pub suffix: String,
     /// Empty fields leave the server default (new tables) or the current value alone.
     pub options: TableOptions,
 }
@@ -130,11 +139,15 @@ pub fn foreign_key_sql(d: Dialect, db: &str, fk: &ForeignKeyDef) -> String {
     } else {
         fk.ref_database.trim()
     };
+    // SQLite foreign keys can only reference tables in their own schema, unqualified.
+    let target = match d {
+        Dialect::MySql => d.qualified(ref_db, fk.ref_table.trim()),
+        Dialect::Sqlite => d.quote_ident(fk.ref_table.trim()),
+    };
     let mut sql = format!(
-        "CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {} ({})",
+        "CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {target} ({})",
         d.quote_ident(&fk.name),
         list(&fk.columns),
-        d.qualified(ref_db, fk.ref_table.trim()),
         list(&fk.ref_columns)
     );
     for (clause, action) in [("ON DELETE", &fk.on_delete), ("ON UPDATE", &fk.on_update)] {
@@ -197,7 +210,12 @@ fn is_expression_default(value: &str) -> bool {
 
 impl TableDesign {
     /// Loads an existing table's design from its columns and indexes.
-    pub fn from_table(name: &str, columns: &[ColumnInfo], indexes: &[IndexInfo]) -> Self {
+    pub fn from_table(
+        d: Dialect,
+        name: &str,
+        columns: &[ColumnInfo],
+        indexes: &[IndexInfo],
+    ) -> Self {
         let primary: Vec<&String> = indexes
             .iter()
             .find(|i| i.is_primary())
@@ -214,12 +232,13 @@ impl TableDesign {
                     default_sql: match &c.default {
                         None => String::new(),
                         Some(v) if is_expression_default(v) => v.clone(),
-                        Some(v) => Dialect::MySql.quote_str(v),
+                        Some(v) => d.quote_str(v),
                     },
                     auto_increment: extra.contains("auto_increment"),
                     primary_key: primary.contains(&&c.name),
                     comment: c.comment.clone(),
                     collation: c.collation.clone(),
+                    generated: extra.contains("generated"),
                     original_name: Some(c.name.clone()),
                 }
             })
@@ -253,11 +272,82 @@ impl TableDesign {
             indexes,
             foreign_keys: Vec::new(),
             checks: Vec::new(),
+            triggers: Vec::new(),
+            suffix: String::new(),
             options: TableOptions::default(),
         }
     }
 
-    /// Adds the table's `CHECK` constraints.
+    /// Adds what a SQLite rebuild must carry over: the table's triggers and the options
+    /// after its column list in `create` (its `CREATE TABLE` statement).
+    #[must_use]
+    pub fn with_sqlite_parts(mut self, create: &str, triggers: Vec<String>) -> Self {
+        let tail = create.rfind(')').map_or("", |at| &create[at + 1..]);
+        tail.trim()
+            .trim_end_matches(';')
+            .trim()
+            .clone_into(&mut self.suffix);
+        self.triggers = triggers;
+        self
+    }
+
+    /// Changes `validate` can't see: generated columns, whose expression isn't loaded, can't
+    /// be changed, and SQLite rebuilds can't keep them at all.
+    pub fn validate_change(&self, d: Dialect, before: &TableDesign) -> Result<(), String> {
+        for old in before.columns.iter().filter(|c| c.generated) {
+            let new = self
+                .columns
+                .iter()
+                .find(|c| c.original_name.as_deref() == Some(old.name.as_str()));
+            let Some(new) = new else { continue };
+            if d == Dialect::Sqlite {
+                return Err(format!(
+                    "{} is a generated column, which a SQLite table can't keep when it's \
+                     rebuilt. Edit the table's CREATE statement instead.",
+                    old.name
+                ));
+            }
+            if new != old {
+                return Err(format!(
+                    "{} is a generated column; it can be kept or dropped, not changed.",
+                    old.name
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// `validate`, plus the limits of `d`.
+    pub fn validate_for(&self, d: Dialect) -> Result<(), String> {
+        self.validate()?;
+        if d == Dialect::Sqlite {
+            for c in self.columns.iter().filter(|c| c.auto_increment) {
+                let single = self.primary_key() == [c.name.as_str()];
+                if !single || !c.data_type.trim().eq_ignore_ascii_case("INTEGER") {
+                    return Err(format!(
+                        "In SQLite only a lone INTEGER primary key can auto-increment ({}).",
+                        c.name
+                    ));
+                }
+            }
+            for index in &self.indexes {
+                if !matches!(index.kind, IndexKind::Index | IndexKind::Unique) {
+                    return Err(format!(
+                        "SQLite has no {} indexes ({}).",
+                        index.kind.label(),
+                        index.name
+                    ));
+                }
+                if index.columns.iter().any(|c| c.contains('(')) {
+                    return Err(format!(
+                        "SQLite indexes have no prefix lengths ({}).",
+                        index.name
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
     #[must_use]
     pub fn with_checks(mut self, checks: &[CheckInfo]) -> Self {
         self.checks = checks
@@ -458,6 +548,9 @@ impl TableDesign {
 
 /// `name TYPE [NOT NULL] [DEFAULT x] [AUTO_INCREMENT] [COMMENT '...']`.
 pub fn column_sql(d: Dialect, c: &ColumnDef) -> String {
+    if d == Dialect::Sqlite {
+        return sqlite_column_sql(c, false);
+    }
     let mut sql = format!("{} {}", d.quote_ident(&c.name), c.data_type.trim());
     if !c.collation.trim().is_empty() {
         sql.push_str(" COLLATE ");
@@ -482,8 +575,107 @@ pub fn column_sql(d: Dialect, c: &ColumnDef) -> String {
     sql
 }
 
+/// A SQLite column; `inline_key` makes it `PRIMARY KEY AUTOINCREMENT`.
+fn sqlite_column_sql(c: &ColumnDef, inline_key: bool) -> String {
+    let d = Dialect::Sqlite;
+    let mut sql = format!("{} {}", d.quote_ident(&c.name), c.data_type.trim());
+    if inline_key {
+        sql.push_str(" PRIMARY KEY AUTOINCREMENT");
+    }
+    if !c.nullable || c.primary_key {
+        sql.push_str(" NOT NULL");
+    }
+    if !c.collation.trim().is_empty() {
+        sql.push_str(" COLLATE ");
+        sql.push_str(c.collation.trim());
+    }
+    if !c.default_sql.trim().is_empty() {
+        sql.push_str(" DEFAULT ");
+        sql.push_str(c.default_sql.trim());
+    }
+    sql
+}
+
+/// SQLite's `CREATE TABLE`: keys, foreign keys and checks inline; indexes are separate.
+fn sqlite_create_sql(db: &str, design: &TableDesign) -> String {
+    let d = Dialect::Sqlite;
+    let pk = design.primary_key();
+    let auto = pk.len() == 1
+        && design
+            .columns
+            .iter()
+            .any(|c| c.name == pk[0] && c.auto_increment);
+    let mut lines: Vec<String> = design
+        .columns
+        .iter()
+        .map(|c| format!("  {}", sqlite_column_sql(c, auto && c.name == pk[0])))
+        .collect();
+    if !pk.is_empty() && !auto {
+        let cols: Vec<String> = pk.iter().map(|c| d.quote_ident(c)).collect();
+        lines.push(format!("  PRIMARY KEY ({})", cols.join(", ")));
+    }
+    lines.extend(
+        design
+            .foreign_keys
+            .iter()
+            .map(|fk| format!("  {}", foreign_key_sql(d, db, fk))),
+    );
+    lines.extend(
+        design
+            .checks
+            .iter()
+            .map(|c| format!("  {}", check_sql(d, c))),
+    );
+    let mut sql = format!(
+        "CREATE TABLE {} (\n{}\n)",
+        d.qualified(db, &design.name),
+        lines.join(",\n")
+    );
+    if !design.suffix.is_empty() {
+        sql.push(' ');
+        sql.push_str(&design.suffix);
+    }
+    sql
+}
+
+/// SQLite's `CREATE INDEX` statements for a table's secondary indexes.
+fn sqlite_index_statements(db: &str, design: &TableDesign) -> Vec<String> {
+    let d = Dialect::Sqlite;
+    design
+        .indexes
+        .iter()
+        .map(|i| {
+            let cols: Vec<String> = i.columns.iter().map(|c| d.quote_ident(c.trim())).collect();
+            format!(
+                "CREATE {}INDEX {} ON {} ({})",
+                if i.kind == IndexKind::Unique {
+                    "UNIQUE "
+                } else {
+                    ""
+                },
+                d.qualified(db, &i.name),
+                d.quote_ident(&design.name),
+                cols.join(", ")
+            )
+        })
+        .collect()
+}
+
+/// Everything that creates the designed table: one `CREATE TABLE`, plus `CREATE INDEX`
+/// statements on SQLite.
+pub fn create_statements(d: Dialect, db: &str, design: &TableDesign) -> Vec<String> {
+    let mut out = vec![create_sql(d, db, design)];
+    if d == Dialect::Sqlite {
+        out.extend(sqlite_index_statements(db, design));
+    }
+    out
+}
+
 /// `CREATE TABLE db.name (...)` for a new table.
 pub fn create_sql(d: Dialect, db: &str, design: &TableDesign) -> String {
+    if d == Dialect::Sqlite {
+        return sqlite_create_sql(db, design);
+    }
     let mut lines: Vec<String> = design
         .columns
         .iter()
@@ -547,6 +739,89 @@ fn changed_text(before: &str, after: &str) -> String {
 /// plus a second when a foreign key is re-created under its old name (InnoDB won't drop and
 /// add the same constraint name in one statement).
 pub fn alter_sql(d: Dialect, db: &str, before: &TableDesign, after: &TableDesign) -> Vec<String> {
+    match d {
+        Dialect::MySql => alter_mysql(d, db, before, after),
+        Dialect::Sqlite => alter_sqlite(db, before, after),
+    }
+}
+
+/// SQLite's ALTER TABLE can only rename and add or drop simple columns, so any other change
+/// rebuilds the table: create the new design under a temporary name, copy the rows, drop the
+/// old table, rename the new one, and re-create its indexes and triggers. Runs with foreign
+/// key enforcement off, in one transaction.
+fn alter_sqlite(db: &str, before: &TableDesign, after: &TableDesign) -> Vec<String> {
+    let d = Dialect::Sqlite;
+    // The engine-neutral comparison tells whether anything changed at all.
+    if alter_mysql(Dialect::MySql, db, before, after).is_empty() {
+        return Vec::new();
+    }
+    let renamed_only = TableDesign {
+        name: before.name.clone(),
+        ..after.clone()
+    };
+    if before.name != after.name
+        && alter_mysql(Dialect::MySql, db, before, &renamed_only).is_empty()
+    {
+        return vec![format!(
+            "ALTER TABLE {} RENAME TO {}",
+            d.qualified(db, &before.name),
+            d.quote_ident(&after.name)
+        )];
+    }
+    let temp = format!("ovs_rebuild_{}", after.name);
+    let staged = TableDesign {
+        name: temp.clone(),
+        ..after.clone()
+    };
+    let (new_cols, old_cols): (Vec<String>, Vec<String>) = after
+        .columns
+        .iter()
+        .filter_map(|c| {
+            let old = c.original_name.as_ref()?;
+            before
+                .columns
+                .iter()
+                .any(|b| &b.name == old)
+                .then(|| (d.quote_ident(&c.name), d.quote_ident(old)))
+        })
+        .unzip();
+    let mut out = vec![
+        "PRAGMA foreign_keys = OFF".to_owned(),
+        "BEGIN".to_owned(),
+        sqlite_create_sql(db, &staged),
+    ];
+    if !new_cols.is_empty() {
+        out.push(format!(
+            "INSERT INTO {} ({}) SELECT {} FROM {}",
+            d.qualified(db, &temp),
+            new_cols.join(", "),
+            old_cols.join(", "),
+            d.qualified(db, &before.name)
+        ));
+    }
+    out.push(format!("DROP TABLE {}", d.qualified(db, &before.name)));
+    out.push(format!(
+        "ALTER TABLE {} RENAME TO {}",
+        d.qualified(db, &temp),
+        d.quote_ident(&after.name)
+    ));
+    out.extend(sqlite_index_statements(db, after));
+    out.extend(after.triggers.iter().cloned());
+    out.push("COMMIT".to_owned());
+    out.push("PRAGMA foreign_keys = ON".to_owned());
+    out
+}
+
+/// What to run when applying `alter_sql`'s statements fails part-way, to leave the session
+/// as it was.
+pub fn recovery_statements(d: Dialect) -> &'static [&'static str] {
+    match d {
+        Dialect::MySql => &[],
+        Dialect::Sqlite => &["ROLLBACK", "PRAGMA foreign_keys = ON"],
+    }
+}
+
+fn alter_mysql(d: Dialect, db: &str, before: &TableDesign, after: &TableDesign) -> Vec<String> {
     let mut clauses = Vec::new();
 
     // Foreign keys that went away or changed are dropped first, as they may need an index
@@ -807,10 +1082,60 @@ mod tests {
                 },
             ],
             indexes: Vec::new(),
-            foreign_keys: Vec::new(),
-            checks: Vec::new(),
-            options: TableOptions::default(),
+            ..TableDesign::default()
         }
+    }
+
+    #[test]
+    fn sqlite_creates_and_rebuilds() {
+        let s = Dialect::Sqlite;
+        let mut t = table();
+        t.columns[0].data_type = "INTEGER".into();
+        t.indexes.push(IndexDef {
+            original_name: None,
+            ..index("by_name", IndexKind::Unique, &["name"])
+        });
+        assert!(t.validate_for(s).is_ok());
+        assert_eq!(
+            create_statements(s, "main", &t),
+            [
+                "CREATE TABLE \"main\".\"t\" (\n  \"id\" INTEGER PRIMARY KEY AUTOINCREMENT \
+                 NOT NULL,\n  \"name\" VARCHAR(40) DEFAULT 'n/a'\n)",
+                "CREATE UNIQUE INDEX \"main\".\"by_name\" ON \"t\" (\"name\")",
+            ]
+        );
+        let mut loaded = t.clone();
+        loaded.indexes[0].original_name = Some("by_name".into());
+        let before = loaded.with_sqlite_parts(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT) STRICT;",
+            vec!["CREATE TRIGGER x AFTER INSERT ON t BEGIN SELECT 1; END".into()],
+        );
+        assert_eq!(before.suffix, "STRICT");
+        assert_eq!(alter_sql(s, "main", &before, &before).len(), 0);
+        let mut renamed = before.clone();
+        renamed.name = "u".into();
+        assert_eq!(
+            alter_sql(s, "main", &before, &renamed),
+            ["ALTER TABLE \"main\".\"t\" RENAME TO \"u\""]
+        );
+        let mut after = before.clone();
+        after.columns[1].name = "label".into();
+        after.columns.push(ColumnDef {
+            original_name: None,
+            ..col("born", "TEXT")
+        });
+        let sql = alter_sql(s, "main", &before, &after);
+        assert_eq!(sql[0], "PRAGMA foreign_keys = OFF");
+        assert!(sql[2].starts_with("CREATE TABLE \"main\".\"ovs_rebuild_t\""));
+        assert!(sql[2].ends_with(") STRICT"), "{}", sql[2]);
+        assert_eq!(
+            sql[3],
+            "INSERT INTO \"main\".\"ovs_rebuild_t\" (\"id\", \"label\") SELECT \"id\", \"name\" FROM \"main\".\"t\""
+        );
+        assert!(sql.contains(&"CREATE TRIGGER x AFTER INSERT ON t BEGIN SELECT 1; END".to_owned()));
+        assert_eq!(sql.last().unwrap(), "PRAGMA foreign_keys = ON");
+        t.indexes[0].kind = IndexKind::Fulltext;
+        assert!(t.validate_for(s).is_err());
     }
 
     #[test]
@@ -1043,7 +1368,7 @@ mod tests {
                 prefix_lengths: vec![Some(4), None],
             },
         ];
-        let design = TableDesign::from_table("t", &columns, &indexes);
+        let design = TableDesign::from_table(D, "t", &columns, &indexes);
         assert!(design.columns[0].primary_key && design.columns[0].auto_increment);
         assert_eq!(design.columns[1].default_sql, "'new'");
         assert_eq!(design.columns[2].default_sql, "CURRENT_TIMESTAMP");

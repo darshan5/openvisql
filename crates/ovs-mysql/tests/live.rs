@@ -676,7 +676,7 @@ async fn table_designer_sql_runs() {
         .unwrap();
 
     let load = |cols: Vec<ovs_core::ColumnInfo>, idx: Vec<ovs_core::IndexInfo>| {
-        TableDesign::from_table("items", &cols, &idx)
+        TableDesign::from_table(Dialect::MySql, "items", &cols, &idx)
     };
     let before = load(
         s.list_columns(&db, "items").await.unwrap(),
@@ -802,7 +802,7 @@ async fn table_designer_foreign_keys_and_options() {
         let fks = s.list_foreign_keys(db, "pets").await.unwrap();
         let options = s.table_options(db, "pets").await.unwrap();
         let checks = s.list_checks(db, "pets").await.unwrap();
-        TableDesign::from_table("pets", &columns, &indexes)
+        TableDesign::from_table(Dialect::MySql, "pets", &columns, &indexes)
             .with_constraints(db, &fks, options)
             .with_checks(&checks)
     }
