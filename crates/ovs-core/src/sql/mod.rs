@@ -20,5 +20,7 @@ pub use analyze::{
 };
 pub use dialect::Dialect;
 pub use edit::{CellEdit, RowEdit, RowKey, generate_edit};
-pub use lexer::{Token, TokenKind, tokenize};
-pub use splitter::{Statement, split_statements, statement_at};
+pub use lexer::{Token, TokenKind, tokenize, tokenize_for};
+pub use splitter::{
+    Statement, split_statements, split_statements_for, statement_at, statement_at_for,
+};

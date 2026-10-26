@@ -139,7 +139,7 @@ fn convert(value: ValueRef<'_>) -> Value {
 
 /// Runs `sql`, one statement or several, stopping at the first error.
 fn run(c: &Connection, sql: &str, row_limit: Option<usize>) -> Result<Vec<QueryOutcome>> {
-    let statements = ovs_core::sql::split_statements(sql);
+    let statements = ovs_core::sql::split_statements_for(sql, D);
     if statements.len() <= 1 {
         return run_one(c, sql, row_limit);
     }

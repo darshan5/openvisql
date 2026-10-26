@@ -141,7 +141,7 @@ pub fn foreign_key_sql(d: Dialect, db: &str, fk: &ForeignKeyDef) -> String {
     };
     // SQLite foreign keys can only reference tables in their own schema, unqualified.
     let target = match d {
-        Dialect::MySql => d.qualified(ref_db, fk.ref_table.trim()),
+        Dialect::MySql | Dialect::Postgres => d.qualified(ref_db, fk.ref_table.trim()),
         Dialect::Sqlite => d.quote_ident(fk.ref_table.trim()),
     };
     let mut sql = format!(
@@ -742,6 +742,8 @@ pub fn alter_sql(d: Dialect, db: &str, before: &TableDesign, after: &TableDesign
     match d {
         Dialect::MySql => alter_mysql(d, db, before, after),
         Dialect::Sqlite => alter_sqlite(db, before, after),
+        // The app doesn't offer the designer for PostgreSQL yet.
+        Dialect::Postgres => Vec::new(),
     }
 }
 
@@ -818,6 +820,7 @@ pub fn recovery_statements(d: Dialect) -> &'static [&'static str] {
     match d {
         Dialect::MySql => &[],
         Dialect::Sqlite => &["ROLLBACK", "PRAGMA foreign_keys = ON"],
+        Dialect::Postgres => &["ROLLBACK"],
     }
 }
 

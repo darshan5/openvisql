@@ -458,6 +458,7 @@ impl ObjectBrowser {
                 .filter(|child| match child {
                     Node::Folder { kind, .. } => {
                         self.dialect == Dialect::MySql
+                            || (self.dialect == Dialect::Postgres && *kind != ObjectKind::Event)
                             || matches!(
                                 kind,
                                 ObjectKind::Table | ObjectKind::View | ObjectKind::Trigger
@@ -489,8 +490,12 @@ impl ObjectBrowser {
         node: Option<&Node>,
         menu: PopupMenu,
     ) -> PopupMenu {
-        // Server-only features: routines, events, creating databases.
+        // MySQL-only: events and databases; PostgreSQL has routines and schemas (shown as
+        // databases); SQLite has neither. The designer, backup and copy aren't available for
+        // PostgreSQL yet.
         let mysql = d == Dialect::MySql;
+        let postgres = d == Dialect::Postgres;
+        let routines = mysql || postgres;
         let emit = |event: BrowserEvent| {
             let this = this.clone();
             move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| {
@@ -554,8 +559,13 @@ impl ObjectBrowser {
                             run: true,
                         })),
                     );
-                if mysql {
-                    menu = menu.item(PopupMenuItem::new("Show CREATE DATABASE").on_click(emit(
+                if mysql || postgres {
+                    let label = if postgres {
+                        "Show CREATE SCHEMA"
+                    } else {
+                        "Show CREATE DATABASE"
+                    };
+                    menu = menu.item(PopupMenuItem::new(label).on_click(emit(
                         BrowserEvent::ShowDdl {
                             db: db.clone(),
                             name: db.clone(),
@@ -564,12 +574,14 @@ impl ObjectBrowser {
                     )));
                 }
                 menu = menu.separator();
-                menu = menu.item(PopupMenuItem::new("New table (designer)…").on_click(emit(
-                    BrowserEvent::DesignTable {
-                        db: db.clone(),
-                        table: None,
-                    },
-                )));
+                if !postgres {
+                    menu = menu.item(PopupMenuItem::new("New table (designer)…").on_click(emit(
+                        BrowserEvent::DesignTable {
+                            db: db.clone(),
+                            table: None,
+                        },
+                    )));
+                }
                 menu = menu
                     .item(
                         PopupMenuItem::new("New table (SQL template)…").on_click(new_object(
@@ -583,7 +595,7 @@ impl ObjectBrowser {
                         db,
                         None,
                     )));
-                if mysql {
+                if routines {
                     menu = menu
                         .item(
                             PopupMenuItem::new("New stored procedure…").on_click(new_object(
@@ -596,27 +608,32 @@ impl ObjectBrowser {
                             ObjectKind::Function,
                             db,
                             None,
-                        )))
-                        .item(PopupMenuItem::new("New event…").on_click(new_object(
-                            ObjectKind::Event,
-                            db,
-                            None,
                         )));
                 }
+                if mysql {
+                    menu = menu.item(PopupMenuItem::new("New event…").on_click(new_object(
+                        ObjectKind::Event,
+                        db,
+                        None,
+                    )));
+                }
+                menu = menu.separator();
+                if !postgres {
+                    menu = menu
+                        .item(
+                            PopupMenuItem::new("Back up database…")
+                                .on_click(emit(BrowserEvent::Backup(db.clone()))),
+                        )
+                        .item(
+                            PopupMenuItem::new("Copy to another connection…").on_click(emit(
+                                BrowserEvent::CopyTo {
+                                    db: db.clone(),
+                                    table: None,
+                                },
+                            )),
+                        );
+                }
                 menu = menu
-                    .separator()
-                    .item(
-                        PopupMenuItem::new("Back up database…")
-                            .on_click(emit(BrowserEvent::Backup(db.clone()))),
-                    )
-                    .item(
-                        PopupMenuItem::new("Copy to another connection…").on_click(emit(
-                            BrowserEvent::CopyTo {
-                                db: db.clone(),
-                                table: None,
-                            },
-                        )),
-                    )
                     .item(
                         PopupMenuItem::new("Run SQL script…")
                             .on_click(emit(BrowserEvent::RunScript(db.clone()))),
@@ -626,10 +643,24 @@ impl ObjectBrowser {
                     menu =
                         menu.item(PopupMenuItem::new("Create database…").on_click(create_database));
                 }
+                if postgres {
+                    menu = menu.item(PopupMenuItem::new("Create schema…").on_click(emit(
+                        BrowserEvent::PromptExecute {
+                            title: "Create schema".into(),
+                            initial: String::new(),
+                            build: Rc::new(templates::create_schema),
+                        },
+                    )));
+                }
                 menu = menu.item(PopupMenuItem::new("Copy name").on_click(copy(db.clone())));
                 // SQLite's main database can't be removed; attached ones are detached.
-                if mysql {
-                    menu = menu.item(PopupMenuItem::new("Drop database…").on_click(drop(
+                if mysql || postgres {
+                    let label = if postgres {
+                        "Drop schema…"
+                    } else {
+                        "Drop database…"
+                    };
+                    menu = menu.item(PopupMenuItem::new(label).on_click(drop(
                         ObjectKind::Database,
                         db,
                         db,
@@ -702,18 +733,21 @@ impl ObjectBrowser {
                 menu = menu.separator();
                 if *kind == ObjectKind::Table {
                     let (rename_db, rename_from) = (db.clone(), name.clone());
-                    menu = menu.item(PopupMenuItem::new("Copy table to…").on_click(emit(
-                        BrowserEvent::CopyTo {
-                            db: db.clone(),
-                            table: Some(name.clone()),
-                        },
-                    )));
-                    menu = menu.item(PopupMenuItem::new("Design table…").on_click(emit(
-                        BrowserEvent::DesignTable {
-                            db: db.clone(),
-                            table: Some(name.clone()),
-                        },
-                    )));
+                    if !postgres {
+                        menu = menu
+                            .item(PopupMenuItem::new("Copy table to…").on_click(emit(
+                                BrowserEvent::CopyTo {
+                                    db: db.clone(),
+                                    table: Some(name.clone()),
+                                },
+                            )))
+                            .item(PopupMenuItem::new("Design table…").on_click(emit(
+                                BrowserEvent::DesignTable {
+                                    db: db.clone(),
+                                    table: Some(name.clone()),
+                                },
+                            )));
+                    }
                     menu = menu
                         .item(PopupMenuItem::new("New trigger…").on_click(new_object(
                             ObjectKind::Trigger,

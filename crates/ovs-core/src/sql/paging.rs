@@ -5,7 +5,7 @@
 //! including joins and `UNION`s, can be filtered by its output columns:
 //!
 //! ```sql
-//! SELECT * FROM (<base>) AS ovs_q WHERE <filter> ORDER BY `col` DESC LIMIT 50, 50
+//! SELECT * FROM (<base>) AS ovs_q WHERE <filter> ORDER BY `col` DESC LIMIT 50 OFFSET 50
 //! ```
 
 use super::dialect::Dialect;
@@ -44,7 +44,8 @@ impl PageSpec {
 
     /// The query for the current page.
     pub fn page_query(&self, dialect: Dialect) -> String {
-        let limit = format!("LIMIT {}, {}", self.offset, self.page_size);
+        // `LIMIT n OFFSET m` is understood by every supported engine.
+        let limit = format!("LIMIT {} OFFSET {}", self.page_size, self.offset);
         match (&self.sort, self.filter()) {
             (None, None) => format!("{} {limit}", self.base),
             (sort, _) => {
@@ -109,12 +110,12 @@ mod tests {
         let mut s = spec();
         assert_eq!(
             s.page_query(Dialect::MySql),
-            "SELECT * FROM shop.orders LIMIT 0, 50"
+            "SELECT * FROM shop.orders LIMIT 50 OFFSET 0"
         );
         s.next();
         assert_eq!(
             s.page_query(Dialect::MySql),
-            "SELECT * FROM shop.orders LIMIT 50, 50"
+            "SELECT * FROM shop.orders LIMIT 50 OFFSET 50"
         );
         assert_eq!(
             s.count_query(),
@@ -139,7 +140,7 @@ mod tests {
         assert_eq!(
             s.page_query(Dialect::MySql),
             "SELECT * FROM (SELECT * FROM shop.orders) AS ovs_q WHERE status = 'paid' \
-             ORDER BY `ordered at` DESC LIMIT 100, 50"
+             ORDER BY `ordered at` DESC LIMIT 50 OFFSET 100"
         );
         assert_eq!(
             s.count_query(),
@@ -155,7 +156,7 @@ mod tests {
         };
         assert_eq!(
             sorted_only.page_query(Dialect::MySql),
-            "SELECT * FROM (SELECT * FROM shop.orders) AS ovs_q ORDER BY `id` ASC LIMIT 0, 50"
+            "SELECT * FROM (SELECT * FROM shop.orders) AS ovs_q ORDER BY `id` ASC LIMIT 50 OFFSET 0"
         );
     }
 

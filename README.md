@@ -2,7 +2,7 @@
 
 A fast, native desktop SQL client written in Rust, for macOS and Windows.
 
-OpenViSQL connects to **MySQL**, **MariaDB** and **SQLite** today; **PostgreSQL** is next.
+OpenViSQL connects to **MySQL**, **MariaDB**, **PostgreSQL** and **SQLite**.
 The layout is the classic one for MySQL tools: an object browser on the left, query tabs on
 the right, and results below.
 
@@ -10,6 +10,10 @@ the right, and results below.
 
 ## Features
 
+- **PostgreSQL**: the database's schemas are listed like databases, with tables, views,
+  functions, procedures and triggers. It shares the editor (dollar-quoted bodies split
+  correctly), grid editing, export, CSV import and server tools. TLS, the designer and backup
+  are still to come.
 - **SQLite** database files, opened or created from the connection manager. They get the same
   editor, grid editing, export, CSV import, backup/restore and table designer (which rebuilds
   the table safely). Server-only tools are hidden for them.
@@ -96,6 +100,7 @@ See [docs/SETUP.md](docs/SETUP.md) for development setup and running the integra
 | --- | --- |
 | `ovs-core` | Engine-agnostic types, driver traits, SQL lexer/splitter, quoting, grid-edit SQL |
 | `ovs-mysql` | MySQL/MariaDB driver built on `mysql_async` |
+| `ovs-postgres` | PostgreSQL driver built on `tokio-postgres` |
 | `ovs-sqlite` | SQLite driver built on `rusqlite` (SQLite compiled in) |
 | `ovs-ssh` | SSH tunnels built on `russh` |
 | `ovs-store` | Saved connections, passwords (keychain or encrypted file), history, session |

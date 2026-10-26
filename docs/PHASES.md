@@ -119,9 +119,20 @@ Phase 4 is complete.
 
 ## Phase 5: PostgreSQL
 
-- `ovs-postgres` driver (`tokio-postgres`); schemas between database and objects; sequences,
-  types and materialized views.
-- `Dialect::Postgres`; cancel through the protocol's cancel request.
+- ✅ `ovs-postgres` driver (`tokio-postgres`). Statements are prepared to learn column types
+  and source tables, then run with the simple query protocol so every type displays as
+  PostgreSQL formats it. Cancel uses the protocol's cancel request.
+- ✅ `Dialect::Postgres`: dollar-quoted bodies and standard strings in the splitter, `'\x..'`
+  bytea literals, ctid-targeted keyless edits, `LIMIT n OFFSET m` paging.
+- ✅ The connected database's schemas are the object browser's databases, with tables,
+  views, functions, procedures and triggers. `CREATE` statements for tables are built from
+  the catalogs.
+- ✅ Templates, info queries and server tools (`pg_stat_activity` with cancel/terminate,
+  settings, statistics).
+- Still to do:
+  - TLS
+  - the table designer, backup and copy for PostgreSQL
+  - sequences, types and materialized-view refresh in the browser
 
 ## Packaging
 

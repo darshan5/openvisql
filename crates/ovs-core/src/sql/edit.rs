@@ -88,9 +88,13 @@ fn where_clause(dialect: Dialect, target: &str, key: &RowKey) -> String {
     match (limit, dialect) {
         (false, _) => format!(" WHERE {preds}"),
         (true, Dialect::MySql) => format!(" WHERE {preds} LIMIT 1"),
-        // SQLite's UPDATE and DELETE take no LIMIT, but every keyless table has a rowid.
+        // SQLite's and PostgreSQL's UPDATE and DELETE take no LIMIT, so one row is picked by
+        // its physical id: SQLite's rowid, PostgreSQL's ctid.
         (true, Dialect::Sqlite) => {
             format!(" WHERE rowid = (SELECT rowid FROM {target} WHERE {preds} LIMIT 1)")
+        }
+        (true, Dialect::Postgres) => {
+            format!(" WHERE ctid = (SELECT ctid FROM {target} WHERE {preds} LIMIT 1)")
         }
     }
 }

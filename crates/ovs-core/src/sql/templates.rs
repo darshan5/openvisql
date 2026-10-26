@@ -9,8 +9,10 @@ const D: Dialect = Dialect::MySql;
 /// A starting point for creating a new object of `kind` in `db`, opened in the editor for the
 /// user to adjust. `table` is needed for triggers.
 pub fn create_template(d: Dialect, kind: ObjectKind, db: &str, table: Option<&str>) -> String {
-    if d == Dialect::Sqlite {
-        return sqlite_create_template(kind, db, table);
+    match d {
+        Dialect::Sqlite => return sqlite_create_template(kind, db, table),
+        Dialect::Postgres => return postgres_create_template(kind, db, table),
+        Dialect::MySql => {}
     }
     let q = |name: &str| D.qualified(db, name);
     match kind {
@@ -40,6 +42,37 @@ pub fn create_template(d: Dialect, kind: ObjectKind, db: &str, table: Option<&st
             "CREATE EVENT {}\nON SCHEDULE EVERY 1 DAY\nDO\n  SELECT 1;\n",
             q("new_event")
         ),
+    }
+}
+
+fn postgres_create_template(kind: ObjectKind, schema: &str, table: Option<&str>) -> String {
+    let d = Dialect::Postgres;
+    let q = |name: &str| d.qualified(schema, name);
+    match kind {
+        ObjectKind::Database => "CREATE SCHEMA \"new_schema\";\n".to_owned(),
+        ObjectKind::Table => format!(
+            "CREATE TABLE {} (\n  \"id\" bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,\n  \"name\" text NOT NULL,\n  \"created_at\" timestamptz NOT NULL DEFAULT now()\n);\n",
+            q("new_table")
+        ),
+        ObjectKind::View => format!(
+            "CREATE VIEW {} AS\nSELECT\n  1 AS \"example\";\n",
+            q("new_view")
+        ),
+        ObjectKind::Procedure => format!(
+            "CREATE PROCEDURE {}(p_id integer)\nLANGUAGE plpgsql\nAS $$\nBEGIN\n  RAISE NOTICE 'id %', p_id;\nEND;\n$$;\n",
+            q("new_procedure")
+        ),
+        ObjectKind::Function => format!(
+            "CREATE FUNCTION {}(p_value integer)\nRETURNS integer\nLANGUAGE sql IMMUTABLE\nAS $$\n  SELECT p_value;\n$$;\n",
+            q("new_function")
+        ),
+        // A trigger runs a function; both are created here.
+        ObjectKind::Trigger => format!(
+            "CREATE FUNCTION {func}()\nRETURNS trigger\nLANGUAGE plpgsql\nAS $$\nBEGIN\n  -- NEW.\"column\" := ...;\n  RETURN NEW;\nEND;\n$$;\n\nCREATE TRIGGER \"new_trigger\"\nBEFORE INSERT ON {table}\nFOR EACH ROW EXECUTE FUNCTION {func}();\n",
+            func = q("new_trigger_fn"),
+            table = q(table.unwrap_or("table_name"))
+        ),
+        ObjectKind::Event => "-- PostgreSQL has no events; use the pg_cron extension.\n".to_owned(),
     }
 }
 
@@ -139,6 +172,12 @@ pub fn statement_template(
 
 /// Statements describing a table: status, columns, indexes and DDL, one result each.
 pub fn table_info(d: Dialect, db: &str, table: &str) -> String {
+    if d == Dialect::Postgres {
+        let (schema, name) = (d.quote_str(db), d.quote_str(table));
+        return format!(
+            "SELECT c.relname AS \"table\", c.reltuples::bigint AS \"rows (approx.)\",\n  pg_size_pretty(pg_total_relation_size(c.oid)) AS \"total size\",\n  obj_description(c.oid, 'pg_class') AS \"comment\"\nFROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace\nWHERE n.nspname = {schema} AND c.relname = {name};\nSELECT column_name, data_type, is_nullable, column_default\nFROM information_schema.columns\nWHERE table_schema = {schema} AND table_name = {name}\nORDER BY ordinal_position;\nSELECT indexname, indexdef FROM pg_indexes\nWHERE schemaname = {schema} AND tablename = {name};\nSELECT conname, pg_get_constraintdef(oid) AS definition FROM pg_constraint\nWHERE conrelid = (quote_ident({schema}) || '.' || quote_ident({name}))::regclass;\n"
+        );
+    }
     if d == Dialect::Sqlite {
         let schema = d.quote_ident(db);
         let name = d.quote_str(table);
@@ -156,6 +195,12 @@ pub fn table_info(d: Dialect, db: &str, table: &str) -> String {
 
 /// Statements describing a database: its tables with sizes, and its DDL.
 pub fn database_info(d: Dialect, db: &str) -> String {
+    if d == Dialect::Postgres {
+        return format!(
+            "SELECT c.relname AS \"name\", CASE c.relkind WHEN 'r' THEN 'table' WHEN 'p' THEN 'partitioned table' WHEN 'v' THEN 'view' WHEN 'm' THEN 'materialized view' WHEN 'S' THEN 'sequence' ELSE c.relkind::text END AS \"kind\",\n  c.reltuples::bigint AS \"rows (approx.)\", pg_size_pretty(pg_total_relation_size(c.oid)) AS \"size\"\nFROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace\nWHERE n.nspname = {} AND c.relkind IN ('r', 'p', 'v', 'm', 'S')\nORDER BY 2, 1;\n",
+            d.quote_str(db)
+        );
+    }
     if d == Dialect::Sqlite {
         let schema = d.quote_ident(db);
         return format!(
@@ -179,19 +224,48 @@ pub const SERVER_INFO: &str = "SELECT VERSION() AS `version`, @@version_comment 
 pub const STATUS_VARIABLES: &str = "SHOW GLOBAL STATUS;\n";
 pub const SYSTEM_VARIABLES: &str = "SHOW GLOBAL VARIABLES;\n";
 
+/// PostgreSQL's sessions, longest-running first. The first column is the backend pid.
+pub const PG_PROCESS_LIST: &str = "SELECT pid AS \"ID\", usename AS \"USER\", client_addr AS \"HOST\", datname AS \"DB\",\n  state AS \"STATE\", now() - query_start AS \"TIME\", left(query, 500) AS \"INFO\"\nFROM pg_stat_activity\nWHERE backend_type = 'client backend'\nORDER BY query_start NULLS LAST;\n";
+
+pub const PG_SERVER_INFO: &str = "SELECT version() AS \"version\", current_database() AS \"database\",\n  current_user AS \"user\", inet_server_addr() AS \"host\", inet_server_port() AS \"port\",\n  pg_size_pretty(pg_database_size(current_database())) AS \"database size\",\n  pg_postmaster_start_time() AS \"started\";\nSELECT * FROM pg_stat_database WHERE datname = current_database();\n";
+
+pub const PG_STATUS_VARIABLES: &str = "SELECT * FROM pg_stat_database;\n";
+pub const PG_SYSTEM_VARIABLES: &str =
+    "SELECT name, setting, unit, short_desc FROM pg_settings ORDER BY name;\n";
+
+/// The process-list, server-info, status and settings queries for `d`.
+pub fn server_queries(d: Dialect) -> [&'static str; 4] {
+    match d {
+        Dialect::Postgres => [
+            PG_PROCESS_LIST,
+            PG_SERVER_INFO,
+            PG_STATUS_VARIABLES,
+            PG_SYSTEM_VARIABLES,
+        ],
+        Dialect::MySql | Dialect::Sqlite => [
+            PROCESS_LIST,
+            SERVER_INFO,
+            STATUS_VARIABLES,
+            SYSTEM_VARIABLES,
+        ],
+    }
+}
+
 /// True for a statement that lists server processes, whose rows can be killed.
 pub fn is_process_list(sql: &str) -> bool {
     let upper = sql.to_ascii_uppercase();
     upper.contains("INFORMATION_SCHEMA.PROCESSLIST")
+        || upper.contains("PG_STAT_ACTIVITY")
         || upper.contains("PROCESSLIST") && upper.trim_start().starts_with("SHOW")
 }
 
-/// `KILL QUERY id` stops the running statement; `KILL id` closes the whole connection.
-pub fn kill(id: u64, connection: bool) -> String {
-    if connection {
-        format!("KILL {id}")
-    } else {
-        format!("KILL QUERY {id}")
+/// Stops a session's running statement, or (`connection`) closes the session.
+pub fn kill(d: Dialect, id: u64, connection: bool) -> String {
+    match (d, connection) {
+        (Dialect::Postgres, true) => format!("SELECT pg_terminate_backend({id})"),
+        (Dialect::Postgres, false) => format!("SELECT pg_cancel_backend({id})"),
+        (_, true) => format!("KILL {id}"),
+        (_, false) => format!("KILL QUERY {id}"),
     }
 }
 
@@ -201,6 +275,10 @@ pub fn drop_object(d: Dialect, kind: ObjectKind, db: &str, name: &str) -> String
         (Dialect::Sqlite, ObjectKind::Database) => {
             format!("DETACH DATABASE {}", d.quote_ident(name))
         }
+        // The object browser's PostgreSQL "databases" are schemas.
+        (Dialect::Postgres, ObjectKind::Database) => {
+            format!("DROP SCHEMA {}", d.quote_ident(name))
+        }
         (_, ObjectKind::Database) => format!("DROP DATABASE {}", d.quote_ident(name)),
         _ => format!("DROP {} {}", kind.sql_keyword(), d.qualified(db, name)),
     }
@@ -208,7 +286,9 @@ pub fn drop_object(d: Dialect, kind: ObjectKind, db: &str, name: &str) -> String
 
 pub fn truncate_table(d: Dialect, db: &str, table: &str) -> String {
     match d {
-        Dialect::MySql => format!("TRUNCATE TABLE {}", d.qualified(db, table)),
+        Dialect::MySql | Dialect::Postgres => {
+            format!("TRUNCATE TABLE {}", d.qualified(db, table))
+        }
         Dialect::Sqlite => format!("DELETE FROM {}", d.qualified(db, table)),
     }
 }
@@ -220,12 +300,17 @@ pub fn rename_table(d: Dialect, db: &str, from: &str, to: &str) -> String {
             d.qualified(db, from),
             d.qualified(db, to)
         ),
-        Dialect::Sqlite => format!(
+        Dialect::Sqlite | Dialect::Postgres => format!(
             "ALTER TABLE {} RENAME TO {}",
             d.qualified(db, from),
             d.quote_ident(to)
         ),
     }
+}
+
+/// `CREATE SCHEMA`: what "Create database" means in PostgreSQL's object browser.
+pub fn create_schema(name: &str) -> String {
+    format!("CREATE SCHEMA {}", Dialect::Postgres.quote_ident(name))
 }
 
 pub fn create_database(name: &str) -> String {
@@ -292,8 +377,13 @@ mod tests {
         assert!(is_process_list(PROCESS_LIST));
         assert!(is_process_list("show full processlist"));
         assert!(!is_process_list("select * from orders"));
-        assert_eq!(kill(42, false), "KILL QUERY 42");
-        assert_eq!(kill(42, true), "KILL 42");
+        assert_eq!(kill(D, 42, false), "KILL QUERY 42");
+        assert_eq!(kill(D, 42, true), "KILL 42");
+        assert_eq!(
+            kill(Dialect::Postgres, 7, false),
+            "SELECT pg_cancel_backend(7)"
+        );
+        assert!(is_process_list(PG_PROCESS_LIST));
         assert_eq!(split_statements(SERVER_INFO).len(), 2);
     }
 

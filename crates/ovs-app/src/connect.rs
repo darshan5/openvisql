@@ -76,6 +76,8 @@ pub struct ConnectView {
     password: Entity<InputState>,
     /// The database file, for SQLite.
     path: Entity<InputState>,
+    /// The database to connect to, for PostgreSQL.
+    database: Entity<InputState>,
     databases: Entity<InputState>,
     ssl_ca: Entity<InputState>,
     init_commands: Entity<InputState>,
@@ -133,6 +135,7 @@ impl ConnectView {
             user: input("root", window, cx),
             password: password.clone(),
             path: input("/path/to/database.sqlite", window, cx),
+            database: input("postgres", window, cx),
             databases: input("All databases (or db1;db2)", window, cx),
             ssl_ca: input("Path to CA certificate (PEM), optional", window, cx),
             init_commands: input("SET NAMES utf8mb4; SET time_zone = '+00:00'", window, cx),
@@ -163,6 +166,7 @@ impl ConnectView {
         set(&self.port, config.port.to_string(), window, cx);
         set(&self.user, config.user.clone(), window, cx);
         set(&self.path, config.path.clone(), window, cx);
+        set(&self.database, config.database.clone(), window, cx);
         // Left empty: a saved password stays in the keychain until it's needed.
         set(&self.password, String::new(), window, cx);
         self.password_edited = false;
@@ -273,6 +277,7 @@ impl ConnectView {
             host,
             port,
             user: text(&self.user),
+            database: text(&self.database),
             databases: text(&self.databases),
             ssl_ca,
             init_commands: text(&self.init_commands),
@@ -696,20 +701,20 @@ impl ConnectView {
     }
 
     fn set_engine(&mut self, engine: Engine, window: &mut Window, cx: &mut Context<Self>) {
-        if self.editing.engine == engine {
+        let old = self.editing.engine;
+        if old == engine {
             return;
         }
         self.editing.engine = engine;
-        if engine.is_server()
-            && self
-                .port
-                .read(cx)
-                .value()
-                .trim()
-                .parse::<u16>()
-                .unwrap_or(0)
-                == 0
-        {
+        // Follow the engine's usual port unless the user picked another.
+        let port = self
+            .port
+            .read(cx)
+            .value()
+            .trim()
+            .parse::<u16>()
+            .unwrap_or(0);
+        if engine.is_server() && (port == 0 || port == old.default_port()) {
             let port = engine.default_port().to_string();
             self.port.update(cx, |s, cx| s.set_value(port, window, cx));
         }
@@ -894,6 +899,14 @@ impl ConnectView {
                             })
                             .when(self.editing.engine.is_server(), |form| form
                             .child(Field::new().label("Host").child(Input::new(&self.host)))
+                            .when(self.editing.engine == Engine::Postgres, |form| {
+                                form.child(
+                                    Field::new()
+                                        .label("Database")
+                                        .description("Its schemas are listed in the object browser.")
+                                        .child(Input::new(&self.database)),
+                                )
+                            })
                             .child(Field::new().label("Port").child(Input::new(&self.port)))
                             .child(Field::new().label("User").child(Input::new(&self.user)))
                             .child(

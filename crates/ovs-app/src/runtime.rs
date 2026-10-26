@@ -43,6 +43,7 @@ pub fn driver_for(config: &ConnectionConfig) -> Arc<dyn Driver> {
     match config.engine {
         ovs_core::Engine::MySql => Arc::new(ovs_mysql::MySqlDriver),
         ovs_core::Engine::Sqlite => Arc::new(ovs_sqlite::SqliteDriver),
+        ovs_core::Engine::Postgres => Arc::new(ovs_postgres::PostgresDriver),
     }
 }
 

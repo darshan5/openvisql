@@ -10,14 +10,16 @@ pub enum Engine {
     MySql,
     /// A database file opened in-process.
     Sqlite,
+    Postgres,
 }
 
 impl Engine {
-    pub const ALL: [Self; 2] = [Self::MySql, Self::Sqlite];
+    pub const ALL: [Self; 3] = [Self::MySql, Self::Postgres, Self::Sqlite];
 
     pub fn default_port(self) -> u16 {
         match self {
             Self::MySql => 3306,
+            Self::Postgres => 5432,
             Self::Sqlite => 0,
         }
     }
@@ -25,6 +27,7 @@ impl Engine {
     pub fn label(self) -> &'static str {
         match self {
             Self::MySql => "MySQL / MariaDB",
+            Self::Postgres => "PostgreSQL",
             Self::Sqlite => "SQLite",
         }
     }
@@ -32,6 +35,7 @@ impl Engine {
     pub fn dialect(self) -> crate::sql::Dialect {
         match self {
             Self::MySql => crate::sql::Dialect::MySql,
+            Self::Postgres => crate::sql::Dialect::Postgres,
             Self::Sqlite => crate::sql::Dialect::Sqlite,
         }
     }
@@ -40,7 +44,7 @@ impl Engine {
     /// than opening a file.
     pub fn is_server(self) -> bool {
         match self {
-            Self::MySql => true,
+            Self::MySql | Self::Postgres => true,
             Self::Sqlite => false,
         }
     }
@@ -131,6 +135,9 @@ pub struct ConnectionConfig {
     pub ssh: SshConfig,
     /// The database file, for engines that open one (SQLite).
     pub path: String,
+    /// The database to connect to, for engines that connect to one (PostgreSQL). Its schemas
+    /// are what the object browser lists.
+    pub database: String,
 }
 
 impl Default for ConnectionConfig {
@@ -154,6 +161,7 @@ impl Default for ConnectionConfig {
             safe_updates: true,
             ssh: SshConfig::default(),
             path: String::new(),
+            database: String::new(),
         }
     }
 }

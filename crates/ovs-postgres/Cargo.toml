@@ -1,0 +1,18 @@
+[package]
+name = "ovs-postgres"
+description = "PostgreSQL driver for OpenViSQL"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+ovs-core.workspace = true
+tokio.workspace = true
+tokio-postgres.workspace = true
+futures.workspace = true
+
+[lints]
+workspace = true

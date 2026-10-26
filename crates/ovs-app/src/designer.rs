@@ -141,6 +141,7 @@ impl TableDesigner {
                 data_type: match dialect {
                     Dialect::MySql => "INT UNSIGNED",
                     Dialect::Sqlite => "INTEGER",
+                    Dialect::Postgres => "bigint",
                 }
                 .into(),
                 primary_key: true,

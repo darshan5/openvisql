@@ -1,6 +1,7 @@
 use std::ops::Range;
 
-use super::lexer::{TokenKind, tokenize};
+use super::dialect::Dialect;
+use super::lexer::{TokenKind, tokenize_for};
 
 /// One statement found in an editor buffer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,7 +35,13 @@ pub struct Statement {
 /// CREATE TRIGGER t AFTER INSERT ON a BEGIN INSERT INTO log VALUES (1); END;
 /// ```
 pub fn split_statements(src: &str) -> Vec<Statement> {
-    let tokens = tokenize(src);
+    split_statements_for(src, Dialect::MySql)
+}
+
+/// [`split_statements`] with `dialect`'s lexing rules (e.g. PostgreSQL's dollar quotes, so a
+/// function body's semicolons stay inside it).
+pub fn split_statements_for(src: &str, dialect: Dialect) -> Vec<Statement> {
+    let tokens = tokenize_for(src, dialect);
     let mut out = Vec::new();
     let mut delimiter = ";".to_owned();
     let mut span_start = 0;
@@ -186,7 +193,12 @@ impl Trigger {
 /// previous statement's delimiter ended, that statement wins, matching how users expect
 /// "execute current" to behave right after typing `;`.
 pub fn statement_at(src: &str, cursor: usize) -> Option<Statement> {
-    let mut stmts = split_statements(src);
+    statement_at_for(src, cursor, Dialect::MySql)
+}
+
+/// [`statement_at`] with `dialect`'s lexing rules.
+pub fn statement_at_for(src: &str, cursor: usize, dialect: Dialect) -> Option<Statement> {
+    let mut stmts = split_statements_for(src, dialect);
     let cursor = cursor.min(src.len());
     let idx = stmts
         .iter()
@@ -283,5 +295,16 @@ mod tests {
         assert_eq!(at(12).as_deref(), Some("select 2"));
         assert_eq!(at(src.len()).as_deref(), Some("select 3"));
         assert_eq!(statement_at("", 0), None);
+    }
+
+    #[test]
+    fn postgres_function_bodies_stay_whole() {
+        let src = "CREATE FUNCTION f() RETURNS int LANGUAGE plpgsql AS $$\nBEGIN\n  RETURN 1;\nEND;\n$$;\nSELECT f();";
+        let out: Vec<String> = split_statements_for(src, Dialect::Postgres)
+            .into_iter()
+            .map(|s| s.sql)
+            .collect();
+        assert_eq!(out.len(), 2, "{out:#?}");
+        assert!(out[0].ends_with("END;\n$$"));
     }
 }

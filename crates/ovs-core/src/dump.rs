@@ -7,7 +7,7 @@ use crate::driver::Session;
 use crate::error::{Error, Result};
 use crate::result::QueryOutcome;
 use crate::schema::ObjectKind;
-use crate::sql::{Dialect, split_statements};
+use crate::sql::{Dialect, split_statements_for};
 
 /// Rows fetched per query while dumping table data.
 const FETCH_BATCH: u64 = 5_000;
@@ -161,6 +161,17 @@ pub async fn copy_database(
             target.use_database(target_db).await?;
             Collations::of(target).await?
         }
+        // PostgreSQL "databases" here are schemas of the connected database.
+        Dialect::Postgres => {
+            target
+                .execute(
+                    &format!("CREATE SCHEMA IF NOT EXISTS {}", d.quote_ident(target_db)),
+                    Some(0),
+                )
+                .await?;
+            target.use_database(target_db).await?;
+            Collations::default()
+        }
         // A SQLite database is a file; it (or an attached one) must already be open.
         Dialect::Sqlite => {
             target.use_database(target_db).await?;
@@ -282,6 +293,7 @@ fn checks_off(d: Dialect) -> &'static [&'static str] {
             "SET UNIQUE_CHECKS = 0",
         ],
         Dialect::Sqlite => &["PRAGMA foreign_keys = OFF"],
+        Dialect::Postgres => &["SET client_encoding = 'UTF8'"],
     }
 }
 
@@ -289,6 +301,7 @@ fn checks_on(d: Dialect) -> &'static [&'static str] {
     match d {
         Dialect::MySql => &["SET UNIQUE_CHECKS = 1", "SET FOREIGN_KEY_CHECKS = 1"],
         Dialect::Sqlite => &["PRAGMA foreign_keys = ON"],
+        Dialect::Postgres => &[],
     }
 }
 
@@ -440,8 +453,9 @@ async fn dump_rows(
     let mut offset = 0u64;
     let mut total = 0u64;
     loop {
-        let sql =
-            format!("SELECT {select_cols} FROM {target}{order} LIMIT {offset}, {FETCH_BATCH}");
+        let sql = format!(
+            "SELECT {select_cols} FROM {target}{order} LIMIT {FETCH_BATCH} OFFSET {offset}"
+        );
         let rows = match session.execute(&sql, None).await?.into_iter().next() {
             Some(QueryOutcome::Rows(rs)) => rs.rows,
             _ => Vec::new(),
@@ -487,7 +501,7 @@ pub async fn run_script(
     stop_on_error: bool,
     progress: &mut (dyn FnMut(usize, usize) + Send),
 ) -> ScriptStats {
-    let statements = split_statements(script);
+    let statements = split_statements_for(script, session.dialect());
     let total = statements.len();
     let mut stats = ScriptStats::default();
     for (i, stmt) in statements.iter().enumerate() {

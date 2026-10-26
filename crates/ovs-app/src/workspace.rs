@@ -21,6 +21,7 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, Subscription, Window, div,
     prelude::FluentBuilder as _, px,
 };
+use ovs_core::sql::Dialect;
 use ovs_core::sql::templates;
 use ovs_core::{ConnectionConfig, ObjectKind};
 use ovs_store::SavedConnectionTab;
@@ -694,6 +695,7 @@ impl Workspace {
             .when(self.config.engine.is_server(), |bar| {
                 bar.child({
                     let this = cx.entity().downgrade();
+                    let dialect = self.config.engine.dialect();
                     Button::new("server-menu")
                         .ghost()
                         .small()
@@ -719,24 +721,34 @@ impl Workspace {
                                     .ok();
                                 }
                             };
-                            menu.item(
-                                PopupMenuItem::new("Process list")
-                                    .on_click(open("Process list", templates::PROCESS_LIST)),
-                            )
-                            .item(
-                                PopupMenuItem::new("Server info")
-                                    .on_click(open("Server info", templates::SERVER_INFO)),
-                            )
-                            .item(
-                                PopupMenuItem::new("Status variables")
-                                    .on_click(open("Status", templates::STATUS_VARIABLES)),
-                            )
-                            .item(
-                                PopupMenuItem::new("System variables")
-                                    .on_click(open("Variables", templates::SYSTEM_VARIABLES)),
-                            )
-                            .separator()
-                            .item(
+                            let [processes, info, status, variables] =
+                                templates::server_queries(dialect);
+                            let menu = menu
+                                .item(
+                                    PopupMenuItem::new("Process list")
+                                        .on_click(open("Process list", processes)),
+                                )
+                                .item(
+                                    PopupMenuItem::new("Server info")
+                                        .on_click(open("Server info", info)),
+                                )
+                                .item(
+                                    PopupMenuItem::new("Status variables")
+                                        .on_click(open("Status", status)),
+                                )
+                                .item(
+                                    PopupMenuItem::new(if dialect == Dialect::Postgres {
+                                        "Settings"
+                                    } else {
+                                        "System variables"
+                                    })
+                                    .on_click(open("Variables", variables)),
+                                );
+                            // The user manager speaks MySQL's account model.
+                            if dialect != Dialect::MySql {
+                                return menu;
+                            }
+                            menu.separator().item(
                                 PopupMenuItem::new("Users and privileges…").on_click({
                                     let this = this.clone();
                                     move |_, window, cx| {

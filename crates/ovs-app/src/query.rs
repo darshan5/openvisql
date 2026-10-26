@@ -455,12 +455,13 @@ impl QueryTab {
         let editor = self.editor.read(cx);
         let text = editor.value();
         let selection = editor.selected_range();
+        let dialect = self.config.engine.dialect();
         if mode == RunMode::Current && !selection.is_empty() {
-            return sql::split_statements(&text[selection]);
+            return sql::split_statements_for(&text[selection], dialect);
         }
         match mode {
-            RunMode::All => sql::split_statements(&text),
-            RunMode::Current => sql::statement_at(&text, editor.cursor())
+            RunMode::All => sql::split_statements_for(&text, dialect),
+            RunMode::Current => sql::statement_at_for(&text, editor.cursor(), dialect)
                 .into_iter()
                 .collect(),
         }
@@ -1407,7 +1408,7 @@ impl QueryTab {
             return;
         };
         let session = session.clone();
-        let sql = sql::templates::kill(id, connection);
+        let sql = sql::templates::kill(self.config.engine.dialect(), id, connection);
         cx.spawn_in(window, async move |this, cx| {
             let result =
                 runtime::run(async move { session.lock().await.execute(&sql, None).await }).await;

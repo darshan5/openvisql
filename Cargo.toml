@@ -13,6 +13,7 @@ rust-version = "1.92"
 [workspace.dependencies]
 ovs-core = { path = "crates/ovs-core" }
 ovs-mysql = { path = "crates/ovs-mysql" }
+ovs-postgres = { path = "crates/ovs-postgres" }
 ovs-sqlite = { path = "crates/ovs-sqlite" }
 ovs-ssh = { path = "crates/ovs-ssh" }
 ovs-store = { path = "crates/ovs-store" }
@@ -31,6 +32,7 @@ rusqlite = { version = "0.41", default-features = false, features = ["bundled", 
 mysql_async = { version = "0.37", default-features = false, features = ["minimal-rust", "rustls-tls", "ring", "tls12", "client_ed25519"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+tokio-postgres = { version = "0.7", default-features = false, features = ["runtime"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 toml = "0.9"
 uuid = { version = "1", features = ["v4", "serde"] }

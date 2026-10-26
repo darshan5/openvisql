@@ -241,7 +241,7 @@ pub fn open_run_script(
                     return;
                 }
             };
-            let count = ovs_core::sql::split_statements(&script).len();
+            let count = ovs_core::sql::split_statements_for(&script, config.engine.dialect()).len();
             let file = path
                 .file_name()
                 .map_or_else(String::new, |n| n.to_string_lossy().into_owned());

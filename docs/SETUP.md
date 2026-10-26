@@ -40,6 +40,16 @@ OVS_TEST_MYSQL=127.0.0.1:33307:root:secret cargo test -p ovs-mysql --test live
 Without the variable these tests return early and pass, so `cargo test` works offline. The
 SQLite driver's tests (`crates/ovs-sqlite/tests/sqlite.rs`) need no server and always run.
 
+PostgreSQL tests run when `OVS_TEST_PG` is set:
+
+```sh
+docker run -d --name ovs-postgres -e POSTGRES_PASSWORD=secret -p 35432:5432 postgres:17
+OVS_TEST_PG=127.0.0.1:35432:postgres:secret cargo test -p ovs-postgres --test live
+```
+
+In zsh, brace variables that come before a `:` (`127.0.0.1:${port}:root`), because `$port:r`
+is a history modifier. Otherwise the variable is garbled and the tests skip silently.
+
 Set `OVS_TEST_MYSQL_TARGET` as well to also copy a database across servers (in both
 directions, run it twice with the two swapped):
 
@@ -75,6 +85,7 @@ crates/
   ovs-core/    src/sql/{lexer,splitter,analyze,dialect,edit,keywords}.rs  SQL text utilities
                src/{driver,connection,result,schema,value}.rs             core types and traits
   ovs-mysql/   src/{lib,convert,introspect}.rs, tests/live.rs             MySQL/MariaDB driver
+  ovs-postgres/ src/{lib,introspect}.rs, tests/live.rs                   PostgreSQL driver
   ovs-sqlite/  src/lib.rs, tests/sqlite.rs                                SQLite driver
   ovs-store/   src/lib.rs                                                 persistence and secrets
   ovs-app/     src/main.rs        app bootstrap, actions, keybindings, menus

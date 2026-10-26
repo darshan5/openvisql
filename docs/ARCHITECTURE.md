@@ -181,3 +181,24 @@ OpenViSQL is MIT-licensed, so its code must stay compatible with MIT:
     off, and is rolled back if any step fails. Generated columns block a rebuild, because
     their expressions aren't loaded.
   - Driver tests use temp files and run in CI everywhere, with no services.
+
+## ADR-009: PostgreSQL schemas as browser databases; prepare, then simple-query
+
+- **Date:** 2026-10-26
+- **Decision:**
+  - A PostgreSQL connection names one database (`ConnectionConfig::database`). Its schemas
+    take the place of MySQL's databases throughout: in the object browser, as the `db`
+    argument of the `Session` trait, and in "use database", which sets `search_path`.
+  - `execute` first prepares the statement (it isn't run), which gives each column's type
+    and source table/column, used for grid editing. It then runs the statement with the
+    simple query protocol, so values arrive as text in PostgreSQL's own format. Text is
+    converted to numbers, bytes or text by type. Scripts of several statements can't be
+    prepared, so they run untyped.
+  - Table DDL is assembled from `pg_attribute`, `pg_constraint` and `pg_get_indexdef`.
+  - The lexer gained dialects. PostgreSQL has dollar quotes and `E'…'` strings, and both
+    PostgreSQL and SQLite treat backslashes and `#` as ordinary characters. Paging switched
+    to `LIMIT n OFFSET m`, which all three engines accept.
+- **Consequences:**
+  - Every query costs one extra round trip for the prepare.
+  - TLS isn't supported yet. SSH tunnels work.
+

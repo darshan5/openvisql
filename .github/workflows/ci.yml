@@ -41,6 +41,29 @@ jobs:
         env:
           OVS_TEST_MYSQL: 127.0.0.1:3306:root:secret
 
+  # The PostgreSQL driver against a real server.
+  postgres:
+    runs-on: ubuntu-latest
+    services:
+      db:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: secret
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=5s --health-timeout=5s --health-retries=30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy -p ovs-postgres --all-targets
+      - run: cargo test -p ovs-postgres
+        env:
+          OVS_TEST_PG: 127.0.0.1:5432:postgres:secret
+
   app:
     strategy:
       fail-fast: false

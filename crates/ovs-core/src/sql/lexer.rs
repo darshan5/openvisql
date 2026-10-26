@@ -1,5 +1,7 @@
 use std::ops::Range;
 
+use super::dialect::Dialect;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenKind {
     Whitespace,
@@ -46,11 +48,22 @@ impl Token {
     }
 }
 
-/// Splits SQL text into tokens. Never fails: unterminated strings and comments run to the end of
-/// input, which is what an editor wants while the user is typing.
+/// Splits SQL text into tokens, with MySQL's rules. Never fails: unterminated strings and
+/// comments run to the end of input, which is what an editor wants while the user is typing.
 pub fn tokenize(src: &str) -> Vec<Token> {
+    tokenize_for(src, Dialect::MySql)
+}
+
+/// [`tokenize`] with `dialect`'s rules. SQLite and PostgreSQL strings are standard (a
+/// backslash is just a character, except in PostgreSQL's `E'...'`), `#` isn't a comment, and
+/// PostgreSQL has dollar-quoted strings (`$$ ... $$`, `$body$ ... $body$`).
+pub fn tokenize_for(src: &str, dialect: Dialect) -> Vec<Token> {
     let mut tokens = Vec::new();
-    let mut lx = Lexer { src, pos: 0 };
+    let mut lx = Lexer {
+        src,
+        pos: 0,
+        dialect,
+    };
     while lx.pos < src.len() {
         let start = lx.pos;
         let kind = lx.next_kind();
@@ -65,6 +78,7 @@ pub fn tokenize(src: &str) -> Vec<Token> {
 struct Lexer<'a> {
     src: &'a str,
     pos: usize,
+    dialect: Dialect,
 }
 
 impl Lexer<'_> {
@@ -94,12 +108,13 @@ impl Lexer<'_> {
 
     fn next_kind(&mut self) -> TokenKind {
         let c = self.peek().expect("next_kind called at end of input");
+        let mysql = self.dialect == Dialect::MySql;
         match c {
             c if c.is_whitespace() => {
                 self.eat_while(char::is_whitespace);
                 TokenKind::Whitespace
             }
-            '#' => self.line_comment(),
+            '#' if mysql => self.line_comment(),
             '-' if self.peek_nth(1) == Some('-')
                 && self.peek_nth(2).is_none_or(char::is_whitespace) =>
             {
@@ -114,13 +129,20 @@ impl Lexer<'_> {
                 TokenKind::BlockComment
             }
             '\'' => {
-                self.quoted('\'', true);
+                self.quoted('\'', mysql);
                 TokenKind::String
             }
             '"' => {
-                self.quoted('"', true);
+                self.quoted('"', mysql);
                 TokenKind::DoubleQuoted
             }
+            // PostgreSQL's escape strings: E'it\'s'.
+            'E' | 'e' if self.dialect == Dialect::Postgres && self.peek_nth(1) == Some('\'') => {
+                self.bump();
+                self.quoted('\'', true);
+                TokenKind::String
+            }
+            '$' if self.dialect == Dialect::Postgres && self.dollar_quoted() => TokenKind::String,
             '`' => {
                 self.quoted('`', false);
                 TokenKind::QuotedIdent
@@ -171,6 +193,26 @@ impl Lexer<'_> {
                 TokenKind::Punct
             }
         }
+    }
+
+    /// Consumes `$tag$ ... $tag$` if one starts here. The body runs to the matching tag, or to
+    /// the end of input.
+    fn dollar_quoted(&mut self) -> bool {
+        let rest = self.rest();
+        // `$`, an optional tag that doesn't start with a digit (that's `$1`), then `$`.
+        let tag_len = rest[1..]
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len() - 1);
+        if rest[1..].starts_with(|c: char| c.is_ascii_digit())
+            || !rest[1 + tag_len..].starts_with('$')
+        {
+            return false;
+        }
+        let open = &rest[..tag_len + 2];
+        self.pos += rest[open.len()..]
+            .find(open)
+            .map_or(rest.len(), |end| 2 * open.len() + end);
+        true
     }
 
     fn line_comment(&mut self) -> TokenKind {
@@ -322,5 +364,32 @@ mod tests {
         let toks = tokenize(src);
         let rebuilt: String = toks.iter().map(|t| t.text(src)).collect();
         assert_eq!(rebuilt, src);
+    }
+
+    #[test]
+    fn postgres_dollar_quotes_and_standard_strings() {
+        let src = "SELECT $$a; 'b'$$, $fn$ x $$ y $fn$, 'c:\\', E'd\\'e', $1 # 2";
+        let kinds: Vec<(TokenKind, &str)> = tokenize_for(src, Dialect::Postgres)
+            .into_iter()
+            .filter(|t| !t.kind.is_trivia())
+            .map(|t| (t.kind, &src[t.range]))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                (TokenKind::Word, "SELECT"),
+                (TokenKind::String, "$$a; 'b'$$"),
+                (TokenKind::Punct, ","),
+                (TokenKind::String, "$fn$ x $$ y $fn$"),
+                (TokenKind::Punct, ","),
+                (TokenKind::String, "'c:\\'"),
+                (TokenKind::Punct, ","),
+                (TokenKind::String, "E'd\\'e'"),
+                (TokenKind::Punct, ","),
+                (TokenKind::Variable, "$1"),
+                (TokenKind::Punct, "#"),
+                (TokenKind::Number, "2"),
+            ]
+        );
     }
 }

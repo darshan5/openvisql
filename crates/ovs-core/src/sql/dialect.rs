@@ -7,6 +7,8 @@ pub enum Dialect {
     MySql,
     /// SQLite: double-quoted identifiers, standard string literals.
     Sqlite,
+    /// PostgreSQL: like SQLite, plus dollar-quoted strings and `'\x..'::bytea` literals.
+    Postgres,
 }
 
 impl Dialect {
@@ -14,7 +16,7 @@ impl Dialect {
     pub fn quote_ident(self, ident: &str) -> String {
         match self {
             Self::MySql => format!("`{}`", ident.replace('`', "``")),
-            Self::Sqlite => format!("\"{}\"", ident.replace('"', "\"\"")),
+            Self::Sqlite | Self::Postgres => format!("\"{}\"", ident.replace('"', "\"\"")),
         }
     }
 
@@ -22,7 +24,7 @@ impl Dialect {
     pub fn begin_transaction(self) -> &'static str {
         match self {
             Self::MySql => "START TRANSACTION",
-            Self::Sqlite => "BEGIN",
+            Self::Sqlite | Self::Postgres => "BEGIN",
         }
     }
 
@@ -56,7 +58,9 @@ impl Dialect {
                 out
             }
             // Standard SQL: only the quote is special, and it is doubled.
-            Self::Sqlite => format!("'{}'", s.replace('\'', "''")),
+            // Standard SQL: only the quote is special. PostgreSQL treats backslashes literally
+            // too, as long as standard_conforming_strings is on (the default since 9.1).
+            Self::Sqlite | Self::Postgres => format!("'{}'", s.replace('\'', "''")),
         }
     }
 
@@ -73,6 +77,7 @@ impl Dialect {
             Value::Bytes(b) => match self {
                 Self::MySql => format!("0x{}", crate::value::hex(b)),
                 Self::Sqlite => format!("X'{}'", crate::value::hex(b)),
+                Self::Postgres => format!("'\\x{}'::bytea", crate::value::hex(b)),
             },
         }
     }
@@ -114,5 +119,9 @@ mod tests {
         assert_eq!(d.quote_str("it's \\ ok"), "'it''s \\ ok'");
         assert_eq!(d.literal(&Value::Bytes(vec![1, 0xab])), "X'01AB'");
         assert_eq!(d.begin_transaction(), "BEGIN");
+        assert_eq!(
+            Dialect::Postgres.literal(&Value::Bytes(vec![1, 0xab])),
+            "'\\x01AB'::bytea"
+        );
     }
 }
