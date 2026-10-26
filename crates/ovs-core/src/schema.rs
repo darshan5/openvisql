@@ -105,6 +105,14 @@ pub struct ForeignKeyInfo {
     pub on_delete: String,
 }
 
+/// A table-level `CHECK` constraint.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CheckInfo {
+    pub name: String,
+    /// The expression, as the server reports it.
+    pub clause: String,
+}
+
 /// Table-level options.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TableOptions {

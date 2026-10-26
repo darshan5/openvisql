@@ -2,7 +2,7 @@
 //! `CREATE TABLE` / `ALTER TABLE` that applies them.
 
 use super::dialect::Dialect;
-use crate::schema::{ColumnInfo, ForeignKeyInfo, IndexInfo, TableOptions};
+use crate::schema::{CheckInfo, ColumnInfo, ForeignKeyInfo, IndexInfo, TableOptions};
 
 /// One column in the designer.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -76,12 +76,23 @@ pub struct ForeignKeyDef {
     pub original_name: Option<String>,
 }
 
+/// A table-level `CHECK` constraint.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CheckDef {
+    pub name: String,
+    /// The expression, e.g. `price >= 0`.
+    pub clause: String,
+    /// The constraint's name in the existing table; `None` for a new one.
+    pub original_name: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TableDesign {
     pub name: String,
     pub columns: Vec<ColumnDef>,
     pub indexes: Vec<IndexDef>,
     pub foreign_keys: Vec<ForeignKeyDef>,
+    pub checks: Vec<CheckDef>,
     /// Empty fields leave the server default (new tables) or the current value alone.
     pub options: TableOptions,
 }
@@ -237,8 +248,23 @@ impl TableDesign {
             columns,
             indexes,
             foreign_keys: Vec::new(),
+            checks: Vec::new(),
             options: TableOptions::default(),
         }
+    }
+
+    /// Adds the table's `CHECK` constraints.
+    #[must_use]
+    pub fn with_checks(mut self, checks: &[CheckInfo]) -> Self {
+        self.checks = checks
+            .iter()
+            .map(|c| CheckDef {
+                name: c.name.clone(),
+                clause: c.clause.clone(),
+                original_name: Some(c.name.clone()),
+            })
+            .collect();
+        self
     }
 
     /// Adds the table's foreign keys and options; `db` is the table's own database, so
@@ -283,6 +309,17 @@ impl TableDesign {
             })
             .collect();
         let current: Vec<String> = self.columns.iter().map(|c| c.name.to_lowercase()).collect();
+        // Checks name columns inside an expression; quoted names are renamed there.
+        for check in &mut self.checks {
+            for (old, new) in &renames {
+                let quoted = Dialect::MySql.quote_ident(old);
+                if check.clause.contains(&quoted) && !current.contains(&old.to_lowercase()) {
+                    check.clause = check
+                        .clause
+                        .replace(&quoted, &Dialect::MySql.quote_ident(new));
+                }
+            }
+        }
         for fk in &mut self.foreign_keys {
             for column in &mut fk.columns {
                 if current.contains(&column.to_lowercase()) {
@@ -356,6 +393,18 @@ impl TableDesign {
                 if !seen.contains(&name.to_lowercase()) {
                     return Err(format!("Index {} uses unknown column {name}.", index.name));
                 }
+            }
+        }
+        let mut check_names = std::collections::HashSet::new();
+        for check in &self.checks {
+            if check.name.trim().is_empty() {
+                return Err("Every check needs a name.".into());
+            }
+            if !check_names.insert(check.name.to_lowercase()) {
+                return Err(format!("Check {} appears twice.", check.name));
+            }
+            if check.clause.trim().is_empty() {
+                return Err(format!("Check {} needs an expression.", check.name));
             }
         }
         let mut fk_names = std::collections::HashSet::new();
@@ -449,6 +498,12 @@ pub fn create_sql(d: Dialect, db: &str, design: &TableDesign) -> String {
             .iter()
             .map(|fk| format!("  {}", foreign_key_sql(d, db, fk))),
     );
+    lines.extend(
+        design
+            .checks
+            .iter()
+            .map(|c| format!("  {}", check_sql(d, c))),
+    );
     let mut sql = format!(
         "CREATE TABLE {} (\n{}\n)",
         d.qualified(db, &design.name),
@@ -459,6 +514,15 @@ pub fn create_sql(d: Dialect, db: &str, design: &TableDesign) -> String {
         sql.push_str(&option);
     }
     sql
+}
+
+/// `CONSTRAINT name CHECK (expression)`.
+pub fn check_sql(d: Dialect, check: &CheckDef) -> String {
+    format!(
+        "CONSTRAINT {} CHECK ({})",
+        d.quote_ident(&check.name),
+        check.clause.trim()
+    )
 }
 
 /// `after` when it differs from `before` (ignoring case), otherwise empty.
@@ -513,6 +577,25 @@ pub fn alter_sql(
             .iter()
             .filter(|fk| fk.original_name.is_none()),
     );
+
+    // Checks are compared as written: one naming a renamed column must be dropped and added
+    // again with the new name, as MySQL won't rename a column a check uses.
+    let mut added_checks = Vec::new();
+    for old in &before.checks {
+        let new = after
+            .checks
+            .iter()
+            .find(|c| c.original_name.as_deref() == Some(old.name.as_str()));
+        let unchanged =
+            new.is_some_and(|new| new.name == old.name && new.clause.trim() == old.clause.trim());
+        if !unchanged {
+            clauses.push(format!("DROP CONSTRAINT {}", d.quote_ident(&old.name)));
+            if let Some(new) = new {
+                added_checks.push(new);
+            }
+        }
+    }
+    added_checks.extend(after.checks.iter().filter(|c| c.original_name.is_none()));
 
     // Indexes that went away or changed are dropped before any column, so dropping a column
     // can't remove an index this statement still refers to; changed ones are re-added last.
@@ -622,6 +705,9 @@ pub fn alter_sql(
     for fk in added_fks {
         clauses.push(format!("ADD {}", foreign_key_sql(d, db, fk)));
     }
+    for check in added_checks {
+        clauses.push(format!("ADD {}", check_sql(d, check)));
+    }
     let changed_options = TableOptions {
         engine: changed_text(&before.options.engine, &after.options.engine),
         collation: changed_text(&before.options.collation, &after.options.collation),
@@ -678,8 +764,41 @@ mod tests {
             ],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
+            checks: Vec::new(),
             options: TableOptions::default(),
         }
+    }
+
+    #[test]
+    fn checks_follow_renames() {
+        let mut before = table().with_checks(&[CheckInfo {
+            name: "name_ok".into(),
+            clause: "(`name` <> 'x')".into(),
+        }]);
+        before.checks.push(CheckDef {
+            name: "id_ok".into(),
+            clause: "`id` > 0".into(),
+            original_name: Some("id_ok".into()),
+        });
+        assert!(create_sql(D, "s", &before).ends_with(
+            "  CONSTRAINT `name_ok` CHECK ((`name` <> 'x')),\n  CONSTRAINT `id_ok` CHECK (`id` > 0)\n)"
+        ));
+        let mut after = before.clone();
+        after.columns[1].name = "label".into();
+        after.follow_renames();
+        assert_eq!(after.checks[0].clause, "(`label` <> 'x')");
+        let sql = alter_sql(D, "s", &before, &after).unwrap();
+        assert!(
+            sql.starts_with("ALTER TABLE `s`.`t`\n  DROP CONSTRAINT `name_ok`,"),
+            "{sql}"
+        );
+        assert!(
+            sql.ends_with("ADD CONSTRAINT `name_ok` CHECK ((`label` <> 'x'))"),
+            "{sql}"
+        );
+        assert!(!sql.contains("id_ok"), "{sql}");
+        after.checks[1].clause = " ".into();
+        assert!(after.validate().unwrap_err().contains("expression"));
     }
 
     #[test]

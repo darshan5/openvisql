@@ -88,7 +88,9 @@ Phase 2 is complete.
     their indexes along.
   - ✅ Foreign keys (multi-column, cross-database, ON DELETE / ON UPDATE) and table options
     (engine, collation, comment).
-  - CHECK constraints, partitions.
+  - ✅ CHECK constraints (re-created when a column they use is renamed).
+  - ✅ Sections in tabs (columns, indexes, foreign keys, checks) with the SQL preview below.
+  - Partitions (later).
 - ✅ SQL dump backup and restore (run script) with abort-on-error.
 - ✅ Import CSV (batched `INSERT`s in one transaction, rolled back on error).
 - ✅ Process list, variables and status views.

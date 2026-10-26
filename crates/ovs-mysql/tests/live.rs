@@ -784,7 +784,10 @@ async fn table_designer_foreign_keys_and_options() {
         let indexes = s.list_indexes(db, "pets").await.unwrap();
         let fks = s.list_foreign_keys(db, "pets").await.unwrap();
         let options = s.table_options(db, "pets").await.unwrap();
-        TableDesign::from_table("pets", &columns, &indexes).with_constraints(db, &fks, options)
+        let checks = s.list_checks(db, "pets").await.unwrap();
+        TableDesign::from_table("pets", &columns, &indexes)
+            .with_constraints(db, &fks, options)
+            .with_checks(&checks)
     }
     let Some((mut s, db)) = scratch("designer_fk").await else {
         return;
@@ -794,7 +797,8 @@ async fn table_designer_foreign_keys_and_options() {
          UNIQUE KEY by_team (team, login))",
         "CREATE TABLE pets (id INT NOT NULL PRIMARY KEY, owner VARCHAR(20) NULL, \
          team INT NULL, CONSTRAINT fk_owner FOREIGN KEY (owner) REFERENCES owners (login) \
-         ON DELETE CASCADE) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 \
+         ON DELETE CASCADE, CONSTRAINT owner_set CHECK (owner <> ''), \
+         CONSTRAINT id_positive CHECK (id > 0)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 \
          COLLATE=utf8mb4_unicode_ci COMMENT='animals'",
         "INSERT INTO owners VALUES ('ada', 1)",
         "INSERT INTO pets VALUES (1, 'ada', 1)",
@@ -814,6 +818,8 @@ async fn table_designer_foreign_keys_and_options() {
         ("", "owners")
     );
     assert_eq!(fk.on_delete, "CASCADE");
+    let names: Vec<&str> = before.checks.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["id_positive", "owner_set"]);
     assert_eq!(alter_sql(Dialect::MySql, &db, &before, &before), None);
 
     // Rename the referencing column, widen the key to two columns and change the options.
@@ -839,6 +845,18 @@ async fn table_designer_foreign_keys_and_options() {
     assert_eq!(fk.on_delete, "SET NULL");
     assert_eq!(reloaded.options.comment, "pets and owners");
     assert_eq!(reloaded.options.collation, "utf8mb4_general_ci");
+    // The check on the renamed column was re-created against its new name.
+    let owner_set = reloaded
+        .checks
+        .iter()
+        .find(|c| c.name == "owner_set")
+        .unwrap();
+    assert!(owner_set.clause.contains("owner_login"), "{owner_set:?}");
+    assert!(
+        s.execute("INSERT INTO pets (id, owner_login) VALUES (5, '')", None)
+            .await
+            .is_err()
+    );
 
     // Dropping the foreign key leaves the index the server made for it alone.
     let mut dropped = reloaded.clone();

@@ -2,8 +2,8 @@
 
 use ovs_core::sql::Dialect;
 use ovs_core::{
-    ColumnInfo, Error, ForeignKeyInfo, IndexInfo, ObjectKind, Result, ResultSet, SchemaObject,
-    TableOptions, Value,
+    CheckInfo, ColumnInfo, Error, ForeignKeyInfo, IndexInfo, ObjectKind, Result, ResultSet,
+    SchemaObject, TableOptions, Value,
 };
 
 use crate::MySqlSession;
@@ -185,6 +185,35 @@ pub(crate) async fn foreign_keys(
         fk.ref_columns.push(text(&rs, r, "ref_col"));
     }
     Ok(out)
+}
+
+pub(crate) async fn checks(s: &mut MySqlSession, db: &str, table: &str) -> Result<Vec<CheckInfo>> {
+    // MariaDB names CHECK_CONSTRAINTS rows by table too, and also lists column-level checks
+    // (part of a column's definition, like JSON's json_valid), which are left out.
+    let sql = format!(
+        "SELECT cc.* FROM information_schema.TABLE_CONSTRAINTS tc \
+         JOIN information_schema.CHECK_CONSTRAINTS cc \
+           ON cc.CONSTRAINT_SCHEMA = tc.CONSTRAINT_SCHEMA \
+          AND cc.CONSTRAINT_NAME = tc.CONSTRAINT_NAME \
+         WHERE tc.TABLE_SCHEMA = {} AND tc.TABLE_NAME = {} AND tc.CONSTRAINT_TYPE = 'CHECK' \
+         ORDER BY cc.CONSTRAINT_NAME",
+        D.quote_str(db),
+        D.quote_str(table)
+    );
+    let rs = s.query_set(&sql).await?;
+    Ok(rs
+        .rows
+        .iter()
+        .filter(|r| {
+            let table_name = text(&rs, r, "TABLE_NAME");
+            (table_name.is_empty() || table_name == table)
+                && !text(&rs, r, "LEVEL").eq_ignore_ascii_case("Column")
+        })
+        .map(|r| CheckInfo {
+            name: text(&rs, r, "CONSTRAINT_NAME"),
+            clause: text(&rs, r, "CHECK_CLAUSE"),
+        })
+        .collect())
 }
 
 pub(crate) async fn table_options(

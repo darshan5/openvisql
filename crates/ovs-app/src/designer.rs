@@ -10,6 +10,7 @@ use gpui_kit::component::{
     h_flex,
     input::{Input, InputEvent, InputState},
     menu::{DropdownMenu as _, PopupMenuItem},
+    tab::{Tab, TabBar},
     v_flex,
 };
 use gpui_kit::{
@@ -20,8 +21,8 @@ use gpui_kit::{
 use ovs_core::TableOptions;
 use ovs_core::sql::Dialect;
 use ovs_core::sql::design::{
-    ColumnDef, ForeignKeyDef, IndexDef, IndexKind, REFERENTIAL_ACTIONS, TableDesign, alter_sql,
-    create_sql,
+    CheckDef, ColumnDef, ForeignKeyDef, IndexDef, IndexKind, REFERENTIAL_ACTIONS, TableDesign,
+    alter_sql, create_sql,
 };
 
 use crate::runtime::{self, SharedSession};
@@ -50,6 +51,13 @@ struct IndexRow {
     original_name: Option<String>,
 }
 
+struct CheckRow {
+    id: usize,
+    name: Entity<InputState>,
+    clause: Entity<InputState>,
+    original_name: Option<String>,
+}
+
 struct ForeignKeyRow {
     id: usize,
     name: Entity<InputState>,
@@ -71,6 +79,32 @@ fn names(text: &str) -> Vec<String> {
         .collect()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Section {
+    Columns,
+    Indexes,
+    ForeignKeys,
+    Checks,
+}
+
+impl Section {
+    const ALL: [Self; 4] = [
+        Self::Columns,
+        Self::Indexes,
+        Self::ForeignKeys,
+        Self::Checks,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Columns => "Columns",
+            Self::Indexes => "Indexes",
+            Self::ForeignKeys => "Foreign keys",
+            Self::Checks => "Checks",
+        }
+    }
+}
+
 pub struct TableDesigner {
     db: String,
     /// The table as loaded; `None` when creating a new table.
@@ -79,6 +113,8 @@ pub struct TableDesigner {
     rows: Vec<Row>,
     indexes: Vec<IndexRow>,
     foreign_keys: Vec<ForeignKeyRow>,
+    checks: Vec<CheckRow>,
+    section: Section,
     engine: Entity<InputState>,
     collation: Entity<InputState>,
     table_comment: Entity<InputState>,
@@ -126,6 +162,8 @@ impl TableDesigner {
             rows: Vec::new(),
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
+            checks: Vec::new(),
+            section: Section::Columns,
             engine: engine.clone(),
             collation: collation.clone(),
             table_comment: table_comment.clone(),
@@ -143,6 +181,9 @@ impl TableDesigner {
         }
         for fk in start.foreign_keys {
             designer.push_foreign_key(fk, window, cx);
+        }
+        for check in start.checks {
+            designer.push_check(check, window, cx);
         }
         designer
     }
@@ -241,6 +282,29 @@ impl TableDesigner {
         cx.notify();
     }
 
+    fn push_check(&mut self, check: CheckDef, window: &mut Window, cx: &mut Context<Self>) {
+        let name = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("constraint name")
+                .default_value(check.name)
+        });
+        let clause = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("price >= 0")
+                .default_value(check.clause)
+        });
+        self.watch(&name, cx);
+        self.watch(&clause, cx);
+        self.checks.push(CheckRow {
+            id: self.next_id,
+            name,
+            clause,
+            original_name: check.original_name,
+        });
+        self.next_id += 1;
+        cx.notify();
+    }
+
     fn design(&self, cx: &App) -> TableDesign {
         let text = |input: &Entity<InputState>| input.read(cx).value().trim().to_owned();
         TableDesign {
@@ -288,6 +352,15 @@ impl TableDesigner {
                         on_delete: fk.on_delete.clone(),
                         original_name: fk.original_name.clone(),
                     }
+                })
+                .collect(),
+            checks: self
+                .checks
+                .iter()
+                .map(|check| CheckDef {
+                    name: text(&check.name),
+                    clause: text(&check.clause),
+                    original_name: check.original_name.clone(),
                 })
                 .collect(),
             options: TableOptions {
@@ -507,6 +580,28 @@ impl TableDesigner {
     }
 }
 
+impl TableDesigner {
+    fn render_check(ix: usize, check: &CheckRow, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .gap_1()
+            .child(div().w(px(150.)).child(Input::new(&check.name).xsmall()))
+            .child(div().flex_1().child(Input::new(&check.clause).xsmall()))
+            .child(
+                Button::new(("remove-check", check.id))
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::Close)
+                    .tooltip("Remove check")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if ix < this.checks.len() {
+                            this.checks.remove(ix);
+                        }
+                        cx.notify();
+                    })),
+            )
+    }
+}
+
 impl Render for TableDesigner {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
@@ -522,24 +617,127 @@ impl Render for TableDesigner {
             Ok(None) => div().text_color(muted).child("No changes."),
             Err(err) => div().text_color(cx.theme().danger).child(err),
         };
-        let rows: Vec<_> = self
-            .rows
+        let add = |id: &'static str, label: &'static str| {
+            Button::new(id)
+                .ghost()
+                .xsmall()
+                .icon(IconName::Plus)
+                .label(label)
+        };
+        let (headers, rows, add_button): (Vec<_>, Vec<_>, Button) = match self.section {
+            Section::Columns => (
+                vec![
+                    header("Column", Some(150.)),
+                    header("Type", Some(150.)),
+                    header("NULL", Some(44.)),
+                    header("PK", Some(36.)),
+                    header("Auto", Some(36.)),
+                    header("Default (SQL)", Some(140.)),
+                    header("Comment", None),
+                    div().w(px(84.)),
+                ],
+                self.rows
+                    .iter()
+                    .enumerate()
+                    .map(|(ix, row)| Self::render_row(ix, row, cx).into_any_element())
+                    .collect(),
+                add("add-column", "Column").on_click(cx.listener(|this, _, window, cx| {
+                    this.push_row(
+                        ColumnDef {
+                            name: format!("column_{}", this.rows.len() + 1),
+                            data_type: "VARCHAR(100)".into(),
+                            nullable: true,
+                            ..ColumnDef::default()
+                        },
+                        window,
+                        cx,
+                    );
+                })),
+            ),
+            Section::Indexes => (
+                vec![
+                    header("Index", Some(180.)),
+                    header("Kind", Some(96.)),
+                    header("Columns (comma-separated, optional prefix length)", None),
+                    div().w(px(28.)),
+                ],
+                self.indexes
+                    .iter()
+                    .enumerate()
+                    .map(|(ix, index)| Self::render_index(ix, index, cx).into_any_element())
+                    .collect(),
+                add("add-index", "Index").on_click(cx.listener(|this, _, window, cx| {
+                    this.push_index(
+                        IndexDef {
+                            name: format!("idx_{}", this.indexes.len() + 1),
+                            ..IndexDef::default()
+                        },
+                        window,
+                        cx,
+                    );
+                })),
+            ),
+            Section::ForeignKeys => (
+                vec![
+                    header("Foreign key", Some(150.)),
+                    header("Columns", Some(150.)),
+                    header("References table", Some(150.)),
+                    header("Referenced columns", None),
+                    header("On delete", Some(96.)),
+                    header("On update", Some(96.)),
+                    div().w(px(28.)),
+                ],
+                self.foreign_keys
+                    .iter()
+                    .enumerate()
+                    .map(|(ix, fk)| Self::render_foreign_key(ix, fk, cx).into_any_element())
+                    .collect(),
+                add("add-fk", "Foreign key").on_click(cx.listener(|this, _, window, cx| {
+                    let name = this.design(cx).name;
+                    this.push_foreign_key(
+                        ForeignKeyDef {
+                            name: format!("fk_{name}_{}", this.foreign_keys.len() + 1),
+                            ..ForeignKeyDef::default()
+                        },
+                        window,
+                        cx,
+                    );
+                })),
+            ),
+            Section::Checks => (
+                vec![
+                    header("Check", Some(150.)),
+                    header("Expression", None),
+                    div().w(px(28.)),
+                ],
+                self.checks
+                    .iter()
+                    .enumerate()
+                    .map(|(ix, check)| Self::render_check(ix, check, cx).into_any_element())
+                    .collect(),
+                add("add-check", "Check").on_click(cx.listener(|this, _, window, cx| {
+                    let name = this.design(cx).name;
+                    this.push_check(
+                        CheckDef {
+                            name: format!("{name}_chk_{}", this.checks.len() + 1),
+                            ..CheckDef::default()
+                        },
+                        window,
+                        cx,
+                    );
+                })),
+            ),
+        };
+        let counts = [
+            self.rows.len(),
+            self.indexes.len(),
+            self.foreign_keys.len(),
+            self.checks.len(),
+        ];
+        let tabs = Section::ALL
             .iter()
-            .enumerate()
-            .map(|(ix, row)| Self::render_row(ix, row, cx).into_any_element())
-            .collect();
-        let indexes: Vec<_> = self
-            .indexes
-            .iter()
-            .enumerate()
-            .map(|(ix, index)| Self::render_index(ix, index, cx).into_any_element())
-            .collect();
-        let foreign_keys: Vec<_> = self
-            .foreign_keys
-            .iter()
-            .enumerate()
-            .map(|(ix, fk)| Self::render_foreign_key(ix, fk, cx).into_any_element())
-            .collect();
+            .zip(counts)
+            .map(|(section, count)| Tab::new().label(format!("{} ({count})", section.label())));
         v_flex()
             .gap_2()
             .child(
@@ -559,123 +757,26 @@ impl Render for TableDesigner {
                     ),
             )
             .child(
-                h_flex()
-                    .gap_1()
-                    .child(header("Column", Some(150.)))
-                    .child(header("Type", Some(150.)))
-                    .child(header("NULL", Some(44.)))
-                    .child(header("PK", Some(36.)))
-                    .child(header("Auto", Some(36.)))
-                    .child(header("Default (SQL)", Some(140.)))
-                    .child(header("Comment", None))
-                    .child(div().w(px(84.))),
+                TabBar::new("designer-sections")
+                    .underline()
+                    .small()
+                    .selected_index(self.section as usize)
+                    .on_click(cx.listener(|this, ix: &usize, _, cx| {
+                        this.section = Section::ALL[*ix];
+                        cx.notify();
+                    }))
+                    .children(tabs),
             )
+            .child(h_flex().gap_1().children(headers))
             .child(
                 v_flex()
                     .id("designer-rows")
                     .gap_1()
-                    .max_h(px(300.))
+                    .h(px(300.))
                     .overflow_y_scroll()
                     .children(rows),
             )
-            .child(
-                h_flex().child(
-                    Button::new("add-column")
-                        .ghost()
-                        .xsmall()
-                        .icon(IconName::Plus)
-                        .label("Column")
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.push_row(
-                                ColumnDef {
-                                    name: format!("column_{}", this.rows.len() + 1),
-                                    data_type: "VARCHAR(100)".into(),
-                                    nullable: true,
-                                    ..ColumnDef::default()
-                                },
-                                window,
-                                cx,
-                            );
-                        })),
-                ),
-            )
-            .child(
-                h_flex()
-                    .gap_1()
-                    .child(header("Index", Some(180.)))
-                    .child(header("Kind", Some(96.)))
-                    .child(header(
-                        "Columns (comma-separated, optional prefix length)",
-                        None,
-                    ))
-                    .child(div().w(px(28.))),
-            )
-            .child(
-                v_flex()
-                    .id("designer-indexes")
-                    .gap_1()
-                    .max_h(px(160.))
-                    .overflow_y_scroll()
-                    .children(indexes),
-            )
-            .child(
-                h_flex().child(
-                    Button::new("add-index")
-                        .ghost()
-                        .xsmall()
-                        .icon(IconName::Plus)
-                        .label("Index")
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.push_index(
-                                IndexDef {
-                                    name: format!("idx_{}", this.indexes.len() + 1),
-                                    ..IndexDef::default()
-                                },
-                                window,
-                                cx,
-                            );
-                        })),
-                ),
-            )
-            .child(
-                h_flex()
-                    .gap_1()
-                    .child(header("Foreign key", Some(150.)))
-                    .child(header("Columns", Some(150.)))
-                    .child(header("References table", Some(150.)))
-                    .child(header("Referenced columns", None))
-                    .child(header("On delete", Some(96.)))
-                    .child(header("On update", Some(96.)))
-                    .child(div().w(px(28.))),
-            )
-            .child(
-                v_flex()
-                    .id("designer-fks")
-                    .gap_1()
-                    .max_h(px(120.))
-                    .overflow_y_scroll()
-                    .children(foreign_keys),
-            )
-            .child(
-                h_flex().child(
-                    Button::new("add-fk")
-                        .ghost()
-                        .xsmall()
-                        .icon(IconName::Plus)
-                        .label("Foreign key")
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            let name = this.design(cx).name;
-                            this.push_foreign_key(
-                                ForeignKeyDef {
-                                    name: format!("fk_{name}_{}", this.foreign_keys.len() + 1),
-                                    ..ForeignKeyDef::default()
-                                },
-                                window,
-                                cx,
-                            );
-                        })),
-                ),
-            )
+            .child(h_flex().child(add_button))
             .child(
                 div()
                     .id("designer-preview")
@@ -702,39 +803,39 @@ pub fn open(
 ) {
     window
         .spawn(cx, async move |cx| {
-            let original =
-                match table {
-                    Some(table) => {
-                        let (d, t) = (db.clone(), table.clone());
-                        let loaded =
-                            runtime::run(async move {
-                                let mut s = session.lock().await;
-                                let columns = s.list_columns(&d, &t).await?;
-                                let indexes = s.list_indexes(&d, &t).await?;
-                                let foreign_keys = s.list_foreign_keys(&d, &t).await?;
-                                let options = s.table_options(&d, &t).await?;
-                                Ok::<_, ovs_core::Error>(
-                                    TableDesign::from_table(&t, &columns, &indexes)
-                                        .with_constraints(&d, &foreign_keys, options),
-                                )
+            let original = match table {
+                Some(table) => {
+                    let (d, t) = (db.clone(), table.clone());
+                    let loaded = runtime::run(async move {
+                        let mut s = session.lock().await;
+                        let columns = s.list_columns(&d, &t).await?;
+                        let indexes = s.list_indexes(&d, &t).await?;
+                        let foreign_keys = s.list_foreign_keys(&d, &t).await?;
+                        let options = s.table_options(&d, &t).await?;
+                        let checks = s.list_checks(&d, &t).await?;
+                        Ok::<_, ovs_core::Error>(
+                            TableDesign::from_table(&t, &columns, &indexes)
+                                .with_constraints(&d, &foreign_keys, options)
+                                .with_checks(&checks),
+                        )
+                    })
+                    .await;
+                    match loaded {
+                        Ok(design) => Some(design),
+                        Err(err) => {
+                            cx.update(|window, cx| {
+                                window.push_notification(
+                                    format!("Could not load {table}: {err}"),
+                                    cx,
+                                );
                             })
-                            .await;
-                        match loaded {
-                            Ok(design) => Some(design),
-                            Err(err) => {
-                                cx.update(|window, cx| {
-                                    window.push_notification(
-                                        format!("Could not load {table}: {err}"),
-                                        cx,
-                                    );
-                                })
-                                .ok();
-                                return;
-                            }
+                            .ok();
+                            return;
                         }
                     }
-                    None => None,
-                };
+                }
+                None => None,
+            };
             cx.update(|window, cx| show(db, original, apply, window, cx))
                 .ok();
         })

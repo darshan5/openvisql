@@ -6,7 +6,7 @@ use crate::connection::{ConnectionConfig, Engine};
 use crate::error::Result;
 use crate::result::QueryOutcome;
 use crate::schema::{
-    ColumnInfo, ForeignKeyInfo, IndexInfo, ObjectKind, SchemaObject, TableOptions,
+    CheckInfo, ColumnInfo, ForeignKeyInfo, IndexInfo, ObjectKind, SchemaObject, TableOptions,
 };
 use crate::sql::Dialect;
 
@@ -55,6 +55,7 @@ pub trait Session: Send {
         table: &str,
     ) -> Result<Vec<ForeignKeyInfo>>;
     async fn table_options(&mut self, database: &str, table: &str) -> Result<TableOptions>;
+    async fn list_checks(&mut self, database: &str, table: &str) -> Result<Vec<CheckInfo>>;
 
     /// The `CREATE ...` statement for an object.
     async fn object_ddl(&mut self, database: &str, name: &str, kind: ObjectKind) -> Result<String>;
