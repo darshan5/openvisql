@@ -459,21 +459,28 @@ impl Workspace {
             BrowserEvent::QueryBuilder { db, table } => {
                 let this = cx.entity().downgrade();
                 let tab_db = db.clone();
+                // The builder has a window of its own; its SQL opens in this one.
+                let main = window.window_handle();
                 crate::query_builder::open(
                     d,
                     db.clone(),
                     table.clone(),
                     self.completion.session.clone(),
-                    Rc::new(move |sql, run, window, cx| {
-                        this.update(cx, |this, cx| {
-                            this.add_tab(
-                                Some("Query builder".into()),
-                                Some(tab_db.clone()),
-                                sql,
-                                run,
-                                window,
-                                cx,
-                            );
+                    Rc::new(move |sql, run, cx| {
+                        let (this, tab_db) = (this.clone(), tab_db.clone());
+                        main.update(cx, |_, window, cx| {
+                            this.update(cx, |this, cx| {
+                                this.add_tab(
+                                    Some("Query builder".into()),
+                                    Some(tab_db),
+                                    sql,
+                                    run,
+                                    window,
+                                    cx,
+                                );
+                            })
+                            .ok();
+                            window.activate_window();
                         })
                         .ok();
                     }),

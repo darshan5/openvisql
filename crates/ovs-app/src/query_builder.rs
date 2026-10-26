@@ -1,12 +1,15 @@
-//! The query builder dialog: pick tables (joined on their foreign keys), tick columns, add
-//! conditions and sorting, and combine several `SELECT`s with `UNION` and friends. The SQL is
-//! previewed live and opened in a query tab.
+//! The visual query builder, in a window of its own. Tables are boxes on a canvas: tick
+//! columns to select them, and drag from a column to a column of another table to join them
+//! (foreign keys are joined for you). Each join line has a marker to change its kind. The grid
+//! below sets aliases, sorting, aggregates, grouping and criteria per column, and more
+//! `SELECT`s can be combined with `UNION` and friends in tabs. The SQL is shown live.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, IconName, Sizable as _, StyledExt as _, WindowExt as _,
+    ActiveTheme as _, IconName, Sizable as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,
     h_flex,
@@ -16,57 +19,86 @@ use gpui_kit::component::{
     v_flex,
 };
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
-    Subscription, Window, div, prelude::FluentBuilder as _, px,
+    AnyElement, App, AppContext as _, Bounds, Context, Entity, InteractiveElement as _,
+    IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement as _, PathBuilder,
+    Pixels, Point, Render, ScrollWheelEvent, SharedString, StatefulInteractiveElement as _,
+    Styled as _, Subscription, Window, canvas, div, point, prelude::FluentBuilder as _, px,
 };
 use ovs_core::sql::Dialect;
 use ovs_core::sql::builder::{
-    Aggregate, ColumnRef, Condition, JoinKind, Operator, OrderItem, Query, SelectItem, SelectPart,
+    Aggregate, ColumnRef, Criterion, JoinKind, OrderItem, Query, SelectItem, SelectPart,
     SetOperator,
 };
 use ovs_core::{ForeignKeyInfo, ObjectKind};
 
 use crate::runtime::{self, SharedSession};
 
-/// Opens the finished SQL in a query tab, running it when the flag is set.
-pub type OpenSql = Rc<dyn Fn(String, bool, &mut Window, &mut App)>;
+/// Opens the finished SQL in a query tab of the connection, running it when the flag is set.
+pub type OpenSql = Rc<dyn Fn(String, bool, &mut App)>;
 
-struct ColumnUi {
+/// Box geometry on the canvas.
+const HEADER: f32 = 26.;
+const ROW: f32 = 22.;
+const BOX_MIN_WIDTH: f32 = 170.;
+const CHAR: f32 = 7.;
+
+/// A table's columns: name and type.
+type Columns = Vec<(String, String)>;
+
+/// A column in the grid: shown in the output or only used for sorting, grouping or criteria.
+struct RowUi {
     column: ColumnRef,
-    aggregate: Option<Aggregate>,
+    visible: bool,
     alias: Entity<InputState>,
+    /// `Some(descending)` when sorted.
+    sort: Option<bool>,
+    /// When sorting was turned on, to keep the sort order the user chose.
+    sorted_at: usize,
+    aggregate: Option<Aggregate>,
+    group: bool,
+    criteria: Entity<InputState>,
 }
 
-struct ConditionUi {
-    column: ColumnRef,
-    operator: Operator,
-    value: Entity<InputState>,
-}
-
-/// One `SELECT` as edited. Tables, joins and sorting live in `part`; columns and conditions,
-/// which carry text inputs, are kept here and copied into it when the SQL is built.
+/// One `SELECT`: its tables and joins (in `part`), their places on the canvas, and its grid.
 struct PartUi {
     operator: SetOperator,
     part: SelectPart,
-    columns: Vec<ColumnUi>,
-    conditions: Vec<ConditionUi>,
-    limit: Entity<InputState>,
+    boxes: HashMap<String, (f32, f32)>,
+    rows: Vec<RowUi>,
+}
+
+enum Drag {
+    Pan {
+        mouse: Point<Pixels>,
+        offset: Point<Pixels>,
+    },
+    Box {
+        alias: String,
+        mouse: Point<Pixels>,
+        at: (f32, f32),
+    },
+    /// Drawing a join from a column; `to` follows the mouse.
+    Link { from: ColumnRef, to: Point<Pixels> },
 }
 
 pub struct QueryBuilder {
     dialect: Dialect,
     db: String,
     session: SharedSession,
-    /// Tables and views of `db`, for "Add table".
+    open_sql: OpenSql,
     tables: Vec<String>,
-    columns: HashMap<String, Vec<String>>,
+    filter: Entity<InputState>,
+    columns: HashMap<String, Columns>,
     foreign_keys: HashMap<String, Vec<ForeignKeyInfo>>,
     parts: Vec<PartUi>,
     active: usize,
-    /// Sorting and limit of a combined query: output column position, descending.
-    union_order: Vec<(usize, bool)>,
-    union_limit: Entity<InputState>,
+    limit: Entity<InputState>,
+    offset_rows: Entity<InputState>,
+    /// Where the canvas origin is drawn, for panning.
+    offset: Point<Pixels>,
+    drag: Option<Drag>,
+    canvas: Rc<Cell<Option<Bounds<Pixels>>>>,
+    sort_counter: usize,
     loading: bool,
     error: Option<String>,
     subscriptions: Vec<Subscription>,
@@ -78,32 +110,42 @@ impl QueryBuilder {
         db: String,
         session: SharedSession,
         tables: Vec<String>,
+        open_sql: OpenSql,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let union_limit = Self::number_input(window, cx);
+        let input = |placeholder: &'static str, window: &mut Window, cx: &mut Context<Self>| {
+            cx.new(|cx| InputState::new(window, cx).placeholder(placeholder))
+        };
+        let filter = input("Find a table", window, cx);
+        let limit = input("none", window, cx);
+        let offset_rows = input("0", window, cx);
         let mut builder = Self {
             dialect,
             db,
             session,
+            open_sql,
             tables,
+            filter: filter.clone(),
             columns: HashMap::new(),
             foreign_keys: HashMap::new(),
             parts: Vec::new(),
             active: 0,
-            union_order: Vec::new(),
-            union_limit: union_limit.clone(),
+            limit: limit.clone(),
+            offset_rows: offset_rows.clone(),
+            offset: point(px(24.), px(24.)),
+            drag: None,
+            canvas: Rc::default(),
+            sort_counter: 0,
             loading: false,
             error: None,
             subscriptions: Vec::new(),
         };
-        builder.watch(&union_limit, cx);
-        builder.add_part(SetOperator::Union, window, cx);
+        for input in [&filter, &limit, &offset_rows] {
+            builder.watch(input, cx);
+        }
+        builder.add_part(SetOperator::Union);
         builder
-    }
-
-    fn number_input(window: &mut Window, cx: &mut Context<Self>) -> Entity<InputState> {
-        cx.new(|cx| InputState::new(window, cx).placeholder("none"))
     }
 
     fn watch(&mut self, input: &Entity<InputState>, cx: &mut Context<Self>) {
@@ -115,18 +157,14 @@ impl QueryBuilder {
             }));
     }
 
-    fn add_part(&mut self, operator: SetOperator, window: &mut Window, cx: &mut Context<Self>) {
-        let limit = Self::number_input(window, cx);
-        self.watch(&limit, cx);
+    fn add_part(&mut self, operator: SetOperator) {
         self.parts.push(PartUi {
             operator,
             part: SelectPart::default(),
-            columns: Vec::new(),
-            conditions: Vec::new(),
-            limit,
+            boxes: HashMap::new(),
+            rows: Vec::new(),
         });
         self.active = self.parts.len() - 1;
-        cx.notify();
     }
 
     /// Removes query `ix` (never the first), keeping the same tab selected where possible.
@@ -146,7 +184,7 @@ impl QueryBuilder {
         &mut self.parts[self.active]
     }
 
-    /// Loads `table`'s columns and foreign keys if needed, then adds it to the active part.
+    /// Loads `table`'s columns and foreign keys if needed, then adds it to the active query.
     fn add_table(&mut self, table: String, cx: &mut Context<Self>) {
         if self.columns.contains_key(&table) {
             self.insert_table(&table, cx);
@@ -167,8 +205,11 @@ impl QueryBuilder {
                 this.loading = false;
                 match loaded {
                     Ok((columns, fks)) => {
-                        this.columns
-                            .insert(table.clone(), columns.into_iter().map(|c| c.name).collect());
+                        let columns = columns
+                            .into_iter()
+                            .map(|c| (c.name, short_type(&c.column_type)))
+                            .collect();
+                        this.columns.insert(table.clone(), columns);
                         this.foreign_keys.insert(table.clone(), fks);
                         this.insert_table(&table, cx);
                     }
@@ -183,105 +224,290 @@ impl QueryBuilder {
 
     fn insert_table(&mut self, table: &str, cx: &mut Context<Self>) {
         let fks = self.foreign_keys.clone();
-        self.part()
-            .part
+        let part = self.part();
+        part.part
             .add_table(table, &|t| fks.get(t).cloned().unwrap_or_default());
+        let added = part.part.tables().last().map(|t| t.alias.clone());
+        // The table it was joined to, if a foreign key joined it.
+        let partner = part
+            .part
+            .joins
+            .last()
+            .filter(|j| Some(&j.table.alias) == added.as_ref())
+            .and_then(|j| j.on.first())
+            .map(|(earlier, _)| earlier.alias.clone());
+        if let Some(alias) = added {
+            let place = self.free_spot(table, partner.as_deref());
+            self.part().boxes.insert(alias, place);
+        }
         self.error = None;
         cx.notify();
+    }
+
+    /// Where a new box for `table` goes: right of the table it joins to (`partner`), or right
+    /// of everything, moved down past any box already there.
+    fn free_spot(&self, table: &str, partner: Option<&str>) -> (f32, f32) {
+        const GAP: f32 = 110.;
+        let ui = &self.parts[self.active];
+        let placed: Vec<(f32, f32, f32, f32)> = ui
+            .part
+            .tables()
+            .into_iter()
+            .filter_map(|t| {
+                let &(x, y) = ui.boxes.get(&t.alias)?;
+                Some((x, y, self.box_width(&t.table), self.box_height(&t.table)))
+            })
+            .collect();
+        if placed.is_empty() {
+            return (0., 0.);
+        }
+        let partner_box = partner.and_then(|alias| {
+            let t = ui.part.tables().into_iter().find(|t| t.alias == alias)?;
+            let &(x, y) = ui.boxes.get(alias)?;
+            Some((x, y, self.box_width(&t.table)))
+        });
+        let (x, mut y) = match partner_box {
+            Some((px_, py, pw)) => (px_ + pw + GAP, py),
+            None => (
+                placed.iter().map(|b| b.0 + b.2).fold(0., f32::max) + GAP,
+                0.,
+            ),
+        };
+        let (w, h) = (self.box_width(table), self.box_height(table));
+        // Step down until it overlaps nothing, with room between boxes.
+        while let Some(&(_, by, _, bh)) = placed.iter().find(|b| {
+            x < b.0 + b.2 + GAP / 2.
+                && b.0 < x + w + GAP / 2.
+                && y < b.1 + b.3 + 30.
+                && b.1 < y + h + 30.
+        }) {
+            y = by + bh + 40.;
+        }
+        (x, y)
+    }
+
+    fn box_width(&self, table: &str) -> f32 {
+        let widest = self
+            .columns
+            .get(table)
+            .into_iter()
+            .flatten()
+            .map(|(name, ty)| name.chars().count() + ty.chars().count() + 6)
+            .chain(std::iter::once(table.chars().count() + 10))
+            .max()
+            .unwrap_or(0);
+        #[allow(clippy::cast_precision_loss)]
+        let width = widest as f32 * CHAR + 24.;
+        width.max(BOX_MIN_WIDTH)
+    }
+
+    fn box_height(&self, table: &str) -> f32 {
+        let rows = self.columns.get(table).map_or(0, Vec::len) + 1;
+        #[allow(clippy::cast_precision_loss)]
+        let rows = rows as f32;
+        HEADER + rows * ROW + 4.
     }
 
     fn remove_table(&mut self, alias: &str, cx: &mut Context<Self>) {
         let part = self.part();
         part.part.remove_table(alias);
-        part.columns.retain(|c| c.column.alias != alias);
-        part.conditions.retain(|c| c.column.alias != alias);
+        part.boxes.remove(alias);
+        part.rows.retain(|r| r.column.alias != alias);
         cx.notify();
     }
 
-    /// Every column of the active part's tables, before the join at `limit` (all when `None`).
-    fn columns_of(&self, ix: usize, before_join: Option<usize>) -> Vec<ColumnRef> {
-        let part = &self.parts[ix].part;
-        let tables = part.tables();
-        let count = before_join.map_or(tables.len(), |j| j + 1);
-        tables
+    /// The point where a column's row meets the side of its box facing `toward_x`.
+    fn anchor(&self, ix: usize, column: &ColumnRef, toward_x: f32) -> Option<(f32, f32)> {
+        let ui = &self.parts[ix];
+        let table = ui
+            .part
+            .tables()
             .into_iter()
-            .take(count)
-            .flat_map(|t| {
-                self.columns
-                    .get(&t.table)
-                    .into_iter()
-                    .flatten()
-                    .map(|c| ColumnRef::new(&t.alias, c))
-            })
-            .collect()
+            .find(|t| t.alias == column.alias)?;
+        let &(x, y) = ui.boxes.get(&column.alias)?;
+        let row = if column.column == "*" {
+            0
+        } else {
+            self.columns
+                .get(&table.table)?
+                .iter()
+                .position(|(name, _)| *name == column.column)?
+                + 1
+        };
+        let width = self.box_width(&table.table);
+        #[allow(clippy::cast_precision_loss)]
+        let row_y = y + HEADER + row as f32 * ROW + ROW / 2.;
+        let side = if toward_x < x + width / 2. {
+            x
+        } else {
+            x + width
+        };
+        Some((side, row_y))
     }
 
+    /// `column`'s anchor on the side of its box facing `other`'s box.
+    fn anchor_toward(
+        &self,
+        ix: usize,
+        column: &ColumnRef,
+        other: &ColumnRef,
+    ) -> Option<(f32, f32)> {
+        let ui = &self.parts[ix];
+        let &(ox, _) = ui.boxes.get(&other.alias)?;
+        let other_table = ui
+            .part
+            .tables()
+            .into_iter()
+            .find(|t| t.alias == other.alias)?;
+        let other_mid = ox + self.box_width(&other_table.table) / 2.;
+        self.anchor(ix, column, other_mid)
+    }
+
+    fn row_of(&self, column: &ColumnRef) -> Option<usize> {
+        self.parts[self.active]
+            .rows
+            .iter()
+            .position(|r| r.column == *column)
+    }
+
+    /// Ticking a column shows it; unticking hides it, keeping it in the grid if it still sorts,
+    /// groups or filters.
     fn toggle_column(&mut self, column: ColumnRef, window: &mut Window, cx: &mut Context<Self>) {
-        let part = &mut self.parts[self.active];
-        if let Some(at) = part.columns.iter().position(|c| c.column == column) {
-            part.columns.remove(at);
-        } else {
-            let alias = cx.new(|cx| InputState::new(window, cx).placeholder("name"));
-            self.watch(&alias, cx);
-            self.parts[self.active].columns.push(ColumnUi {
-                column,
-                aggregate: None,
-                alias,
-            });
+        match self.row_of(&column) {
+            Some(ix) => {
+                let row = &mut self.parts[self.active].rows[ix];
+                if row.visible {
+                    let used = row.sort.is_some()
+                        || row.group
+                        || !row.criteria.read(cx).value().trim().is_empty();
+                    if used {
+                        row.visible = false;
+                    } else {
+                        self.parts[self.active].rows.remove(ix);
+                    }
+                } else {
+                    row.visible = true;
+                }
+            }
+            None => self.push_row(column, window, cx),
         }
         cx.notify();
     }
 
-    fn add_condition(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(column) = self.columns_of(self.active, None).into_iter().next() else {
+    fn push_row(&mut self, column: ColumnRef, window: &mut Window, cx: &mut Context<Self>) {
+        let alias = cx.new(|cx| InputState::new(window, cx));
+        let criteria =
+            cx.new(|cx| InputState::new(window, cx).placeholder("e.g. > 100 or LIKE 'a%'"));
+        self.watch(&alias, cx);
+        self.watch(&criteria, cx);
+        self.parts[self.active].rows.push(RowUi {
+            column,
+            visible: true,
+            alias,
+            sort: None,
+            sorted_at: 0,
+            aggregate: None,
+            group: false,
+            criteria,
+        });
+    }
+
+    /// Joins the tables of two columns on them: the later table's join gets the pair.
+    fn link(&mut self, a: &ColumnRef, b: &ColumnRef, cx: &mut Context<Self>) {
+        if a.alias == b.alias || a.column == "*" || b.column == "*" {
+            return;
+        }
+        let part = &mut self.parts[self.active].part;
+        let order: Vec<String> = part.tables().iter().map(|t| t.alias.clone()).collect();
+        let (Some(ia), Some(ib)) = (
+            order.iter().position(|x| *x == a.alias),
+            order.iter().position(|x| *x == b.alias),
+        ) else {
             return;
         };
-        let value =
-            cx.new(|cx| InputState::new(window, cx).placeholder("value: 42, text, or =SQL"));
-        self.watch(&value, cx);
-        self.part().conditions.push(ConditionUi {
-            column,
-            operator: Operator::Eq,
-            value,
-        });
+        let (earlier, later, later_ix) = if ia < ib { (a, b, ib) } else { (b, a, ia) };
+        let Some(join) = part.joins.get_mut(later_ix - 1) else {
+            return;
+        };
+        let pair = (earlier.clone(), later.clone());
+        if !join.on.contains(&pair) {
+            join.on.push(pair);
+        }
+        if join.kind == JoinKind::Cross {
+            join.kind = JoinKind::Inner;
+        }
         cx.notify();
     }
 
-    /// The model with every input's current text.
+    /// The model, with every input's current text.
     fn query(&self, cx: &App) -> Query {
-        let limit = |input: &Entity<InputState>| input.read(cx).value().trim().parse().ok();
+        let number = |input: &Entity<InputState>| input.read(cx).value().trim().parse().ok();
         let build = |ui: &PartUi| {
             let mut part = ui.part.clone();
             part.columns = ui
-                .columns
+                .rows
                 .iter()
-                .map(|c| SelectItem {
-                    column: c.column.clone(),
-                    aggregate: c.aggregate,
-                    alias: c.alias.read(cx).value().trim().to_owned(),
+                .filter(|r| r.visible)
+                .map(|r| SelectItem {
+                    column: r.column.clone(),
+                    aggregate: r.aggregate,
+                    alias: r.alias.read(cx).value().trim().to_owned(),
                 })
                 .collect();
-            part.conditions = ui
-                .conditions
+            part.criteria = ui
+                .rows
                 .iter()
-                .map(|c| Condition {
-                    column: c.column.clone(),
-                    operator: c.operator,
-                    value: c.value.read(cx).value().to_string(),
+                .map(|r| Criterion {
+                    column: r.column.clone(),
+                    text: r.criteria.read(cx).value().to_string(),
                 })
                 .collect();
-            part.limit = limit(&ui.limit);
+            part.group_by = ui
+                .rows
+                .iter()
+                .filter(|r| r.group)
+                .map(|r| r.column.clone())
+                .collect();
+            let mut sorted: Vec<&RowUi> = ui.rows.iter().filter(|r| r.sort.is_some()).collect();
+            sorted.sort_by_key(|r| r.sorted_at);
+            part.order_by = sorted
+                .iter()
+                .map(|r| OrderItem {
+                    column: r.column.clone(),
+                    descending: r.sort == Some(true),
+                })
+                .collect();
             part
         };
+        let mut first = build(&self.parts[0]);
+        let combined = self.parts.len() > 1;
+        // A combined query sorts its result by output column position.
+        let mut union_order = Vec::new();
+        if combined {
+            let visible: Vec<&RowUi> = self.parts[0].rows.iter().filter(|r| r.visible).collect();
+            for item in std::mem::take(&mut first.order_by) {
+                if let Some(p) = visible.iter().position(|r| r.column == item.column) {
+                    union_order.push((p + 1, item.descending));
+                }
+            }
+        } else {
+            first.limit = number(&self.limit);
+            first.offset = number(&self.offset_rows);
+        }
         Query {
-            first: build(&self.parts[0]),
+            first,
             rest: self.parts[1..]
                 .iter()
-                .map(|ui| (ui.operator, build(ui)))
+                .map(|ui| {
+                    let mut part = build(ui);
+                    part.order_by.clear();
+                    (ui.operator, part)
+                })
                 .collect(),
-            order_by: self.union_order.clone(),
-            limit: if self.parts.len() > 1 {
-                limit(&self.union_limit)
+            order_by: union_order,
+            limit: if combined { number(&self.limit) } else { None },
+            offset: if combined {
+                number(&self.offset_rows)
             } else {
                 None
             },
@@ -291,10 +517,51 @@ impl QueryBuilder {
     pub fn sql(&self, cx: &App) -> Result<String, String> {
         self.query(cx).sql(self.dialect, &self.db)
     }
+
+    fn finish(&mut self, run: bool, cx: &mut Context<Self>) {
+        match self.sql(cx) {
+            Ok(sql) => (self.open_sql)(sql, run, cx),
+            Err(err) => self.error = Some(err),
+        }
+        cx.notify();
+    }
+
+    fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if event.pressed_button != Some(MouseButton::Left) {
+            if self.drag.take().is_some() {
+                cx.notify();
+            }
+            return;
+        }
+        match &mut self.drag {
+            Some(Drag::Pan { mouse, offset }) => {
+                self.offset = *offset + (event.position - *mouse);
+                cx.notify();
+            }
+            Some(Drag::Box { alias, mouse, at }) => {
+                let delta = event.position - *mouse;
+                let to = (at.0 + f32::from(delta.x), at.1 + f32::from(delta.y));
+                let alias = alias.clone();
+                self.part().boxes.insert(alias, to);
+                cx.notify();
+            }
+            Some(Drag::Link { to, .. }) => {
+                *to = event.position;
+                cx.notify();
+            }
+            None => {}
+        }
+    }
 }
 
-/// A small dropdown button showing `label`, listing `items`; picking one calls `pick` with its
-/// index.
+/// Types as the boxes show them: without lengths or options that make them wide.
+fn short_type(column_type: &str) -> String {
+    let t = column_type.trim();
+    let t = t.split('(').next().unwrap_or(t);
+    t.split_whitespace().next().unwrap_or(t).to_owned()
+}
+
+/// A small dropdown button showing `label`; picking item `ix` calls `pick`.
 fn picker(
     id: impl Into<gpui_kit::ElementId>,
     label: impl Into<SharedString>,
@@ -326,537 +593,418 @@ fn picker(
         })
 }
 
-fn remove_button(
-    id: impl Into<gpui_kit::ElementId>,
-    tooltip: &'static str,
-    on: impl Fn(&mut QueryBuilder, &mut Context<QueryBuilder>) + 'static,
-    cx: &mut Context<QueryBuilder>,
-) -> impl IntoElement {
-    Button::new(id)
-        .ghost()
-        .xsmall()
-        .icon(IconName::Close)
-        .tooltip(tooltip)
-        .on_click(cx.listener(move |this, _, _, cx| on(this, cx)))
-}
-
-fn section(title: &'static str, cx: &App) -> impl IntoElement {
-    div()
-        .text_xs()
-        .font_semibold()
-        .text_color(cx.theme().muted_foreground)
-        .child(title)
-}
-
 impl QueryBuilder {
-    fn render_tables(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let ix = self.active;
-        let part = self.parts[ix].part.clone();
-        let mut list = v_flex().gap_2().child(section("TABLES", cx));
-        if let Some(from) = &part.from {
-            let alias = from.alias.clone();
-            list = list.child(
-                h_flex()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_sm()
-                            .child(format!("FROM {} ({})", from.table, from.alias)),
-                    )
-                    .child(div().flex_1())
-                    .child(remove_button(
-                        ("remove-from", ix),
-                        "Remove table",
-                        move |this, cx| this.remove_table(&alias, cx),
-                        cx,
-                    )),
-            );
-        }
-        let kinds = JoinKind::available(self.dialect);
-        for (j, join) in part.joins.iter().enumerate() {
-            let alias = join.table.alias.clone();
-            let mut block = v_flex()
-                .gap_1()
-                .pl_2()
-                .border_l_2()
-                .border_color(cx.theme().border);
-            block = block.child(
-                h_flex()
-                    .gap_1()
-                    .child(picker(
-                        ("join-kind", ix * 1000 + j),
-                        join.kind.keyword(),
-                        110.,
-                        kinds.iter().map(|k| k.keyword().to_owned()).collect(),
-                        move |this, k, _, cx| {
-                            let kind = JoinKind::available(this.dialect)[k];
-                            if let Some(join) = this.part().part.joins.get_mut(j) {
-                                join.kind = kind;
-                            }
-                            cx.notify();
-                        },
-                        cx,
-                    ))
-                    .child(
-                        div()
-                            .text_sm()
-                            .child(format!("{} ({})", join.table.table, join.table.alias)),
-                    )
-                    .child(div().flex_1())
-                    .child(remove_button(
-                        ("remove-join", ix * 1000 + j),
-                        "Remove table",
-                        move |this, cx| this.remove_table(&alias, cx),
-                        cx,
-                    )),
-            );
-            if join.kind != JoinKind::Cross {
-                let earlier: Vec<ColumnRef> = self.columns_of(ix, Some(j));
-                let own: Vec<ColumnRef> = self
-                    .columns
-                    .get(&join.table.table)
-                    .into_iter()
-                    .flatten()
-                    .map(|c| ColumnRef::new(&join.table.alias, c))
-                    .collect();
-                for (p, (left, right)) in join.on.iter().enumerate() {
-                    let (earlier, own) = (earlier.clone(), own.clone());
-                    let id = ix * 100_000 + j * 100 + p;
-                    block = block.child(
-                        h_flex()
-                            .gap_1()
-                            .child(div().text_xs().w(px(22.)).child(if p == 0 {
-                                "ON"
-                            } else {
-                                "AND"
-                            }))
-                            .child(picker(
-                                ("on-left", id),
-                                left.label(),
-                                130.,
-                                earlier.iter().map(ColumnRef::label).collect(),
-                                move |this, k, _, cx| {
-                                    if let Some(pair) = this
-                                        .part()
-                                        .part
-                                        .joins
-                                        .get_mut(j)
-                                        .and_then(|j| j.on.get_mut(p))
-                                    {
-                                        pair.0 = earlier[k].clone();
-                                    }
-                                    cx.notify();
-                                },
-                                cx,
-                            ))
-                            .child(div().text_xs().child("="))
-                            .child(picker(
-                                ("on-right", id),
-                                right.label(),
-                                130.,
-                                own.iter().map(ColumnRef::label).collect(),
-                                move |this, k, _, cx| {
-                                    if let Some(pair) = this
-                                        .part()
-                                        .part
-                                        .joins
-                                        .get_mut(j)
-                                        .and_then(|j| j.on.get_mut(p))
-                                    {
-                                        pair.1 = own[k].clone();
-                                    }
-                                    cx.notify();
-                                },
-                                cx,
-                            ))
-                            .child(remove_button(
-                                ("remove-on", id),
-                                "Remove this match",
-                                move |this, cx| {
-                                    if let Some(join) = this.part().part.joins.get_mut(j)
-                                        && p < join.on.len()
-                                    {
-                                        join.on.remove(p);
-                                    }
-                                    cx.notify();
-                                },
-                                cx,
-                            )),
-                    );
-                }
-                let (first_left, first_right) = (earlier.first().cloned(), own.first().cloned());
-                block = block.child(
-                    h_flex().child(
-                        Button::new(("add-on", ix * 1000 + j))
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::Plus)
-                            .label(if join.on.is_empty() {
-                                "Match columns"
-                            } else {
-                                "Match another column"
-                            })
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if let (Some(l), Some(r)) =
-                                    (first_left.clone(), first_right.clone())
-                                    && let Some(join) = this.part().part.joins.get_mut(j)
-                                {
-                                    join.on.push((l, r));
-                                }
-                                cx.notify();
-                            })),
-                    ),
-                );
-            }
-            list = list.child(block);
-        }
-        let tables = self.tables.clone();
-        list.child(
-            h_flex().child(
-                Button::new(("add-table", ix))
-                    .xsmall()
-                    .icon(IconName::Plus)
-                    .label(if part.from.is_some() {
-                        "Join a table"
-                    } else {
-                        "Add a table"
-                    })
-                    .loading(self.loading)
-                    .dropdown_menu({
-                        let this = cx.entity().downgrade();
-                        move |menu: PopupMenu, _, _| {
-                            tables.iter().fold(menu.scrollable(true), |menu, table| {
-                                let (this, table) = (this.clone(), table.clone());
-                                menu.item(PopupMenuItem::new(table.clone()).on_click(
-                                    move |_, _, cx| {
-                                        this.update(cx, |this, cx| {
-                                            this.add_table(table.clone(), cx);
-                                        })
-                                        .ok();
-                                    },
-                                ))
-                            })
-                        }
-                    }),
-            ),
-        )
-        .into_any_element()
-    }
-
-    fn render_columns(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let ix = self.active;
-        let part = self.parts[ix].part.clone();
-        let mut list = v_flex().gap_2().child(
-            h_flex().gap_3().child(section("COLUMNS", cx)).child(
-                Checkbox::new(("distinct", ix))
-                    .label("Distinct rows")
-                    .checked(part.distinct)
-                    .on_change(cx.listener(|this, value: &bool, _, cx| {
-                        this.part().part.distinct = *value;
-                        cx.notify();
-                    })),
-            ),
-        );
-        for table in part.tables() {
-            let names = self.columns.get(&table.table).cloned().unwrap_or_default();
-            let boxes = names.into_iter().enumerate().map(|(c, name)| {
-                let column = ColumnRef::new(&table.alias, &name);
-                let checked = self.parts[ix].columns.iter().any(|x| x.column == column);
-                Checkbox::new(SharedString::from(format!("col-{ix}-{}-{c}", table.alias)))
-                    .label(name)
-                    .checked(checked)
-                    .on_change(cx.listener(move |this, _: &bool, window, cx| {
-                        this.toggle_column(column.clone(), window, cx);
-                    }))
-            });
-            list = list.child(
-                v_flex()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_sm()
-                            .child(format!("{} ({})", table.table, table.alias)),
-                    )
-                    .child(h_flex().flex_wrap().gap_x_3().gap_y_1().children(boxes)),
-            );
-        }
-        if part.from.is_none() {
-            list = list.child(
+    fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let filter = self.filter.read(cx).value().trim().to_lowercase();
+        let hover = cx.theme().list_hover;
+        let items: Vec<AnyElement> = self
+            .tables
+            .iter()
+            .filter(|t| filter.is_empty() || t.to_lowercase().contains(&filter))
+            .enumerate()
+            .map(|(i, table)| {
+                let name = table.clone();
                 div()
+                    .id(("builder-table", i))
+                    .px_2()
+                    .py_1()
                     .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("Add a table on the left to choose its columns."),
-            );
-        } else if self.parts[ix].columns.is_empty() {
-            list = list.child(
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(hover))
+                    .child(table.clone())
+                    .on_click(cx.listener(move |this, _, _, cx| this.add_table(name.clone(), cx)))
+                    .into_any_element()
+            })
+            .collect();
+        v_flex()
+            .w(px(210.))
+            .h_full()
+            .border_r_1()
+            .border_color(cx.theme().border)
+            .p_2()
+            .gap_2()
+            .child(Input::new(&self.filter).small())
+            .child(
                 div()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child("No columns ticked: every column is selected (*)."),
-            );
-        }
-        let aggregates: Vec<String> = std::iter::once("—".to_owned())
-            .chain(Aggregate::ALL.iter().map(|a| a.label().to_owned()))
-            .collect();
-        for (c, column) in self.parts[ix].columns.iter().enumerate() {
-            let aggregates = aggregates.clone();
-            list = list.child(
-                h_flex()
-                    .gap_1()
-                    .child(div().text_sm().w(px(160.)).child(column.column.label()))
-                    .child(picker(
-                        ("aggregate", ix * 1000 + c),
-                        column.aggregate.map_or("—", Aggregate::label),
-                        120.,
-                        aggregates,
-                        move |this, k, _, cx| {
-                            if let Some(col) = this.part().columns.get_mut(c) {
-                                col.aggregate = k.checked_sub(1).map(|k| Aggregate::ALL[k]);
-                            }
-                            cx.notify();
-                        },
-                        cx,
-                    ))
-                    .child(div().text_xs().child("AS"))
-                    .child(div().w(px(140.)).child(Input::new(&column.alias).xsmall())),
-            );
-        }
-        list.into_any_element()
+                    .child(if self.loading {
+                        "Loading…"
+                    } else {
+                        "Click a table to add it"
+                    }),
+            )
+            .child(
+                v_flex()
+                    .id("builder-table-list")
+                    .flex_1()
+                    .overflow_y_scroll()
+                    .children(items),
+            )
+            .into_any_element()
     }
 
-    fn render_filters(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_boxes(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let ix = self.active;
-        let columns = self.columns_of(ix, None);
-        let labels: Vec<String> = columns.iter().map(ColumnRef::label).collect();
-        let mut list = v_flex()
-            .gap_1()
-            .child(section("WHERE (all must match)", cx));
-        for (c, cond) in self.parts[ix].conditions.iter().enumerate() {
-            let columns = columns.clone();
-            let id = ix * 1000 + c;
-            list = list.child(
-                h_flex()
-                    .gap_1()
-                    .child(picker(
-                        ("cond-col", id),
-                        cond.column.label(),
-                        160.,
-                        labels.clone(),
-                        move |this, k, _, cx| {
-                            if let Some(cond) = this.part().conditions.get_mut(c) {
-                                cond.column = columns[k].clone();
-                            }
-                            cx.notify();
-                        },
-                        cx,
-                    ))
-                    .child(picker(
-                        ("cond-op", id),
-                        cond.operator.label(),
-                        100.,
-                        Operator::ALL.iter().map(|o| o.label().to_owned()).collect(),
-                        move |this, k, _, cx| {
-                            if let Some(cond) = this.part().conditions.get_mut(c) {
-                                cond.operator = Operator::ALL[k];
-                            }
-                            cx.notify();
-                        },
-                        cx,
-                    ))
-                    .child(div().flex_1().when(cond.operator.takes_value(), |d| {
-                        d.child(Input::new(&cond.value).xsmall())
-                    }))
-                    .child(remove_button(
-                        ("remove-cond", id),
-                        "Remove condition",
-                        move |this, cx| {
-                            if c < this.part().conditions.len() {
-                                this.part().conditions.remove(c);
-                            }
-                            cx.notify();
-                        },
-                        cx,
-                    )),
+        let ui = &self.parts[ix];
+        let theme = cx.theme();
+        let (border, header, muted, bg, hover) = (
+            theme.border,
+            theme.secondary,
+            theme.muted_foreground,
+            theme.background,
+            theme.list_hover,
+        );
+        let mut out = Vec::new();
+        for (b, table) in ui.part.tables().into_iter().enumerate() {
+            let Some(&(x, y)) = ui.boxes.get(&table.alias) else {
+                continue;
+            };
+            let alias = table.alias.clone();
+            let columns: Columns = std::iter::once(("*".to_owned(), String::new()))
+                .chain(self.columns.get(&table.table).cloned().unwrap_or_default())
+                .collect();
+            let rows: Vec<AnyElement> = columns
+                .into_iter()
+                .enumerate()
+                .map(|(c, (name, ty))| {
+                    let column = ColumnRef::new(&alias, &name);
+                    let checked = ui.rows.iter().any(|r| r.column == column && r.visible);
+                    let (down, up, tick) = (column.clone(), column.clone(), column);
+                    let star = name == "*";
+                    h_flex()
+                        .id(SharedString::from(format!("box-{ix}-{alias}-{c}")))
+                        .h(px(ROW))
+                        .px_2()
+                        .gap_2()
+                        .hover(move |s| s.bg(hover))
+                        .child(
+                            Checkbox::new(SharedString::from(format!("tick-{ix}-{alias}-{c}")))
+                                .xsmall()
+                                .checked(checked)
+                                .on_change(cx.listener(move |this, _: &bool, window, cx| {
+                                    this.toggle_column(tick.clone(), window, cx);
+                                })),
+                        )
+                        .child(
+                            h_flex()
+                                .flex_1()
+                                .h_full()
+                                .justify_between()
+                                .gap_2()
+                                .when(!star, |el| el.cursor(gpui_kit::CursorStyle::Crosshair))
+                                .child(div().text_sm().child(if star {
+                                    "* (all columns)".to_owned()
+                                } else {
+                                    name
+                                }))
+                                .child(div().text_xs().text_color(muted).child(ty))
+                                // Drag from a column to another table's column to join on them.
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                        if down.column != "*" {
+                                            this.drag = Some(Drag::Link {
+                                                from: down.clone(),
+                                                to: event.position,
+                                            });
+                                        }
+                                        cx.stop_propagation();
+                                    }),
+                                ),
+                        )
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                if let Some(Drag::Link { from, .. }) = this.drag.take() {
+                                    this.link(&from, &up, cx);
+                                }
+                            }),
+                        )
+                        .into_any_element()
+                })
+                .collect();
+            let width = self.box_width(&table.table);
+            let height = self.box_height(&table.table);
+            let (close, moving) = (alias.clone(), alias.clone());
+            out.push(
+                v_flex()
+                    .id(("builder-box", ix * 1000 + b))
+                    .absolute()
+                    .left(self.offset.x + px(x))
+                    .top(self.offset.y + px(y))
+                    .w(px(width))
+                    .h(px(height))
+                    .bg(bg)
+                    .border_1()
+                    .border_color(border)
+                    .rounded_md()
+                    .shadow_sm()
+                    .overflow_hidden()
+                    .child(
+                        h_flex()
+                            .h(px(HEADER))
+                            .pl_2()
+                            .bg(header)
+                            .border_b_1()
+                            .border_color(border)
+                            .cursor_move()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                    this.drag = Some(Drag::Box {
+                                        alias: moving.clone(),
+                                        mouse: event.position,
+                                        at: (x, y),
+                                    });
+                                    cx.stop_propagation();
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_sm()
+                                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                    .child(format!("{} ({})", table.table, table.alias)),
+                            )
+                            .child(
+                                Button::new(("close-box", ix * 1000 + b))
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(IconName::Close)
+                                    .tooltip("Remove table")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.remove_table(&close, cx);
+                                    })),
+                            ),
+                    )
+                    .children(rows)
+                    .into_any_element(),
             );
         }
-        list = list.child(
-            h_flex().child(
-                Button::new(("add-cond", ix))
-                    .ghost()
-                    .xsmall()
-                    .icon(IconName::Plus)
-                    .label("Condition")
-                    .disabled(columns.is_empty())
-                    .on_click(cx.listener(|this, _, window, cx| this.add_condition(window, cx))),
-            ),
-        );
-        // A combined query is sorted as a whole, below.
-        if self.parts.len() == 1 {
-            list = list
-                .child(div().h(px(6.)))
-                .child(section("SORT AND LIMIT", cx));
-            for (o, order) in self.parts[ix].part.order_by.iter().enumerate() {
-                let columns = columns.clone();
-                let id = ix * 1000 + o;
-                list = list.child(
-                    h_flex()
-                        .gap_1()
+        out
+    }
+
+    /// A marker on each join's lines, showing its kind; clicking it changes or removes it.
+    fn render_markers(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let ix = self.active;
+        let ui = &self.parts[ix];
+        let kinds: Vec<JoinKind> = JoinKind::available(self.dialect)
+            .iter()
+            .copied()
+            .filter(|k| *k != JoinKind::Cross)
+            .collect();
+        let mut out = Vec::new();
+        for (j, join) in ui.part.joins.iter().enumerate() {
+            for (p, (a, b)) in join.on.iter().enumerate() {
+                let (Some(pa), Some(pb)) =
+                    (self.anchor_toward(ix, a, b), self.anchor_toward(ix, b, a))
+                else {
+                    continue;
+                };
+                let mid = (f32::midpoint(pa.0, pb.0), f32::midpoint(pa.1, pb.1));
+                let mut items: Vec<String> = kinds.iter().map(|k| k.keyword().to_owned()).collect();
+                items.push("Remove this link".to_owned());
+                let label = join
+                    .kind
+                    .keyword()
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("JOIN")
+                    .to_owned();
+                let kinds = kinds.clone();
+                out.push(
+                    div()
+                        .absolute()
+                        .left(self.offset.x + px(mid.0 - 34.))
+                        .top(self.offset.y + px(mid.1 - 11.))
                         .child(picker(
-                            ("order-col", id),
-                            order.column.label(),
-                            160.,
-                            labels.clone(),
+                            ("join-marker", ix * 100_000 + j * 100 + p),
+                            label,
+                            68.,
+                            items,
                             move |this, k, _, cx| {
-                                if let Some(order) = this.part().part.order_by.get_mut(o) {
-                                    order.column = columns[k].clone();
+                                if let Some(join) = this.part().part.joins.get_mut(j) {
+                                    match kinds.get(k) {
+                                        Some(kind) => join.kind = *kind,
+                                        None if p < join.on.len() => {
+                                            join.on.remove(p);
+                                        }
+                                        None => {}
+                                    }
                                 }
                                 cx.notify();
                             },
                             cx,
                         ))
-                        .child(
-                            Button::new(("order-dir", id))
-                                .xsmall()
-                                .outline()
-                                .label(if order.descending {
-                                    "Descending"
-                                } else {
-                                    "Ascending"
-                                })
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    if let Some(order) = this.part().part.order_by.get_mut(o) {
-                                        order.descending = !order.descending;
-                                    }
-                                    cx.notify();
-                                })),
-                        )
-                        .child(remove_button(
-                            ("remove-order", id),
-                            "Remove sort",
-                            move |this, cx| {
-                                if o < this.part().part.order_by.len() {
-                                    this.part().part.order_by.remove(o);
-                                }
-                                cx.notify();
-                            },
-                            cx,
-                        )),
+                        .into_any_element(),
                 );
             }
-            let first = columns.first().cloned();
-            list = list.child(
+        }
+        out
+    }
+
+    fn render_grid(&self, cx: &mut Context<Self>) -> AnyElement {
+        let ix = self.active;
+        let muted = cx.theme().muted_foreground;
+        let head = |text: &'static str, width: Option<f32>| {
+            let cell = div().text_xs().text_color(muted).child(text);
+            match width {
+                Some(w) => cell.w(px(w)),
+                None => cell.flex_1(),
+            }
+        };
+        let mut sorted: Vec<(usize, usize)> = self.parts[ix]
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.sort.is_some())
+            .map(|(i, r)| (r.sorted_at, i))
+            .collect();
+        sorted.sort_unstable();
+        let rank = |i: usize| sorted.iter().position(|&(_, r)| r == i).map(|p| p + 1);
+        let aggregates: Vec<String> = std::iter::once("—".to_owned())
+            .chain(Aggregate::ALL.iter().map(|a| a.label().to_owned()))
+            .collect();
+        let rows: Vec<AnyElement> = self.parts[ix]
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(r, row)| {
+                let id = ix * 10_000 + r;
                 h_flex()
                     .gap_2()
+                    .h(px(30.))
                     .child(
-                        Button::new(("add-order", ix))
+                        Button::new(("grid-remove", id))
                             .ghost()
                             .xsmall()
-                            .icon(IconName::Plus)
-                            .label("Sort")
-                            .disabled(first.is_none())
+                            .icon(IconName::Close)
+                            .tooltip("Remove from the grid")
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                if let Some(column) = first.clone() {
-                                    this.part().part.order_by.push(OrderItem {
-                                        column,
-                                        descending: false,
-                                    });
+                                if r < this.part().rows.len() {
+                                    this.part().rows.remove(r);
                                 }
                                 cx.notify();
                             })),
                     )
-                    .child(div().text_xs().child("Limit"))
                     .child(
-                        div()
-                            .w(px(90.))
-                            .child(Input::new(&self.parts[ix].limit).xsmall()),
-                    ),
-            );
-        }
-        list.into_any_element()
-    }
-
-    /// Sorting and limit for a combined query, by output column position.
-    fn render_union_order(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let width = self.parts[0].columns.len().max(1);
-        let positions: Vec<String> = (1..=width).map(|p| format!("column {p}")).collect();
-        let mut list = v_flex()
-            .gap_1()
-            .child(section("SORT AND LIMIT THE COMBINED RESULT", cx));
-        for (o, (position, descending)) in self.union_order.iter().enumerate() {
-            list = list.child(
-                h_flex()
-                    .gap_1()
+                        div().w(px(54.)).child(
+                            Checkbox::new(("grid-visible", id))
+                                .xsmall()
+                                .checked(row.visible)
+                                .on_change(cx.listener(move |this, value: &bool, _, cx| {
+                                    if let Some(row) = this.part().rows.get_mut(r) {
+                                        row.visible = *value;
+                                    }
+                                    cx.notify();
+                                })),
+                        ),
+                    )
+                    .child(div().w(px(180.)).text_sm().child(row.column.label()))
+                    .child(div().w(px(130.)).child(Input::new(&row.alias).xsmall()))
                     .child(picker(
-                        ("union-order", o),
-                        format!("column {position}"),
+                        ("grid-sort", id),
+                        match row.sort {
+                            None => "—",
+                            Some(false) => "Ascending",
+                            Some(true) => "Descending",
+                        },
                         110.,
-                        positions.clone(),
+                        vec!["—".into(), "Ascending".into(), "Descending".into()],
                         move |this, k, _, cx| {
-                            if let Some(order) = this.union_order.get_mut(o) {
-                                order.0 = k + 1;
+                            this.sort_counter += 1;
+                            let counter = this.sort_counter;
+                            if let Some(row) = this.part().rows.get_mut(r) {
+                                let was = row.sort;
+                                row.sort = match k {
+                                    1 => Some(false),
+                                    2 => Some(true),
+                                    _ => None,
+                                };
+                                if was.is_none() && row.sort.is_some() {
+                                    row.sorted_at = counter;
+                                }
                             }
                             cx.notify();
                         },
                         cx,
                     ))
                     .child(
-                        Button::new(("union-dir", o))
-                            .xsmall()
-                            .outline()
-                            .label(if *descending {
-                                "Descending"
-                            } else {
-                                "Ascending"
-                            })
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if let Some(order) = this.union_order.get_mut(o) {
-                                    order.1 = !order.1;
-                                }
-                                cx.notify();
-                            })),
+                        div()
+                            .w(px(70.))
+                            .text_sm()
+                            .text_center()
+                            .child(rank(r).map(|n| n.to_string()).unwrap_or_default()),
                     )
-                    .child(remove_button(
-                        ("remove-union-order", o),
-                        "Remove sort",
-                        move |this, cx| {
-                            if o < this.union_order.len() {
-                                this.union_order.remove(o);
+                    .child(picker(
+                        ("grid-aggregate", id),
+                        row.aggregate.map_or("—", Aggregate::label),
+                        120.,
+                        aggregates.clone(),
+                        move |this, k, _, cx| {
+                            if let Some(row) = this.part().rows.get_mut(r) {
+                                row.aggregate = k.checked_sub(1).map(|k| Aggregate::ALL[k]);
                             }
                             cx.notify();
                         },
                         cx,
-                    )),
-            );
-        }
-        list.child(
-            h_flex()
-                .gap_2()
-                .child(
-                    Button::new("add-union-order")
-                        .ghost()
-                        .xsmall()
-                        .icon(IconName::Plus)
-                        .label("Sort")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.union_order.push((1, false));
-                            cx.notify();
-                        })),
-                )
-                .child(div().text_xs().child("Limit"))
-                .child(
+                    ))
+                    .child(
+                        div().w(px(64.)).flex().justify_center().child(
+                            Checkbox::new(("grid-group", id))
+                                .xsmall()
+                                .checked(row.group)
+                                .on_change(cx.listener(move |this, value: &bool, _, cx| {
+                                    if let Some(row) = this.part().rows.get_mut(r) {
+                                        row.group = *value;
+                                    }
+                                    cx.notify();
+                                })),
+                        ),
+                    )
+                    .child(div().flex_1().child(Input::new(&row.criteria).xsmall()))
+                    .into_any_element()
+            })
+            .collect();
+        let empty = rows.is_empty();
+        v_flex()
+            .id("builder-grid")
+            .h(px(200.))
+            .px_3()
+            .py_2()
+            .gap_1()
+            .border_t_1()
+            .border_color(cx.theme().border)
+            .overflow_y_scroll()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(div().w(px(24.)))
+                    .child(head("Output", Some(54.)))
+                    .child(head("Expression", Some(180.)))
+                    .child(head("Alias", Some(130.)))
+                    .child(head("Sort type", Some(110.)))
+                    .child(head("Sort order", Some(70.)))
+                    .child(head("Aggregate", Some(120.)))
+                    .child(head("Grouping", Some(64.)))
+                    .child(head("Criteria", None)),
+            )
+            .children(rows)
+            .when(empty, |el| {
+                el.child(
                     div()
-                        .w(px(90.))
-                        .child(Input::new(&self.union_limit).xsmall()),
-                ),
-        )
-        .into_any_element()
+                        .text_sm()
+                        .text_color(muted)
+                        .pt_2()
+                        .child("Tick columns in the tables above to add them here."),
+                )
+            })
+            .into_any_element()
     }
-}
 
-impl Render for QueryBuilder {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.active = self.active.min(self.parts.len() - 1);
-        let muted = cx.theme().muted_foreground;
+    fn render_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
         let tabs: Vec<Tab> = self
             .parts
             .iter()
@@ -865,7 +1013,6 @@ impl Render for QueryBuilder {
                 if i == 0 {
                     return Tab::new().label("Query 1");
                 }
-                // Every query but the first can be removed from its tab.
                 Tab::new()
                     .label(format!("{} · Query {}", ui.operator.keyword(), i + 1))
                     .suffix(
@@ -880,23 +1027,45 @@ impl Render for QueryBuilder {
                     )
             })
             .collect();
-        let preview = match self.sql(cx) {
-            Ok(sql) => div().child(sql),
-            Err(err) => div().text_color(muted).child(err),
-        };
         let active = self.active;
-        let combine = (active > 0).then(|| {
-            h_flex()
-                .gap_2()
-                .child(
-                    div()
-                        .text_xs()
-                        .child("Combined with the queries before it by"),
-                )
-                .child(picker(
+        let distinct = self.parts[active].part.distinct;
+        h_flex()
+            .h(px(44.))
+            .px_3()
+            .gap_3()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .child(
+                TabBar::new("builder-parts")
+                    .underline()
+                    .small()
+                    .selected_index(active)
+                    .on_click(cx.listener(|this, ix: &usize, _, cx| {
+                        // A tab's × removes it first, then the click reaches the bar.
+                        if *ix < this.parts.len() {
+                            this.active = *ix;
+                        }
+                        cx.notify();
+                    }))
+                    .children(tabs),
+            )
+            .child(
+                Button::new("add-part")
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::Plus)
+                    .label("UNION")
+                    .tooltip("Combine with another SELECT (UNION, INTERSECT, EXCEPT)")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.add_part(SetOperator::Union);
+                        cx.notify();
+                    })),
+            )
+            .when(active > 0, |el| {
+                el.child(picker(
                     ("set-op", active),
                     self.parts[active].operator.keyword(),
-                    120.,
+                    110.,
                     SetOperator::ALL
                         .iter()
                         .map(|o| o.keyword().to_owned())
@@ -907,89 +1076,194 @@ impl Render for QueryBuilder {
                     },
                     cx,
                 ))
-        });
-        let tables = self.render_tables(cx);
-        let columns = self.render_columns(cx);
-        let filters = self.render_filters(cx);
-        let union_order = (self.parts.len() > 1).then(|| self.render_union_order(cx));
-        v_flex()
-            .gap_2()
+            })
+            .child(div().flex_1())
             .child(
-                h_flex()
-                    .gap_2()
-                    .child(
-                        TabBar::new("builder-parts")
-                            .underline()
-                            .small()
-                            .selected_index(self.active)
-                            .on_click(cx.listener(|this, ix: &usize, _, cx| {
-                                // A tab's × removes it first, then the click reaches the bar.
-                                if *ix < this.parts.len() {
-                                    this.active = *ix;
-                                }
-                                cx.notify();
-                            }))
-                            .children(tabs),
-                    )
-                    .child(
-                        Button::new("add-part")
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::Plus)
-                            .label("UNION another query")
-                            .tooltip("Combine with another SELECT (UNION, INTERSECT, EXCEPT)")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.add_part(SetOperator::Union, window, cx);
-                            })),
-                    ),
+                Checkbox::new(("distinct", active))
+                    .label("Distinct")
+                    .checked(distinct)
+                    .on_change(cx.listener(|this, value: &bool, _, cx| {
+                        this.part().part.distinct = *value;
+                        cx.notify();
+                    })),
             )
-            .children(combine)
-            .child(
-                h_flex()
-                    .items_start()
-                    .gap_4()
-                    .h(px(400.))
-                    .child(
-                        div()
-                            .id("builder-tables")
-                            .w(px(400.))
-                            .h_full()
-                            .overflow_y_scroll()
-                            .child(tables),
-                    )
-                    .child(
-                        v_flex()
-                            .id("builder-right")
-                            .flex_1()
-                            .h_full()
-                            .gap_4()
-                            .overflow_y_scroll()
-                            .child(columns)
-                            .child(filters)
-                            .children(union_order),
-                    ),
-            )
-            .children(
-                self.error
-                    .clone()
-                    .map(|err| div().text_sm().text_color(cx.theme().danger).child(err)),
-            )
+            .child(div().text_sm().child("Limit"))
+            .child(div().w(px(70.)).child(Input::new(&self.limit).xsmall()))
+            .child(div().text_sm().child("Offset"))
             .child(
                 div()
-                    .id("builder-preview")
-                    .p_2()
+                    .w(px(60.))
+                    .child(Input::new(&self.offset_rows).xsmall()),
+            )
+            .child(
+                Button::new("builder-open")
+                    .small()
+                    .label("Open in editor")
+                    .on_click(cx.listener(|this, _, _, cx| this.finish(false, cx))),
+            )
+            .child(
+                Button::new("builder-run")
+                    .small()
+                    .primary()
+                    .icon(IconName::Play)
+                    .label("Run")
+                    .on_click(cx.listener(|this, _, _, cx| this.finish(true, cx))),
+            )
+            .into_any_element()
+    }
+}
+
+impl Render for QueryBuilder {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.active = self.active.min(self.parts.len() - 1);
+        let theme = cx.theme();
+        let (line, muted, bg) = (
+            theme.muted_foreground,
+            theme.muted_foreground,
+            theme.background,
+        );
+        let ix = self.active;
+        // Every join line, plus the one being drawn.
+        let mut links: Vec<((f32, f32), (f32, f32))> = Vec::new();
+        for join in &self.parts[ix].part.joins {
+            for (a, b) in &join.on {
+                if let (Some(pa), Some(pb)) =
+                    (self.anchor_toward(ix, a, b), self.anchor_toward(ix, b, a))
+                {
+                    links.push((pa, pb));
+                }
+            }
+        }
+        if let Some(Drag::Link { from, to }) = &self.drag {
+            let origin = self.canvas.get().map_or(Point::default(), |b| b.origin);
+            let target = *to - origin - self.offset;
+            let target = (f32::from(target.x), f32::from(target.y));
+            if let Some(start) = self.anchor(ix, from, target.0) {
+                links.push((start, target));
+            }
+        }
+        let (offset, bounds) = (self.offset, self.canvas.clone());
+        let connectors = canvas(
+            move |b, _, _| bounds.set(Some(b)),
+            move |b, (), window, _| {
+                let at = |p: (f32, f32)| {
+                    point(
+                        b.origin.x + offset.x + px(p.0),
+                        b.origin.y + offset.y + px(p.1),
+                    )
+                };
+                for (from, to) in &links {
+                    let (start, end) = (at(*from), at(*to));
+                    let reach = (f32::from(end.x - start.x).abs() / 2.).max(30.);
+                    let (sb, eb) = if start.x < end.x {
+                        (reach, -reach)
+                    } else {
+                        (-reach, reach)
+                    };
+                    let mut path = PathBuilder::stroke(px(1.5));
+                    path.move_to(start);
+                    path.cubic_bezier_to(
+                        end,
+                        point(start.x + px(sb), start.y),
+                        point(end.x + px(eb), end.y),
+                    );
+                    if let Ok(path) = path.build() {
+                        window.paint_path(path, line);
+                    }
+                }
+            },
+        )
+        .absolute()
+        .size_full();
+        let empty = self.parts[ix].part.from.is_none();
+        let sidebar = self.render_sidebar(cx);
+        let boxes = self.render_boxes(cx);
+        let markers = self.render_markers(cx);
+        let grid = self.render_grid(cx);
+        let toolbar = self.render_toolbar(cx);
+        let preview = match self.sql(cx) {
+            Ok(sql) => div().child(sql),
+            Err(err) => div().text_color(muted).child(err),
+        };
+        v_flex()
+            .size_full()
+            .bg(bg)
+            .text_color(cx.theme().foreground)
+            .child(toolbar)
+            .child(
+                h_flex().flex_1().min_h_0().child(sidebar).child(
+                    div()
+                        .id("builder-canvas")
+                        .relative()
+                        .flex_1()
+                        .h_full()
+                        .overflow_hidden()
+                        .bg(cx.theme().muted.opacity(0.4))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, event: &MouseDownEvent, _, _| {
+                                this.drag = Some(Drag::Pan {
+                                    mouse: event.position,
+                                    offset: this.offset,
+                                });
+                            }),
+                        )
+                        .on_mouse_move(cx.listener(Self::on_mouse_move))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.drag = None;
+                                cx.notify();
+                            }),
+                        )
+                        .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+                            this.offset += event.delta.pixel_delta(px(ROW));
+                            cx.notify();
+                        }))
+                        .child(connectors)
+                        .children(boxes)
+                        .children(markers)
+                        .when(empty, |el| {
+                            el.child(
+                                div()
+                                    .absolute()
+                                    .top(px(24.))
+                                    .left(px(24.))
+                                    .text_sm()
+                                    .text_color(muted)
+                                    .child(
+                                        "Add tables from the list on the left. Tick columns \
+                                             to select them; drag from a column to another \
+                                             table's column to join on it.",
+                                    ),
+                            )
+                        }),
+                ),
+            )
+            .child(grid)
+            .children(self.error.clone().map(|err| {
+                div()
+                    .px_3()
+                    .text_sm()
+                    .text_color(cx.theme().danger)
+                    .child(err)
+            }))
+            .child(
+                div()
+                    .id("builder-sql")
                     .h(px(150.))
+                    .p_3()
+                    .border_t_1()
+                    .border_color(cx.theme().border)
                     .overflow_y_scroll()
-                    .rounded(cx.theme().radius)
-                    .bg(cx.theme().muted)
                     .font_family(cx.theme().mono_font_family.clone())
-                    .text_xs()
+                    .text_sm()
                     .child(preview),
             )
     }
 }
 
-/// Opens the builder for `db`, starting with `table` when given.
+/// Opens the builder for `db` in a window of its own, starting with `table` when given.
 pub fn open(
     dialect: Dialect,
     db: String,
@@ -1012,7 +1286,21 @@ pub fn open(
             })
             .await;
             cx.update(|window, cx| match listed {
-                Ok(tables) => show(dialect, db, table, tables, session, open_sql, window, cx),
+                Ok(tables) => {
+                    let options = crate::window_options(format!("Query builder: {db}"), cx);
+                    let opened = gpui_kit::open_window(options, cx, move |window, cx| {
+                        let builder = cx.new(|cx| {
+                            QueryBuilder::new(dialect, db, session, tables, open_sql, window, cx)
+                        });
+                        if let Some(table) = table {
+                            builder.update(cx, |b, cx| b.add_table(table, cx));
+                        }
+                        builder
+                    });
+                    if let Err(err) = opened {
+                        window.push_notification(format!("Could not open the builder: {err}"), cx);
+                    }
+                }
                 Err(err) => {
                     window.push_notification(format!("Could not list the tables: {err}"), cx);
                 }
@@ -1020,57 +1308,4 @@ pub fn open(
             .ok();
         })
         .detach();
-}
-
-#[allow(clippy::too_many_arguments)]
-fn show(
-    dialect: Dialect,
-    db: String,
-    table: Option<String>,
-    tables: Vec<String>,
-    session: SharedSession,
-    open_sql: OpenSql,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    let title = format!("Query builder: {db}");
-    let builder = cx.new(|cx| QueryBuilder::new(dialect, db, session, tables, window, cx));
-    if let Some(table) = table {
-        builder.update(cx, |b, cx| b.add_table(table, cx));
-    }
-    window.open_dialog(cx, move |dialog, _, _| {
-        let finish = |run: bool, builder: Entity<QueryBuilder>, open_sql: OpenSql| {
-            move |_: &gpui_kit::ClickEvent, window: &mut Window, cx: &mut App| {
-                if let Ok(sql) = builder.read(cx).sql(cx) {
-                    window.close_dialog(cx);
-                    open_sql(sql, run, window, cx);
-                }
-            }
-        };
-        dialog
-            .title(title.clone())
-            .w(px(1120.))
-            .child(builder.clone())
-            .footer(
-                h_flex()
-                    .gap_2()
-                    .justify_end()
-                    .child(
-                        Button::new("builder-cancel")
-                            .label("Cancel")
-                            .on_click(|_, window, cx| window.close_dialog(cx)),
-                    )
-                    .child(
-                        Button::new("builder-open")
-                            .label("Open in editor")
-                            .on_click(finish(false, builder.clone(), open_sql.clone())),
-                    )
-                    .child(
-                        Button::new("builder-run")
-                            .primary()
-                            .label("Run")
-                            .on_click(finish(true, builder.clone(), open_sql.clone())),
-                    ),
-            )
-    });
 }

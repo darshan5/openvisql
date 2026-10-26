@@ -621,6 +621,7 @@ async fn query_builder_sql_runs() {
         rest: vec![(SetOperator::Union, suppliers)],
         order_by: vec![(1, false)],
         limit: None,
+        offset: None,
     };
     let sql = query.sql(s.dialect(), "main").unwrap();
     let rs = rows(&mut s, &sql).await;

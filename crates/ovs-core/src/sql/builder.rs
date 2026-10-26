@@ -30,6 +30,10 @@ impl ColumnRef {
     }
 
     fn sql(&self, d: Dialect) -> String {
+        // Every column of the table.
+        if self.column == "*" {
+            return format!("{}.*", d.quote_ident(&self.alias));
+        }
         format!(
             "{}.{}",
             d.quote_ident(&self.alias),
@@ -229,8 +233,20 @@ pub struct SelectPart {
     pub columns: Vec<SelectItem>,
     pub distinct: bool,
     pub conditions: Vec<Condition>,
+    /// Conditions typed as text against a column, like `> 100` or `LIKE 'a%'`.
+    pub criteria: Vec<Criterion>,
+    /// Explicit grouping; when empty, the columns shown next to aggregates are grouped by.
+    pub group_by: Vec<ColumnRef>,
     pub order_by: Vec<OrderItem>,
     pub limit: Option<u64>,
+    pub offset: Option<u64>,
+}
+
+/// A condition on a column written as text: see [`criteria_sql`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Criterion {
+    pub column: ColumnRef,
+    pub text: String,
 }
 
 impl SelectPart {
@@ -350,6 +366,8 @@ impl SelectPart {
         }
         self.columns.retain(|c| c.column.alias != alias);
         self.conditions.retain(|c| c.column.alias != alias);
+        self.criteria.retain(|c| c.column.alias != alias);
+        self.group_by.retain(|c| c.alias != alias);
         self.order_by.retain(|o| o.column.alias != alias);
     }
 
@@ -409,20 +427,28 @@ impl SelectPart {
                 .collect();
             let _ = write!(sql, " ON {}", on.join(" AND "));
         }
-        if !self.conditions.is_empty() {
-            let conditions = self
-                .conditions
+        let mut conditions = self
+            .conditions
+            .iter()
+            .map(|c| condition_sql(d, c))
+            .collect::<Result<Vec<_>, _>>()?;
+        conditions.extend(
+            self.criteria
                 .iter()
-                .map(|c| condition_sql(d, c))
-                .collect::<Result<Vec<_>, _>>()?;
+                .filter_map(|c| criteria_sql(d, &c.column.sql(d), &c.text)),
+        );
+        if !conditions.is_empty() {
             let _ = write!(
                 sql,
                 "\n{indent}WHERE {}",
                 conditions.join(&format!("\n{indent}  AND "))
             );
         }
-        // Columns shown next to aggregates are grouped by.
-        if aggregated {
+        if !self.group_by.is_empty() {
+            let grouped: Vec<String> = self.group_by.iter().map(|c| c.sql(d)).collect();
+            let _ = write!(sql, "\n{indent}GROUP BY {}", grouped.join(", "));
+        } else if aggregated {
+            // Columns shown next to aggregates are grouped by.
             let grouped: Vec<String> = self
                 .columns
                 .iter()
@@ -433,13 +459,25 @@ impl SelectPart {
                 let _ = write!(sql, "\n{indent}GROUP BY {}", grouped.join(", "));
             }
         }
-        sql.push_str(&order_and_limit(d, &self.order_by, self.limit, indent));
+        sql.push_str(&order_and_limit(
+            d,
+            &self.order_by,
+            self.limit,
+            self.offset,
+            indent,
+        ));
         Ok(sql)
     }
 }
 
 /// `ORDER BY …` and `LIMIT n`, each on its own line, or nothing.
-fn order_and_limit(d: Dialect, order: &[OrderItem], limit: Option<u64>, indent: &str) -> String {
+fn order_and_limit(
+    d: Dialect,
+    order: &[OrderItem],
+    limit: Option<u64>,
+    offset: Option<u64>,
+    indent: &str,
+) -> String {
     let mut sql = String::new();
     if !order.is_empty() {
         let items: Vec<String> = order
@@ -454,10 +492,97 @@ fn order_and_limit(d: Dialect, order: &[OrderItem], limit: Option<u64>, indent: 
             .collect();
         let _ = write!(sql, "\n{indent}ORDER BY {}", items.join(", "));
     }
-    if let Some(limit) = limit {
-        let _ = write!(sql, "\n{indent}LIMIT {limit}");
-    }
+    sql.push_str(&limit_sql(d, limit, offset, indent));
     sql
+}
+
+/// `LIMIT n OFFSET m` on a line of its own, or nothing. MySQL and SQLite need a limit to
+/// skip rows, so an offset alone gets the largest one they take.
+fn limit_sql(d: Dialect, limit: Option<u64>, offset: Option<u64>, indent: &str) -> String {
+    let offset = offset.filter(|&o| o > 0);
+    match (limit, offset) {
+        (None, None) => String::new(),
+        (Some(limit), None) => format!("\n{indent}LIMIT {limit}"),
+        (Some(limit), Some(offset)) => format!("\n{indent}LIMIT {limit} OFFSET {offset}"),
+        (None, Some(offset)) => match d {
+            Dialect::Postgres => format!("\n{indent}OFFSET {offset}"),
+            Dialect::MySql => format!("\n{indent}LIMIT 18446744073709551615 OFFSET {offset}"),
+            Dialect::Sqlite => format!("\n{indent}LIMIT -1 OFFSET {offset}"),
+        },
+    }
+}
+
+/// `column` compared as `text` says, or `None` when it's empty:
+///
+/// - starting with an operator (`=`, `<>`, `!=`, `<`, `<=`, `>`, `>=`): that comparison, with
+///   the rest as a value;
+/// - starting with `LIKE`, `NOT LIKE`, `IN`, `NOT IN`: that, with the value or list quoted as
+///   needed;
+/// - starting with `IS` or `BETWEEN` (or `NOT BETWEEN`): used as written;
+/// - anything else: equal to it.
+///
+/// Values are quoted unless they're numbers, `NULL`, already quoted, or contain `(` (a
+/// function call such as `now()`).
+pub fn criteria_sql(d: Dialect, column: &str, text: &str) -> Option<String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let upper = text.to_ascii_uppercase();
+    let starts = |word: &str| {
+        upper.starts_with(word)
+            && upper[word.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| c.is_whitespace() || c == '(' || c == '\'')
+    };
+    for word in ["IS", "BETWEEN", "NOT BETWEEN"] {
+        if starts(word) {
+            return Some(format!("{column} {text}"));
+        }
+    }
+    for word in ["NOT LIKE", "LIKE"] {
+        if starts(word) {
+            let value = criteria_value(d, text[word.len()..].trim());
+            return Some(format!("{column} {word} {value}"));
+        }
+    }
+    for word in ["NOT IN", "IN"] {
+        if starts(word) {
+            let list = text[word.len()..].trim();
+            let inner = list
+                .strip_prefix('(')
+                .and_then(|l| l.strip_suffix(')'))
+                .unwrap_or(list);
+            let items: Vec<String> = inner
+                .split(',')
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(|v| criteria_value(d, v))
+                .collect();
+            return Some(format!("{column} {word} ({})", items.join(", ")));
+        }
+    }
+    for op in ["<>", "!=", "<=", ">=", "=", "<", ">"] {
+        if let Some(rest) = text.strip_prefix(op) {
+            return Some(format!("{column} {op} {}", criteria_value(d, rest.trim())));
+        }
+    }
+    Some(format!("{column} = {}", criteria_value(d, text)))
+}
+
+/// A criteria value: kept for numbers, `NULL`, quoted text and calls; otherwise quoted.
+fn criteria_value(d: Dialect, value: &str) -> String {
+    let is_quoted = value.len() >= 2 && value.starts_with('\'') && value.ends_with('\'');
+    if is_quoted
+        || value.contains('(')
+        || value.eq_ignore_ascii_case("null")
+        || value.parse::<f64>().is_ok_and(f64::is_finite)
+    {
+        value.to_owned()
+    } else {
+        d.quote_str(value)
+    }
 }
 
 /// A value as SQL: see [`Condition::value`].
@@ -536,6 +661,7 @@ pub struct Query {
     /// applied to the combined result.
     pub order_by: Vec<(usize, bool)>,
     pub limit: Option<u64>,
+    pub offset: Option<u64>,
 }
 
 impl Query {
@@ -550,7 +676,7 @@ impl Query {
         // Per-part sorting and limits would need parentheses, which SQLite doesn't accept.
         if parts
             .iter()
-            .any(|p| !p.order_by.is_empty() || p.limit.is_some())
+            .any(|p| !p.order_by.is_empty() || p.limit.is_some() || p.offset.is_some())
         {
             return Err(
                 "In a combined query, sort and limit the whole result, not each part.".into(),
@@ -591,9 +717,7 @@ impl Query {
                 .collect::<Result<_, _>>()?;
             let _ = write!(sql, "\nORDER BY {}", items.join(", "));
         }
-        if let Some(limit) = self.limit {
-            let _ = write!(sql, "\nLIMIT {limit}");
-        }
+        sql.push_str(&limit_sql(d, self.limit, self.offset, ""));
         Ok(sql)
     }
 }
@@ -815,6 +939,7 @@ mod tests {
             rest: vec![(SetOperator::UnionAll, part("suppliers", &["name", "email"]))],
             order_by: vec![(1, false), (2, true)],
             limit: Some(10),
+            offset: None,
         };
         assert_eq!(
             query.sql(Dialect::Sqlite, "main").unwrap(),
@@ -839,6 +964,75 @@ mod tests {
                 .unwrap_err()
                 .contains("Add a table")
         );
+    }
+
+    #[test]
+    fn criteria_read_like_a_query_grid() {
+        let c = |text: &str| criteria_sql(M, "`a`.`x`", text);
+        assert_eq!(c(""), None);
+        assert_eq!(c("Elvis").unwrap(), "`a`.`x` = 'Elvis'");
+        assert_eq!(c("42").unwrap(), "`a`.`x` = 42");
+        assert_eq!(c("> 100").unwrap(), "`a`.`x` > 100");
+        assert_eq!(c(">=now()").unwrap(), "`a`.`x` >= now()");
+        assert_eq!(c("<> it's").unwrap(), "`a`.`x` <> 'it\\'s'");
+        assert_eq!(c("Like 'Elvis%'").unwrap(), "`a`.`x` LIKE 'Elvis%'");
+        assert_eq!(c("not like Elvis%").unwrap(), "`a`.`x` NOT LIKE 'Elvis%'");
+        assert_eq!(
+            c("IN (1, two, 'three')").unwrap(),
+            "`a`.`x` IN (1, 'two', 'three')"
+        );
+        assert_eq!(c("not in a,b").unwrap(), "`a`.`x` NOT IN ('a', 'b')");
+        assert_eq!(c("IS NOT NULL").unwrap(), "`a`.`x` IS NOT NULL");
+        assert_eq!(c("between 1 and 5").unwrap(), "`a`.`x` between 1 and 5");
+        // A value that merely starts with a keyword is still a value.
+        assert_eq!(c("Island").unwrap(), "`a`.`x` = 'Island'");
+        assert_eq!(c("Inca").unwrap(), "`a`.`x` = 'Inca'");
+    }
+
+    #[test]
+    fn grid_parts_grouping_offset_and_star() {
+        let mut part = SelectPart::default();
+        part.add_table("orders", &shop_fks);
+        part.add_table("customers", &shop_fks);
+        part.columns = vec![
+            SelectItem::column(ColumnRef::new("c", "*")),
+            SelectItem {
+                aggregate: Some(Aggregate::Sum),
+                ..SelectItem::column(ColumnRef::new("o", "total"))
+            },
+        ];
+        part.criteria = vec![
+            Criterion {
+                column: ColumnRef::new("c", "name"),
+                text: "Like 'A%'".into(),
+            },
+            Criterion {
+                column: ColumnRef::new("o", "total"),
+                text: "  ".into(),
+            },
+        ];
+        part.group_by = vec![ColumnRef::new("c", "id")];
+        part.limit = Some(10);
+        part.offset = Some(20);
+        assert_eq!(
+            part.sql(M, "shop", "").unwrap(),
+            "SELECT\n  `c`.*,\n  SUM(`o`.`total`)\nFROM `shop`.`orders` AS `o`\
+             \n  INNER JOIN `shop`.`customers` AS `c` ON `o`.`customer_id` = `c`.`id`\
+             \nWHERE `c`.`name` LIKE 'A%'\nGROUP BY `c`.`id`\nLIMIT 10 OFFSET 20"
+        );
+        part.limit = None;
+        for (d, expected) in [
+            (M, "LIMIT 18446744073709551615 OFFSET 20"),
+            (Dialect::Sqlite, "LIMIT -1 OFFSET 20"),
+            (P, "OFFSET 20"),
+        ] {
+            assert!(
+                part.sql(d, "shop", "").unwrap().ends_with(expected),
+                "{d:?}"
+            );
+        }
+        part.remove_table("c");
+        assert_eq!((part.criteria.len(), part.group_by.len()), (1, 0));
     }
 
     #[test]

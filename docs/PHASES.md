@@ -152,12 +152,16 @@ Phase 5 is complete.
 
 ## Phase 6: Visual tools
 
-- ✅ Query builder (right-click a database or table → "Query builder…"): tables joined on
-  their foreign keys, with the join type and matched columns editable; ticked columns with
-  aggregates (automatic GROUP BY) and aliases; WHERE conditions; sorting and a limit; and
-  further queries combined with UNION, UNION ALL, INTERSECT or EXCEPT. Live SQL preview;
-  "Open in editor" or "Run". The generated SQL is tested on MySQL, MariaDB, PostgreSQL and
-  SQLite.
+- ✅ Visual query builder (right-click a database or table → "Query builder…"), in a window
+  of its own. Tables from a searchable list become boxes on a canvas: tick columns (or `*`)
+  to select them, and drag from a column to another table's column to join on it; foreign
+  keys are joined automatically, and new boxes are placed beside the table they join. Each
+  join line has a marker to change its kind (INNER, LEFT, RIGHT, FULL where supported) or
+  remove it. A grid sets each column's output, alias, sort type and order, aggregate,
+  grouping and criteria (`> 100`, `LIKE 'a%'`, `IS NULL`, or a value). Distinct, limit and
+  offset; further queries combined with UNION, UNION ALL, INTERSECT or EXCEPT in tabs. Live
+  SQL; "Open in editor" or "Run" in the connection's window. The generated SQL is tested on
+  MySQL, MariaDB, PostgreSQL and SQLite.
 - ✅ ER diagram (right-click a database → "ER diagram…"), in a window of its own: tables as
   boxes listing their columns (primary keys `#`, foreign keys `→`), lines between key
   columns. Laid out automatically: referenced tables left of the tables referring to them,
