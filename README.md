@@ -6,6 +6,8 @@ OpenViSQL connects to **MySQL** and **MariaDB** today; **SQLite** and **PostgreS
 The layout is the classic one for MySQL tools: an object browser on the left, query tabs on
 the right, and results below.
 
+![OpenViSQL: object browser, query tabs, SQL editor and result grid](docs/images/screenshot.png)
+
 ## Features
 
 - Several connections open at once as tabs across the top, with tabs that shrink to fit. The
