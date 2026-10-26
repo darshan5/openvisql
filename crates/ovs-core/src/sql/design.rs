@@ -20,10 +20,81 @@ pub struct ColumnDef {
     pub original_name: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum IndexKind {
+    #[default]
+    Index,
+    Unique,
+    Fulltext,
+    Spatial,
+}
+
+impl IndexKind {
+    pub const ALL: [Self; 4] = [Self::Index, Self::Unique, Self::Fulltext, Self::Spatial];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Index => "INDEX",
+            Self::Unique => "UNIQUE",
+            Self::Fulltext => "FULLTEXT",
+            Self::Spatial => "SPATIAL",
+        }
+    }
+}
+
+/// A secondary index (the primary key is kept on the columns).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct IndexDef {
+    pub name: String,
+    pub kind: IndexKind,
+    /// Column names, optionally with a prefix length: `name` or `name(10)`.
+    pub columns: Vec<String>,
+    /// The index's name in the existing table; `None` for a new index.
+    pub original_name: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TableDesign {
     pub name: String,
     pub columns: Vec<ColumnDef>,
+    pub indexes: Vec<IndexDef>,
+}
+
+/// `col` or `col(10)` quoted as `` `col` `` / `` `col`(10) ``.
+fn index_column_sql(d: Dialect, column: &str) -> String {
+    let column = column.trim();
+    match column.split_once('(') {
+        Some((name, rest)) if rest.ends_with(')') => {
+            format!("{}({rest}", d.quote_ident(name.trim()))
+        }
+        _ => d.quote_ident(column),
+    }
+}
+
+/// The column an index part refers to, without any prefix length.
+fn index_column_name(column: &str) -> &str {
+    column
+        .split_once('(')
+        .map_or(column, |(name, _)| name)
+        .trim()
+}
+
+/// `UNIQUE INDEX name (a, b)` as used in `CREATE TABLE` and `ADD`.
+pub fn index_sql(d: Dialect, index: &IndexDef) -> String {
+    let cols: Vec<String> = index
+        .columns
+        .iter()
+        .map(|c| index_column_sql(d, c))
+        .collect();
+    let kind = match index.kind {
+        IndexKind::Index => "INDEX".to_owned(),
+        other => format!("{} INDEX", other.label()),
+    };
+    format!(
+        "{kind} {} ({})",
+        d.quote_ident(&index.name),
+        cols.join(", ")
+    )
 }
 
 /// Defaults that are expressions rather than literal values.
@@ -64,9 +135,50 @@ impl TableDesign {
                 }
             })
             .collect();
+        let indexes = indexes
+            .iter()
+            .filter(|i| !i.is_primary())
+            .map(|i| IndexDef {
+                name: i.name.clone(),
+                kind: match i.index_type.to_ascii_uppercase().as_str() {
+                    "FULLTEXT" => IndexKind::Fulltext,
+                    "SPATIAL" => IndexKind::Spatial,
+                    _ if i.unique => IndexKind::Unique,
+                    _ => IndexKind::Index,
+                },
+                columns: i.columns.clone(),
+                original_name: Some(i.name.clone()),
+            })
+            .collect();
         Self {
             name: name.to_owned(),
             columns,
+            indexes,
+        }
+    }
+
+    /// Points index columns at renamed columns: an index that names a column by its old name
+    /// follows the rename, as the server does.
+    pub fn follow_renames(&mut self) {
+        let renames: Vec<(String, String)> = self
+            .columns
+            .iter()
+            .filter_map(|c| {
+                let old = c.original_name.as_ref()?;
+                (old != &c.name).then(|| (old.clone(), c.name.clone()))
+            })
+            .collect();
+        let current: Vec<String> = self.columns.iter().map(|c| c.name.to_lowercase()).collect();
+        for index in &mut self.indexes {
+            for column in &mut index.columns {
+                let name = index_column_name(column).to_owned();
+                if current.contains(&name.to_lowercase()) {
+                    continue;
+                }
+                if let Some((_, new)) = renames.iter().find(|(old, _)| *old == name) {
+                    *column = column.replacen(&name, new, 1);
+                }
+            }
         }
     }
 
@@ -100,6 +212,27 @@ impl TableDesign {
         }
         if self.columns.iter().filter(|c| c.auto_increment).count() > 1 {
             return Err("Only one column can be AUTO_INCREMENT.".into());
+        }
+        let mut index_names = std::collections::HashSet::new();
+        for index in &self.indexes {
+            if index.name.trim().is_empty() {
+                return Err("Every index needs a name.".into());
+            }
+            if index.name.eq_ignore_ascii_case("PRIMARY") {
+                return Err("Mark primary key columns with PK instead of an index.".into());
+            }
+            if !index_names.insert(index.name.to_lowercase()) {
+                return Err(format!("Index {} appears twice.", index.name));
+            }
+            if index.columns.is_empty() {
+                return Err(format!("Index {} needs at least one column.", index.name));
+            }
+            for column in &index.columns {
+                let name = index_column_name(column);
+                if !seen.contains(&name.to_lowercase()) {
+                    return Err(format!("Index {} uses unknown column {name}.", index.name));
+                }
+            }
         }
         Ok(())
     }
@@ -139,6 +272,12 @@ pub fn create_sql(d: Dialect, db: &str, design: &TableDesign) -> String {
         let cols: Vec<String> = pk.iter().map(|c| d.quote_ident(c)).collect();
         lines.push(format!("  PRIMARY KEY ({})", cols.join(", ")));
     }
+    lines.extend(
+        design
+            .indexes
+            .iter()
+            .map(|i| format!("  {}", index_sql(d, i))),
+    );
     format!(
         "CREATE TABLE {} (\n{}\n)",
         d.qualified(db, &design.name),
@@ -156,7 +295,33 @@ pub fn alter_sql(
 ) -> Option<String> {
     let mut clauses = Vec::new();
 
-    // Dropped columns first, so a new column may reuse a dropped name.
+    // Indexes that went away or changed are dropped before any column, so dropping a column
+    // can't remove an index this statement still refers to; changed ones are re-added last.
+    let mut added_indexes = Vec::new();
+    for old in &before.indexes {
+        let new = after
+            .indexes
+            .iter()
+            .find(|i| i.original_name.as_deref() == Some(old.name.as_str()));
+        let mut renamed_old = before.clone();
+        renamed_old.columns.clone_from(&after.columns);
+        renamed_old.indexes = vec![old.clone()];
+        renamed_old.follow_renames();
+        let unchanged = new.is_some_and(|new| {
+            new.name == old.name
+                && new.kind == old.kind
+                && new.columns == renamed_old.indexes[0].columns
+        });
+        if !unchanged {
+            clauses.push(format!("DROP INDEX {}", d.quote_ident(&old.name)));
+            if let Some(new) = new {
+                added_indexes.push(new);
+            }
+        }
+    }
+    added_indexes.extend(after.indexes.iter().filter(|i| i.original_name.is_none()));
+
+    // Dropped columns next, so a new column may reuse a dropped name.
     for old in &before.columns {
         let kept = after
             .columns
@@ -232,6 +397,9 @@ pub fn alter_sql(
             .collect();
         clauses.push(format!("ADD PRIMARY KEY ({})", cols.join(", ")));
     }
+    for index in added_indexes {
+        clauses.push(format!("ADD {}", index_sql(d, index)));
+    }
     if before.name != after.name {
         clauses.push(format!("RENAME TO {}", d.qualified(db, &after.name)));
     }
@@ -277,7 +445,63 @@ mod tests {
                     ..col("name", "VARCHAR(40)")
                 },
             ],
+            indexes: Vec::new(),
         }
+    }
+
+    fn index(name: &str, kind: IndexKind, columns: &[&str]) -> IndexDef {
+        IndexDef {
+            name: name.into(),
+            kind,
+            columns: columns.iter().map(|c| (*c).to_owned()).collect(),
+            original_name: Some(name.into()),
+        }
+    }
+
+    #[test]
+    fn creates_and_alters_indexes() {
+        let mut t = table();
+        t.indexes.push(IndexDef {
+            original_name: None,
+            ..index("by_name", IndexKind::Unique, &["name(10)", "id"])
+        });
+        assert!(
+            create_sql(D, "s", &t)
+                .ends_with("PRIMARY KEY (`id`),\n  UNIQUE INDEX `by_name` (`name`(10), `id`)\n)")
+        );
+
+        let mut before = table();
+        before.indexes = vec![
+            index("keep", IndexKind::Index, &["name"]),
+            index("gone", IndexKind::Index, &["id", "name"]),
+            index("widen", IndexKind::Index, &["name"]),
+        ];
+        let mut after = before.clone();
+        // Renaming a column carries the index along without touching it.
+        after.columns[1].name = "label".into();
+        after.follow_renames();
+        assert_eq!(after.indexes[0].columns, ["label"]);
+        after.indexes.remove(1);
+        after.indexes[1].columns.push("id".into());
+        after.indexes.push(IndexDef {
+            original_name: None,
+            ..index("ft", IndexKind::Fulltext, &["label"])
+        });
+        let sql = alter_sql(D, "s", &before, &after).unwrap();
+        assert!(!sql.contains("`keep`"), "{sql}");
+        assert!(
+            sql.starts_with("ALTER TABLE `s`.`t`\n  DROP INDEX `gone`,\n  DROP INDEX `widen`,"),
+            "{sql}"
+        );
+        assert!(
+            sql.ends_with(
+                "ADD INDEX `widen` (`label`, `id`),\n  ADD FULLTEXT INDEX `ft` (`label`)"
+            ),
+            "{sql}"
+        );
+        assert!(after.validate().is_ok());
+        after.indexes[0].columns = vec!["nope".into()];
+        assert!(after.validate().unwrap_err().contains("unknown column"));
     }
 
     #[test]
@@ -358,16 +582,28 @@ mod tests {
                 ..ColumnInfo::default()
             },
         ];
-        let indexes = [IndexInfo {
-            name: "PRIMARY".into(),
-            columns: vec!["id".into()],
-            unique: true,
-            index_type: "BTREE".into(),
-        }];
+        let indexes = [
+            IndexInfo {
+                name: "PRIMARY".into(),
+                columns: vec!["id".into()],
+                unique: true,
+                index_type: "BTREE".into(),
+            },
+            IndexInfo {
+                name: "by_status".into(),
+                columns: vec!["status".into(), "at".into()],
+                unique: true,
+                index_type: "BTREE".into(),
+            },
+        ];
         let design = TableDesign::from_table("t", &columns, &indexes);
         assert!(design.columns[0].primary_key && design.columns[0].auto_increment);
         assert_eq!(design.columns[1].default_sql, "'new'");
         assert_eq!(design.columns[2].default_sql, "CURRENT_TIMESTAMP");
+        assert_eq!(
+            design.indexes,
+            [index("by_status", IndexKind::Unique, &["status", "at"])]
+        );
         assert!(design.validate().is_ok());
     }
 

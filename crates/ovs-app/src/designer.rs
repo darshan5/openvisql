@@ -9,6 +9,7 @@ use gpui_kit::component::{
     checkbox::Checkbox,
     h_flex,
     input::{Input, InputEvent, InputState},
+    menu::{DropdownMenu as _, PopupMenuItem},
     v_flex,
 };
 use gpui_kit::{
@@ -17,7 +18,7 @@ use gpui_kit::{
     Subscription, Window, div, px,
 };
 use ovs_core::sql::Dialect;
-use ovs_core::sql::design::{ColumnDef, TableDesign, alter_sql, create_sql};
+use ovs_core::sql::design::{ColumnDef, IndexDef, IndexKind, TableDesign, alter_sql, create_sql};
 
 use crate::runtime::{self, SharedSession};
 
@@ -36,12 +37,22 @@ struct Row {
     original_name: Option<String>,
 }
 
+struct IndexRow {
+    id: usize,
+    name: Entity<InputState>,
+    kind: IndexKind,
+    /// Comma-separated column names, e.g. `name(10), id`.
+    columns: Entity<InputState>,
+    original_name: Option<String>,
+}
+
 pub struct TableDesigner {
     db: String,
     /// The table as loaded; `None` when creating a new table.
     original: Option<TableDesign>,
     name: Entity<InputState>,
     rows: Vec<Row>,
+    indexes: Vec<IndexRow>,
     next_id: usize,
     subscriptions: Vec<Subscription>,
 }
@@ -62,6 +73,7 @@ impl TableDesigner {
                 auto_increment: true,
                 ..ColumnDef::default()
             }],
+            indexes: Vec::new(),
         });
         let name = cx.new(|cx| InputState::new(window, cx).default_value(start.name.clone()));
         let mut designer = Self {
@@ -69,12 +81,16 @@ impl TableDesigner {
             original,
             name: name.clone(),
             rows: Vec::new(),
+            indexes: Vec::new(),
             next_id: 0,
             subscriptions: Vec::new(),
         };
         designer.watch(&name, cx);
         for column in start.columns {
             designer.push_row(column, window, cx);
+        }
+        for index in start.indexes {
+            designer.push_index(index, window, cx);
         }
         designer
     }
@@ -118,6 +134,30 @@ impl TableDesigner {
         cx.notify();
     }
 
+    fn push_index(&mut self, index: IndexDef, window: &mut Window, cx: &mut Context<Self>) {
+        let name = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("index name")
+                .default_value(index.name)
+        });
+        let columns = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("col_a, col_b(10)")
+                .default_value(index.columns.join(", "))
+        });
+        self.watch(&name, cx);
+        self.watch(&columns, cx);
+        self.indexes.push(IndexRow {
+            id: self.next_id,
+            name,
+            kind: index.kind,
+            columns,
+            original_name: index.original_name,
+        });
+        self.next_id += 1;
+        cx.notify();
+    }
+
     fn design(&self, cx: &App) -> TableDesign {
         let text = |input: &Entity<InputState>| input.read(cx).value().trim().to_owned();
         TableDesign {
@@ -136,12 +176,31 @@ impl TableDesigner {
                     original_name: row.original_name.clone(),
                 })
                 .collect(),
+            indexes: self
+                .indexes
+                .iter()
+                .map(|index| IndexDef {
+                    name: text(&index.name),
+                    kind: index.kind,
+                    columns: index
+                        .columns
+                        .read(cx)
+                        .value()
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|c| !c.is_empty())
+                        .map(str::to_owned)
+                        .collect(),
+                    original_name: index.original_name.clone(),
+                })
+                .collect(),
         }
     }
 
     /// The statement to run: `Ok(None)` when an existing table is unchanged.
     fn sql(&self, cx: &App) -> Result<Option<String>, String> {
-        let design = self.design(cx);
+        let mut design = self.design(cx);
+        design.follow_renames();
         design.validate()?;
         Ok(match &self.original {
             None => Some(create_sql(Dialect::MySql, &self.db, &design)),
@@ -227,6 +286,50 @@ impl TableDesigner {
     }
 }
 
+impl TableDesigner {
+    fn render_index(ix: usize, index: &IndexRow, cx: &mut Context<Self>) -> impl IntoElement {
+        let this = cx.entity().downgrade();
+        h_flex()
+            .gap_1()
+            .child(div().w(px(180.)).child(Input::new(&index.name).xsmall()))
+            .child(
+                Button::new(("kind", index.id))
+                    .xsmall()
+                    .outline()
+                    .w(px(96.))
+                    .label(index.kind.label())
+                    .dropdown_menu(move |menu, _, _| {
+                        IndexKind::ALL.into_iter().fold(menu, |menu, kind| {
+                            let this = this.clone();
+                            menu.item(PopupMenuItem::new(kind.label()).on_click(move |_, _, cx| {
+                                this.update(cx, |this, cx| {
+                                    if let Some(index) = this.indexes.get_mut(ix) {
+                                        index.kind = kind;
+                                    }
+                                    cx.notify();
+                                })
+                                .ok();
+                            }))
+                        })
+                    }),
+            )
+            .child(div().flex_1().child(Input::new(&index.columns).xsmall()))
+            .child(
+                Button::new(("remove-index", index.id))
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::Close)
+                    .tooltip("Remove index")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if ix < this.indexes.len() {
+                            this.indexes.remove(ix);
+                        }
+                        cx.notify();
+                    })),
+            )
+    }
+}
+
 impl Render for TableDesigner {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
@@ -247,6 +350,12 @@ impl Render for TableDesigner {
             .iter()
             .enumerate()
             .map(|(ix, row)| Self::render_row(ix, row, cx).into_any_element())
+            .collect();
+        let indexes: Vec<_> = self
+            .indexes
+            .iter()
+            .enumerate()
+            .map(|(ix, index)| Self::render_index(ix, index, cx).into_any_element())
             .collect();
         v_flex()
             .gap_2()
@@ -290,6 +399,44 @@ impl Render for TableDesigner {
                                     data_type: "VARCHAR(100)".into(),
                                     nullable: true,
                                     ..ColumnDef::default()
+                                },
+                                window,
+                                cx,
+                            );
+                        })),
+                ),
+            )
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(header("Index", Some(180.)))
+                    .child(header("Kind", Some(96.)))
+                    .child(header(
+                        "Columns (comma-separated, optional prefix length)",
+                        None,
+                    ))
+                    .child(div().w(px(28.))),
+            )
+            .child(
+                v_flex()
+                    .id("designer-indexes")
+                    .gap_1()
+                    .max_h(px(160.))
+                    .overflow_y_scroll()
+                    .children(indexes),
+            )
+            .child(
+                h_flex().child(
+                    Button::new("add-index")
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::Plus)
+                        .label("Index")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.push_index(
+                                IndexDef {
+                                    name: format!("idx_{}", this.indexes.len() + 1),
+                                    ..IndexDef::default()
                                 },
                                 window,
                                 cx,

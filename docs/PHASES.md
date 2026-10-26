@@ -84,7 +84,9 @@ Phase 2 is complete.
 - Create/Alter Table designer:
   - ✅ Columns (name, type, NULL, primary key, auto-increment, default, comment, order) with a
     live `CREATE TABLE` / `ALTER TABLE` preview; opened from the object browser.
-  - Indexes, foreign keys, checks and advanced options (engine, charset).
+  - ✅ Indexes (INDEX, UNIQUE, FULLTEXT, SPATIAL, prefix lengths); renamed columns carry
+    their indexes along.
+  - Foreign keys, checks and advanced options (engine, charset).
 - ✅ SQL dump backup and restore (run script) with abort-on-error.
 - ✅ Import CSV (batched `INSERT`s in one transaction, rolled back on error).
 - ✅ Process list, variables and status views. User manager still to do.

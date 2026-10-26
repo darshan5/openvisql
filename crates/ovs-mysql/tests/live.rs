@@ -601,7 +601,9 @@ async fn csv_import_inserts_and_rolls_back_on_error() {
 #[tokio::test]
 async fn table_designer_sql_runs() {
     use ovs_core::sql::Dialect;
-    use ovs_core::sql::design::{ColumnDef, TableDesign, alter_sql, create_sql};
+    use ovs_core::sql::design::{
+        ColumnDef, IndexDef, IndexKind, TableDesign, alter_sql, create_sql,
+    };
 
     let Some((mut s, db)) = scratch("designer").await else {
         return;
@@ -637,6 +639,19 @@ async fn table_designer_sql_runs() {
                 ..ColumnDef::default()
             },
         ],
+        indexes: vec![
+            IndexDef {
+                name: "by_label".into(),
+                columns: vec!["label".into()],
+                ..IndexDef::default()
+            },
+            IndexDef {
+                name: "by_legacy".into(),
+                kind: IndexKind::Unique,
+                columns: vec!["legacy".into(), "created".into()],
+                ..IndexDef::default()
+            },
+        ],
     };
     s.execute(&create_sql(Dialect::MySql, &db, &new_table), None)
         .await
@@ -663,6 +678,8 @@ async fn table_designer_sql_runs() {
     after.columns[1].name = "title".into();
     after.columns[1].data_type = "VARCHAR(100)".into();
     after.columns.retain(|c| c.name != "legacy");
+    after.indexes.retain(|i| i.name != "by_legacy");
+    after.follow_renames();
     after.columns.insert(
         1,
         ColumnDef {
@@ -690,6 +707,8 @@ async fn table_designer_sql_runs() {
             .starts_with("varchar(100)")
     );
     assert_eq!(reloaded.columns[2].comment, "shown to users");
+    assert_eq!(reloaded.indexes.len(), 1);
+    assert_eq!(reloaded.indexes[0].columns, ["title"]);
     // The data survived the rename.
     let out = s
         .execute("SELECT title FROM items ORDER BY id", None)
@@ -712,5 +731,44 @@ async fn table_designer_sql_runs() {
     let idx = s.list_indexes(&db, "items").await.unwrap();
     let pk = idx.iter().find(|i| i.is_primary()).unwrap();
     assert_eq!(pk.columns, ["id", "sku"]);
+
+    // Widen an index and add prefix and full-text ones.
+    let current = load(s.list_columns(&db, "items").await.unwrap(), idx);
+    let mut indexed = current.clone();
+    indexed.indexes[0].columns.push("created".into());
+    indexed.indexes.push(IndexDef {
+        name: "sku_prefix".into(),
+        kind: IndexKind::Unique,
+        columns: vec!["sku(5)".into(), "id".into()],
+        original_name: None,
+    });
+    indexed.indexes.push(IndexDef {
+        name: "title_text".into(),
+        kind: IndexKind::Fulltext,
+        columns: vec!["title".into()],
+        original_name: None,
+    });
+    let sql = alter_sql(Dialect::MySql, &db, &current, &indexed).unwrap();
+    s.execute(&sql, None)
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+    let final_design = load(
+        s.list_columns(&db, "items").await.unwrap(),
+        s.list_indexes(&db, "items").await.unwrap(),
+    );
+    let mut kinds: Vec<(String, IndexKind, usize)> = final_design
+        .indexes
+        .iter()
+        .map(|i| (i.name.clone(), i.kind, i.columns.len()))
+        .collect();
+    kinds.sort();
+    assert_eq!(
+        kinds,
+        [
+            ("by_label".to_owned(), IndexKind::Index, 2),
+            ("sku_prefix".to_owned(), IndexKind::Unique, 2),
+            ("title_text".to_owned(), IndexKind::Fulltext, 1),
+        ]
+    );
     cleanup(s, &db).await;
 }
