@@ -955,6 +955,22 @@ impl QueryBuilder {
             .gap_3()
             .border_b_1()
             .border_color(cx.theme().border)
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_base()
+                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                            .child("Query builder"),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(self.db.clone()),
+                    ),
+            )
             .child(div().flex_1())
             .child(
                 Checkbox::new("distinct")
@@ -986,6 +1002,14 @@ impl QueryBuilder {
                     .icon(IconName::Play)
                     .label("Run")
                     .on_click(cx.listener(|this, _, _, cx| this.finish(true, cx))),
+            )
+            .child(
+                Button::new("builder-close")
+                    .ghost()
+                    .small()
+                    .icon(IconName::Close)
+                    .tooltip("Close the query builder")
+                    .on_click(|_, window, _| window.remove_window()),
             )
             .into_any_element()
     }

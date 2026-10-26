@@ -313,9 +313,21 @@ impl Render for DiagramView {
                     .gap_2()
                     .border_b_1()
                     .border_color(cx.theme().border)
-                    .child(div().text_sm().child(SharedString::from(format!(
-                        "{count} tables, {links} relationships"
-                    ))))
+                    .child(
+                        div()
+                            .text_base()
+                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                            .child("ER diagram"),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(SharedString::from(format!(
+                                "{} · {count} tables, {links} relationships",
+                                self.db
+                            ))),
+                    )
                     .child(div().flex_1())
                     .child(
                         Button::new("zoom-out")
@@ -364,6 +376,14 @@ impl Render for DiagramView {
                             .small()
                             .label("Export SVG…")
                             .on_click(cx.listener(|this, _, window, cx| this.export(window, cx))),
+                    )
+                    .child(
+                        Button::new("diagram-close")
+                            .ghost()
+                            .small()
+                            .icon(IconName::Close)
+                            .tooltip("Close the diagram")
+                            .on_click(|_, window, _| window.remove_window()),
                     ),
             )
             .child(
