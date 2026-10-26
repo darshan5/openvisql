@@ -76,10 +76,16 @@ pub struct ResultGrid {
     on_open_value: Option<OpenValue>,
     /// Set for process-list results.
     on_kill: Option<KillProcess>,
+    /// The connection's SQL dialect, for "Copy all as SQL INSERT".
+    dialect: ovs_core::sql::Dialect,
 }
 
 impl ResultGrid {
-    pub fn new(data: Arc<ResultSet>, editability: Editability) -> Self {
+    pub fn new(
+        data: Arc<ResultSet>,
+        editability: Editability,
+        dialect: ovs_core::sql::Dialect,
+    ) -> Self {
         let columns = data
             .columns
             .iter()
@@ -101,6 +107,7 @@ impl ResultGrid {
             server_sort: None,
             on_open_value: None,
             on_kill: None,
+            dialect,
         }
     }
 
@@ -543,11 +550,13 @@ impl TableDelegate for ResultGrid {
             rows: order.iter().map(|&r| data.rows[r].clone()).collect(),
             truncated: data.truncated,
         });
+        let dialect = self.dialect;
         let copy_as = |format: ExportFormat| {
             let ordered = ordered.clone();
             move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| {
                 let options = ExportOptions {
                     format,
+                    dialect,
                     ..ExportOptions::default()
                 };
                 cx.write_to_clipboard(ClipboardItem::new_string(export_to_string(

@@ -723,6 +723,7 @@ impl QueryTab {
         cx: &mut Context<Self>,
     ) {
         let n = self.results.len() + 1;
+        let dialect = self.config.engine.dialect();
         let rows = rs.rows.len();
         let truncated = rs.truncated;
         let source = limits.source_sql.clone().zip(single_source_table(&rs));
@@ -742,11 +743,15 @@ impl QueryTab {
             Editability::ReadOnly("the result doesn't come from a table".into())
         };
         let table = cx.new(|cx| {
-            TableState::new(ResultGrid::new(Arc::new(rs), editability), window, cx)
-                .col_resizable(true)
-                .col_movable(false)
-                .sortable(true)
-                .cell_selectable(true)
+            TableState::new(
+                ResultGrid::new(Arc::new(rs), editability, dialect),
+                window,
+                cx,
+            )
+            .col_resizable(true)
+            .col_movable(false)
+            .sortable(true)
+            .cell_selectable(true)
         });
         let events = cx.subscribe_in(
             &table,
@@ -977,6 +982,7 @@ impl QueryTab {
         cx: &mut Context<Self>,
     ) {
         let rows = rs.rows.len();
+        let dialect = self.config.engine.dialect();
         let Some(ix) = self.results.iter().position(|r| &r.table == table) else {
             return;
         };
@@ -1005,7 +1011,7 @@ impl QueryTab {
                 table.delegate_mut().editability_mut(),
                 Editability::Checking,
             );
-            let mut grid = ResultGrid::new(Arc::new(rs), editability);
+            let mut grid = ResultGrid::new(Arc::new(rs), editability, dialect);
             if let Some((col, dir)) = sorted {
                 grid = grid.with_sort(col, dir);
             }
