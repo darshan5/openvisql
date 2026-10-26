@@ -339,6 +339,7 @@ mod tests {
             unique,
             index_type: "BTREE".into(),
             prefix_lengths: Vec::new(),
+            constraint_name: String::new(),
         }
     }
 

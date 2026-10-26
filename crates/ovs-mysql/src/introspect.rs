@@ -136,6 +136,7 @@ pub(crate) async fn indexes(s: &mut MySqlSession, db: &str, table: &str) -> Resu
                 columns: vec![column],
                 name,
                 prefix_lengths: Vec::new(),
+                constraint_name: String::new(),
             });
             out.last_mut().expect("just pushed")
         };

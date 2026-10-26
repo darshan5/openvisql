@@ -534,3 +534,162 @@ async fn dumps_restore_and_copies_schemas() {
     exec(&mut other, &format!("DROP SCHEMA {copied} CASCADE")).await;
     cleanup(s, &schema).await;
 }
+
+#[tokio::test]
+async fn table_designer_alters_tables() {
+    use ovs_core::sql::design::{
+        CheckDef, ColumnDef, IndexDef, IndexKind, TableDesign, alter_sql, create_statements,
+    };
+
+    async fn load(s: &mut Box<dyn Session>, schema: &str, table: &str) -> TableDesign {
+        let columns = s.list_columns(schema, table).await.unwrap();
+        let indexes = s.list_indexes(schema, table).await.unwrap();
+        let fks = s.list_foreign_keys(schema, table).await.unwrap();
+        let checks = s.list_checks(schema, table).await.unwrap();
+        let options = s.table_options(schema, table).await.unwrap();
+        TableDesign::from_table(D, table, &columns, &indexes)
+            .with_constraints(schema, &fks, options)
+            .with_checks(&checks)
+    }
+    async fn apply(s: &mut Box<dyn Session>, statements: Vec<String>) {
+        for sql in statements {
+            exec(s, &sql).await;
+        }
+    }
+
+    let Some((mut s, schema)) = scratch("designer").await else {
+        return;
+    };
+    script(&mut s, SCHEMA).await;
+    exec(
+        &mut s,
+        "INSERT INTO owners (name, score) VALUES ('ada', 1.5), ('bob', 2)",
+    )
+    .await;
+    exec(&mut s, "INSERT INTO pets (owner, tag) VALUES (1, 'rex')").await;
+
+    let before = load(&mut s, &schema, "owners").await;
+    assert_eq!(before.primary_key_name, "owners_pkey");
+    assert_eq!(alter_sql(D, &schema, &before, &before).len(), 0);
+
+    // Rename, retype, make nullable, change a default, drop a column, add one with a comment,
+    // add an index and a check, comment the table, and rename it.
+    let mut after = before.clone();
+    after.columns[1].name = "full_name".into();
+    after.columns[1].default_sql = "'anon'".into();
+    after.columns[4].data_type = "numeric(10,3)".into();
+    after.columns.retain(|c| c.name != "born");
+    after.columns.push(ColumnDef {
+        name: "joined".into(),
+        data_type: "date".into(),
+        nullable: true,
+        default_sql: "CURRENT_DATE".into(),
+        comment: "first visit".into(),
+        ..ColumnDef::default()
+    });
+    after.follow_renames();
+    after.indexes.push(IndexDef {
+        name: "owners_by_name".into(),
+        kind: IndexKind::Unique,
+        columns: vec!["full_name".into()],
+        original_name: None,
+    });
+    after.checks.push(CheckDef {
+        name: "score_positive".into(),
+        clause: "score >= 0".into(),
+        original_name: None,
+    });
+    after.options.comment = "people and more".into();
+    after.name = "people".into();
+    after.validate_for(D).unwrap();
+    after.validate_change(D, &before).unwrap();
+    apply(&mut s, alter_sql(D, &schema, &before, &after)).await;
+
+    let reloaded = load(&mut s, &schema, "people").await;
+    let names: Vec<&str> = reloaded.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(
+        names,
+        ["id", "full_name", "data", "score", "active", "joined"]
+    );
+    assert_eq!(reloaded.columns[1].default_sql, "'anon'");
+    assert_eq!(reloaded.columns[3].data_type, "numeric(10,3)");
+    assert_eq!(reloaded.columns[5].comment, "first visit");
+    assert_eq!(reloaded.options.comment, "people and more");
+    assert!(reloaded.indexes.iter().any(|i| i.name == "owners_by_name"));
+    assert_eq!(reloaded.checks.len(), 2);
+    // The renamed column's old check followed it.
+    assert!(
+        reloaded
+            .checks
+            .iter()
+            .any(|c| c.clause.contains("full_name"))
+    );
+    assert_eq!(alter_sql(D, &schema, &reloaded, &reloaded).len(), 0);
+    // Rows, the identity counter and the foreign key from pets all survived.
+    exec(&mut s, "INSERT INTO people (full_name) VALUES ('cy')").await;
+    assert_eq!(
+        rows(&mut s, "SELECT max(id) FROM people").await.rows[0][0],
+        Value::Int(3)
+    );
+    assert!(
+        s.execute("INSERT INTO pets (owner, tag) VALUES (42, 'x')", None)
+            .await
+            .is_err()
+    );
+
+    // Swap the primary key.
+    let mut keyed = reloaded.clone();
+    keyed.columns[0].primary_key = false;
+    keyed.columns[1].primary_key = true;
+    keyed.columns[1].nullable = false;
+    let err = s
+        .execute(&alter_sql(D, &schema, &reloaded, &keyed).join(";\n"), None)
+        .await;
+    // pets' foreign key depends on the old key, so the server refuses; nothing changed.
+    assert!(err.is_err());
+    let _ = s.execute("ROLLBACK", None).await;
+    assert_eq!(
+        load(&mut s, &schema, "people").await.primary_key_name,
+        "owners_pkey"
+    );
+
+    // Reordering is refused before reaching the server.
+    let mut moved = reloaded.clone();
+    moved.columns.swap(1, 2);
+    assert!(moved.validate_change(D, &reloaded).is_err());
+
+    // A new table with an identity key, an index and comments.
+    let new = TableDesign {
+        name: "tags".into(),
+        columns: vec![
+            ColumnDef {
+                name: "id".into(),
+                data_type: "bigint".into(),
+                primary_key: true,
+                auto_increment: true,
+                ..ColumnDef::default()
+            },
+            ColumnDef {
+                name: "label".into(),
+                data_type: "text".into(),
+                comment: "shown".into(),
+                ..ColumnDef::default()
+            },
+        ],
+        indexes: vec![IndexDef {
+            name: "tags_label".into(),
+            kind: IndexKind::Unique,
+            columns: vec!["label".into()],
+            original_name: None,
+        }],
+        ..TableDesign::default()
+    };
+    apply(&mut s, create_statements(D, &schema, &new)).await;
+    exec(&mut s, "INSERT INTO tags (label) VALUES ('a')").await;
+    assert!(
+        s.execute("INSERT INTO tags (label) VALUES ('a')", None)
+            .await
+            .is_err()
+    );
+    cleanup(s, &schema).await;
+}

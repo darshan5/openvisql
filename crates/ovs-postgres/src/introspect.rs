@@ -210,6 +210,11 @@ pub(crate) async fn indexes(
                 unique: text(&rs, r, "uniq") == "true",
                 index_type: text(&rs, r, "kind").to_ascii_uppercase(),
                 prefix_lengths: Vec::new(),
+                constraint_name: if primary {
+                    text(&rs, r, "name")
+                } else {
+                    String::new()
+                },
             }
         })
         .collect())

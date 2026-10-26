@@ -12,8 +12,8 @@ the right, and results below.
 
 - **PostgreSQL**: the database's schemas are listed like databases, with tables, views,
   functions, procedures and triggers. It shares the editor (dollar-quoted bodies split
-  correctly), grid editing, export, CSV import, backup/restore and copy, server tools and
-  TLS. The table designer is still to come.
+  correctly), grid editing, export, CSV import, backup/restore and copy, the table designer,
+  server tools and TLS.
 - **SQLite** database files, opened or created from the connection manager. They get the same
   editor, grid editing, export, CSV import, backup/restore and table designer (which rebuilds
   the table safely). Server-only tools are hidden for them.

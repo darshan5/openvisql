@@ -92,6 +92,9 @@ pub struct IndexInfo {
     pub index_type: String,
     /// Per column, the indexed prefix length (`name(10)`); empty when no column has one.
     pub prefix_lengths: Vec<Option<u32>>,
+    /// The index's own name where `name` is a stand-in (PostgreSQL's primary key is listed
+    /// as `PRIMARY`, like MySQL's); empty otherwise.
+    pub constraint_name: String,
 }
 
 /// A foreign key constraint, its columns in order.

@@ -388,6 +388,11 @@ impl TableDesigner {
                 .as_ref()
                 .map(|o| o.suffix.clone())
                 .unwrap_or_default(),
+            primary_key_name: self
+                .original
+                .as_ref()
+                .map(|o| o.primary_key_name.clone())
+                .unwrap_or_default(),
             options: TableOptions {
                 engine: text(&self.engine),
                 collation: text(&self.collation),
@@ -645,6 +650,8 @@ impl TableDesigner {
 impl Render for TableDesigner {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mysql = self.dialect == Dialect::MySql;
+        // Column and table comments: MySQL and PostgreSQL have them, SQLite doesn't.
+        let comments = self.dialect != Dialect::Sqlite;
         let kinds: &'static [IndexKind] = if mysql {
             &IndexKind::ALL
         } else {
@@ -679,13 +686,13 @@ impl Render for TableDesigner {
                     header("PK", Some(36.)),
                     header("Auto", Some(36.)),
                     header("Default (SQL)", Some(140.)),
-                    header(if mysql { "Comment" } else { "" }, None),
+                    header(if comments { "Comment" } else { "" }, None),
                     div().w(px(84.)),
                 ],
                 self.rows
                     .iter()
                     .enumerate()
-                    .map(|(ix, row)| Self::render_row(ix, row, mysql, cx).into_any_element())
+                    .map(|(ix, row)| Self::render_row(ix, row, comments, cx).into_any_element())
                     .collect(),
                 add("add-column", "Column").on_click(cx.listener(|this, _, window, cx| {
                     this.push_row(
@@ -796,12 +803,13 @@ impl Render for TableDesigner {
                             .child(div().w(px(110.)).child(Input::new(&self.engine).small()))
                             .child(div().text_sm().child("Collation"))
                             .child(div().w(px(170.)).child(Input::new(&self.collation).small()))
-                            .child(div().text_sm().child("Comment"))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .child(Input::new(&self.table_comment).small()),
-                            )
+                    })
+                    .when(comments, |row| {
+                        row.child(div().text_sm().child("Comment")).child(
+                            div()
+                                .flex_1()
+                                .child(Input::new(&self.table_comment).small()),
+                        )
                     }),
             )
             .child(

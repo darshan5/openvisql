@@ -418,6 +418,7 @@ impl Session for SqliteSession {
                 unique: true,
                 index_type: "BTREE".into(),
                 prefix_lengths: Vec::new(),
+                constraint_name: String::new(),
             });
         }
         let list = self
@@ -442,6 +443,7 @@ impl Session for SqliteSession {
                 unique: int(&list, r, "unique") == 1,
                 index_type: "BTREE".into(),
                 prefix_lengths: Vec::new(),
+                constraint_name: String::new(),
                 name,
             });
         }

@@ -134,8 +134,10 @@ Phase 4 is complete.
 - ✅ Backup, restore and copy of a schema. Dumps leave out the schema name so they restore
   anywhere. Foreign keys are added after the data. Identity and serial counters continue
   after the restored ids.
+- ✅ Table designer for PostgreSQL. A change runs in one transaction: renames, type /
+  nullability / default / identity changes, keys, indexes, checks, comments and the table's
+  name. Column reordering is refused, since PostgreSQL keeps column order.
 - Still to do:
-  - the table designer for PostgreSQL
   - sequences, types and materialized-view refresh in the browser
 
 ## Packaging
