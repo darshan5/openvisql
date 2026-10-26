@@ -153,8 +153,9 @@ Phase 5 is complete.
 ## Packaging
 
 - ✅ macOS `.app` bundle and `.dmg`, Windows NSIS installer (cargo-packager), with an app icon.
-- ✅ A GitHub Actions release workflow that builds them on tags (Apple Silicon, Intel,
-  Windows) and attaches them to a draft release.
+- ✅ A GitHub Actions release workflow that builds them on tags (Apple Silicon Macs and
+  Windows) and attaches them to a draft release. Intel Macs aren't built (decided
+  2026-10-26); they can build from source.
 - ✅ Signing and notarization run when the certificate secrets are set; see
   [DEPLOYMENT.md](DEPLOYMENT.md#signing). Releases are unsigned for now (decided 2026-10-26).
 - Auto-update: not planned (decided 2026-10-26). New versions are downloaded from the

@@ -30,7 +30,6 @@ MySQL, MariaDB, PostgreSQL and SSH suites when the test servers are up. See
 
 3. `.github/workflows/release.yml` builds these and attaches them to a **draft** release:
    - `OpenViSQL_<version>_aarch64.dmg` (Apple Silicon)
-   - `OpenViSQL_<version>_x64.dmg` (Intel)
    - `OpenViSQL_<version>_x64-setup.exe` (Windows installer, per-user)
 
    Review the generated notes and publish the release.

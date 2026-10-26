@@ -83,7 +83,7 @@ the right, and results below.
 
 ## Download
 
-Installers for macOS (Apple Silicon and Intel `.dmg`) and Windows (`-setup.exe`) are
+Installers for macOS on Apple Silicon (`.dmg`) and Windows (`-setup.exe`) are
 attached to [GitHub releases](https://github.com/darshan5/openvisql/releases).
 
 ## Build from source
