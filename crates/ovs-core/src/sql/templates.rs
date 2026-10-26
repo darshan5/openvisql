@@ -128,6 +128,31 @@ pub fn database_info(db: &str) -> String {
     )
 }
 
+/// Running connections, longest-running first.
+pub const PROCESS_LIST: &str = "SELECT ID, USER, HOST, DB, COMMAND, TIME, STATE, LEFT(INFO, 500) AS INFO\nFROM information_schema.PROCESSLIST\nORDER BY TIME DESC;\n";
+
+/// Version, settings and key counters of the server.
+pub const SERVER_INFO: &str = "SELECT VERSION() AS `version`, @@version_comment AS `distribution`,\n  @@hostname AS `host`, @@port AS `port`, @@character_set_server AS `charset`,\n  @@collation_server AS `collation`, @@time_zone AS `time zone`, @@datadir AS `data dir`;\nSHOW GLOBAL STATUS WHERE Variable_name IN\n  ('Uptime', 'Threads_connected', 'Threads_running', 'Questions', 'Slow_queries',\n   'Connections', 'Aborted_connects', 'Bytes_received', 'Bytes_sent');\n";
+
+pub const STATUS_VARIABLES: &str = "SHOW GLOBAL STATUS;\n";
+pub const SYSTEM_VARIABLES: &str = "SHOW GLOBAL VARIABLES;\n";
+
+/// True for a statement that lists server processes, whose rows can be killed.
+pub fn is_process_list(sql: &str) -> bool {
+    let upper = sql.to_ascii_uppercase();
+    upper.contains("INFORMATION_SCHEMA.PROCESSLIST")
+        || upper.contains("PROCESSLIST") && upper.trim_start().starts_with("SHOW")
+}
+
+/// `KILL QUERY id` stops the running statement; `KILL id` closes the whole connection.
+pub fn kill(id: u64, connection: bool) -> String {
+    if connection {
+        format!("KILL {id}")
+    } else {
+        format!("KILL QUERY {id}")
+    }
+}
+
 /// `DROP <kind> db.name`.
 pub fn drop_object(kind: ObjectKind, db: &str, name: &str) -> String {
     let target = if kind == ObjectKind::Database {
@@ -205,6 +230,16 @@ mod tests {
             let sql = create_template(kind, "shop", Some("orders"));
             assert_eq!(split_statements(&sql).len(), 1, "{kind:?}: {sql}");
         }
+    }
+
+    #[test]
+    fn process_list_detection_and_kill() {
+        assert!(is_process_list(PROCESS_LIST));
+        assert!(is_process_list("show full processlist"));
+        assert!(!is_process_list("select * from orders"));
+        assert_eq!(kill(42, false), "KILL QUERY 42");
+        assert_eq!(kill(42, true), "KILL 42");
+        assert_eq!(split_statements(SERVER_INFO).len(), 2);
     }
 
     #[test]

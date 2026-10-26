@@ -415,6 +415,18 @@ async fn object_templates_and_info_queries_run() {
     for stmt in split_statements(&database_info(&db)) {
         s.execute(&stmt.sql, None).await.unwrap();
     }
+    for sql in [
+        ovs_core::sql::templates::PROCESS_LIST,
+        ovs_core::sql::templates::SERVER_INFO,
+        ovs_core::sql::templates::STATUS_VARIABLES,
+        ovs_core::sql::templates::SYSTEM_VARIABLES,
+    ] {
+        for stmt in split_statements(sql) {
+            s.execute(&stmt.sql, None)
+                .await
+                .unwrap_or_else(|e| panic!("{e}\n{}", stmt.sql));
+        }
+    }
     s.execute(&truncate_table(&db, "new_table"), None)
         .await
         .unwrap();

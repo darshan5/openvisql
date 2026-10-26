@@ -9,6 +9,7 @@ use gpui_kit::component::{
     button::{Button, ButtonVariant, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState},
+    menu::{DropdownMenu as _, PopupMenuItem},
     resizable::{h_resizable, resizable_panel},
     status_bar::StatusBar,
     tab::{Tab, TabBar},
@@ -20,6 +21,7 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, px,
 };
 use ovs_core::sql::Dialect;
+use ovs_core::sql::templates;
 use ovs_core::{ConnectionConfig, ObjectKind};
 use ovs_store::SavedConnectionTab;
 
@@ -595,6 +597,49 @@ impl Workspace {
                     .tooltip("Refresh object browser (F5)")
                     .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
             )
+            .child({
+                let this = cx.entity().downgrade();
+                Button::new("server-menu")
+                    .ghost()
+                    .small()
+                    .label("Server")
+                    .dropdown_caret(true)
+                    .dropdown_menu(move |menu, _, _| {
+                        let open = |title: &'static str, sql: &'static str| {
+                            let this = this.clone();
+                            move |_: &gpui_kit::ClickEvent, window: &mut Window, cx: &mut App| {
+                                this.update(cx, |this, cx| {
+                                    let db = this.active_database(cx);
+                                    this.add_tab(
+                                        Some(title.into()),
+                                        db,
+                                        sql.into(),
+                                        true,
+                                        window,
+                                        cx,
+                                    );
+                                })
+                                .ok();
+                            }
+                        };
+                        menu.item(
+                            PopupMenuItem::new("Process list")
+                                .on_click(open("Process list", templates::PROCESS_LIST)),
+                        )
+                        .item(
+                            PopupMenuItem::new("Server info")
+                                .on_click(open("Server info", templates::SERVER_INFO)),
+                        )
+                        .item(
+                            PopupMenuItem::new("Status variables")
+                                .on_click(open("Status", templates::STATUS_VARIABLES)),
+                        )
+                        .item(
+                            PopupMenuItem::new("System variables")
+                                .on_click(open("Variables", templates::SYSTEM_VARIABLES)),
+                        )
+                    })
+            })
             .child(div().flex_1())
             .child(
                 div()

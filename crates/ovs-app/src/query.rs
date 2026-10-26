@@ -36,7 +36,7 @@ use ovs_store::{HistoryEntry, SavedQueryTab, Store};
 
 use crate::completion::{CompletionSource, SqlCompletions};
 use crate::export_dialog::ExportForm;
-use crate::grid::{Editability, OpenValue, ResultGrid, ServerSort};
+use crate::grid::{Editability, KillProcess, OpenValue, ResultGrid, ServerSort};
 use crate::runtime::{self, SharedSession};
 
 /// Hard cap per result set for statements we can't add a LIMIT to (SHOW, CALL, ...).
@@ -129,6 +129,8 @@ struct Limits {
     source_sql: Option<String>,
     /// How to fetch other pages of a SELECT's result.
     page: Option<PageSpec>,
+    /// The statement as written, for recognising special results such as the process list.
+    statement: String,
 }
 
 /// Summary of the last run, shown in the status bar.
@@ -641,6 +643,7 @@ impl QueryTab {
                     total,
                     source_sql,
                     page,
+                    statement: stmt.sql.clone(),
                 };
                 let cancelled = matches!(result, Err(Error::Cancelled));
                 let report = match result {
@@ -794,6 +797,10 @@ impl QueryTab {
         table.update(cx, |t, _| {
             t.delegate_mut().set_on_open_value(Some(open_value));
         });
+        if sql::templates::is_process_list(&limits.statement) {
+            let kill = Self::kill_callback(cx);
+            table.update(cx, |t, _| t.delegate_mut().set_on_kill(Some(kill)));
+        }
         if let Some((_, (schema, name))) = &source {
             self.detect_editability(table.clone(), schema.clone(), name.clone(), cx);
         }
@@ -1345,6 +1352,66 @@ impl QueryTab {
                     Err(err) => format!("Export failed: {err}"),
                 };
                 window.push_notification(message, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn kill_callback(cx: &mut Context<Self>) -> KillProcess {
+        let this = cx.entity().downgrade();
+        Rc::new(move |id, connection, window, cx| {
+            this.update(cx, |this, cx| this.kill_process(id, connection, window, cx))
+                .ok();
+        })
+    }
+
+    /// Kills a server process from the process list (asking first for a whole connection),
+    /// then re-runs the list.
+    fn kill_process(
+        &mut self,
+        id: u64,
+        connection: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if connection {
+            let this = cx.entity().downgrade();
+            window.open_alert_dialog(cx, move |alert, _, _| {
+                let this = this.clone();
+                alert
+                    .title(format!("Kill connection {id}?"))
+                    .description(
+                        "The connection is closed and any transaction it has open is rolled back.",
+                    )
+                    .confirm()
+                    .ok_text("Kill connection")
+                    .ok_variant(ButtonVariant::Danger)
+                    .on_ok(move |_, window, cx| {
+                        this.update(cx, |this, cx| this.run_kill(id, true, window, cx))
+                            .ok();
+                        true
+                    })
+            });
+        } else {
+            self.run_kill(id, false, window, cx);
+        }
+    }
+
+    fn run_kill(&mut self, id: u64, connection: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let SessionState::Ready { session, .. } = &self.session else {
+            return;
+        };
+        let session = session.clone();
+        let sql = sql::templates::kill(id, connection);
+        cx.spawn_in(window, async move |this, cx| {
+            let result =
+                runtime::run(async move { session.lock().await.execute(&sql, None).await }).await;
+            this.update_in(cx, |this, window, cx| {
+                if let Err(err) = result {
+                    window.push_notification(format!("Could not kill process {id}: {err}"), cx);
+                }
+                this.execute(RunMode::All, window, cx);
             })
             .ok();
         })

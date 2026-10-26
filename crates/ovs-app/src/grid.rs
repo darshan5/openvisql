@@ -57,6 +57,8 @@ struct CellEditor {
 pub type ServerSort = Rc<dyn Fn(usize, ColumnSort, &mut App)>;
 /// Opens the value viewer/editor for a cell (display row, column).
 pub type OpenValue = Rc<dyn Fn(usize, usize, &mut Window, &mut App)>;
+/// Kills a server process: (process id, whole connection rather than just the query).
+pub type KillProcess = Rc<dyn Fn(u64, bool, &mut Window, &mut App)>;
 
 pub struct ResultGrid {
     data: Arc<ResultSet>,
@@ -72,6 +74,8 @@ pub struct ResultGrid {
     /// Set when only a page of the rows is loaded, so sorting must re-query.
     server_sort: Option<ServerSort>,
     on_open_value: Option<OpenValue>,
+    /// Set for process-list results.
+    on_kill: Option<KillProcess>,
 }
 
 impl ResultGrid {
@@ -96,6 +100,26 @@ impl ResultGrid {
             focused_cell: None,
             server_sort: None,
             on_open_value: None,
+            on_kill: None,
+        }
+    }
+
+    pub fn set_on_kill(&mut self, kill: Option<KillProcess>) {
+        self.on_kill = kill;
+    }
+
+    /// The process id in a process-list row (its `ID` column).
+    fn process_id(&self, row: usize) -> Option<u64> {
+        let col = self
+            .data
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case("id"))?;
+        match self.cell(row, col)? {
+            Cell::Value(Value::Int(n)) => u64::try_from(*n).ok(),
+            Cell::Value(Value::UInt(n)) => Some(*n),
+            Cell::Value(v) => v.to_string().parse().ok(),
+            Cell::Default => None,
         }
     }
 
@@ -556,6 +580,21 @@ impl TableDelegate for ResultGrid {
                 PopupMenuItem::new("View / edit value…")
                     .on_click(move |_, window, cx| open(row_ix, col, window, cx)),
             ),
+            _ => menu,
+        };
+        let menu = match (self.on_kill.clone(), self.process_id(row_ix)) {
+            (Some(kill), Some(id)) => {
+                let kill_connection = kill.clone();
+                menu.separator()
+                    .item(
+                        PopupMenuItem::new(format!("Kill query (process {id})"))
+                            .on_click(move |_, window, cx| kill(id, false, window, cx)),
+                    )
+                    .item(
+                        PopupMenuItem::new(format!("Kill connection (process {id})…"))
+                            .on_click(move |_, window, cx| kill_connection(id, true, window, cx)),
+                    )
+            }
             _ => menu,
         };
         if self.target().is_none() {
