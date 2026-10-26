@@ -139,8 +139,14 @@ Phase 4 is complete.
 - ✅ Table designer for PostgreSQL. A change runs in one transaction: renames, type /
   nullability / default / identity changes, keys, indexes, checks, comments and the table's
   name. Column reordering is refused, since PostgreSQL keeps column order.
-- Still to do:
-  - sequences, types and materialized-view refresh in the browser
+- ✅ Sequences and types (enums, domains, composite and range types) in the object browser,
+  with their `CREATE` statements. Materialized views can be refreshed. Drops say what
+  PostgreSQL needs: `DROP MATERIALIZED VIEW`, `DROP DOMAIN`, a function's arguments.
+- ✅ Dumps create types and free-standing sequences before the tables that use them, only when
+  missing, and carry sequence values over. Replacing a whole schema drops its tables with
+  `CASCADE` so views don't block it.
+
+Phase 5 is complete.
 
 ## Packaging
 

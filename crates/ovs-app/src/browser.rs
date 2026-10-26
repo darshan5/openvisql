@@ -116,6 +116,8 @@ impl Node {
                 ObjectKind::Procedure | ObjectKind::Function => IconName::SquareTerminal,
                 ObjectKind::Trigger => IconName::Asterisk,
                 ObjectKind::Event => IconName::Calendar,
+                ObjectKind::Sequence => IconName::SortAscending,
+                ObjectKind::Type => IconName::CaseSensitive,
             },
             Self::Leaf { kind, .. } => match kind {
                 LeafKind::Column { primary: true } | LeafKind::Index { primary: true } => {
@@ -456,14 +458,7 @@ impl ObjectBrowser {
             Some(children) => children
                 .into_iter()
                 .filter(|child| match child {
-                    Node::Folder { kind, .. } => {
-                        self.dialect == Dialect::MySql
-                            || (self.dialect == Dialect::Postgres && *kind != ObjectKind::Event)
-                            || matches!(
-                                kind,
-                                ObjectKind::Table | ObjectKind::View | ObjectKind::Trigger
-                            )
-                    }
+                    Node::Folder { kind, .. } => kind.exists_in(self.dialect),
                     _ => true,
                 })
                 .collect(),
@@ -526,7 +521,7 @@ impl ObjectBrowser {
             initial: String::new(),
             build: Rc::new(templates::create_database),
         });
-        let drop = |kind: ObjectKind, db: &str, name: &str| {
+        let drop = |kind: ObjectKind, db: &str, name: &str, object_detail: &str| {
             let what = kind.sql_keyword().to_lowercase();
             let detail = match kind {
                 ObjectKind::Database => "and every table, view and routine in it",
@@ -534,7 +529,7 @@ impl ObjectBrowser {
                 _ => "",
             };
             emit(BrowserEvent::ConfirmExecute {
-                sql: templates::drop_object(d, kind, db, name),
+                sql: templates::drop_statement(d, kind, db, name, object_detail),
                 title: format!("Drop {what} {name}?"),
                 description: format!(
                     "This permanently deletes the {what} \u{201c}{name}\u{201d} {detail}. It can't be undone."
@@ -663,6 +658,7 @@ impl ObjectBrowser {
                         ObjectKind::Database,
                         db,
                         db,
+                        "",
                     )));
                 } else if db != "main" {
                     menu = menu.item(PopupMenuItem::new("Detach database").on_click(emit(
@@ -781,21 +777,23 @@ impl ObjectBrowser {
                             },
                         )));
                 }
+                if postgres && *kind == ObjectKind::View && detail == "materialized" {
+                    menu = menu.item(PopupMenuItem::new("Refresh materialized view…").on_click(
+                        emit(BrowserEvent::ConfirmExecute {
+                            sql: templates::refresh_materialized_view(d, db, name),
+                            title: format!("Refresh {name}?"),
+                            description: format!(
+                                "This re-runs the query of \u{201c}{name}\u{201d} and replaces its rows. \
+                                 Reading it waits until the refresh finishes."
+                            ),
+                            action: "Refresh".into(),
+                        }),
+                    ));
+                }
                 menu.item(PopupMenuItem::new("Copy name").on_click(copy(name.clone())))
                     .item(
                         PopupMenuItem::new(format!("Drop {}…", kind.sql_keyword().to_lowercase()))
-                            .on_click(if *kind == ObjectKind::Trigger {
-                                emit(BrowserEvent::ConfirmExecute {
-                                    sql: templates::drop_trigger(d, db, name, detail, false),
-                                    title: format!("Drop trigger {name}?"),
-                                    description: format!(
-                                        "This permanently deletes the trigger \u{201c}{name}\u{201d}. It can't be undone."
-                                    ),
-                                    action: "Drop trigger".into(),
-                                })
-                            } else {
-                                drop(*kind, db, name)
-                            }),
+                            .on_click(drop(*kind, db, name, detail)),
                     )
                     .separator()
             }

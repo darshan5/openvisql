@@ -399,6 +399,10 @@ async fn transfer(
     }
     out.note("")?;
 
+    if options.structure {
+        stats.other_objects += types_and_sequences(session, db, adapt, out, progress).await?;
+    }
+
     let tables = session.list_objects(db, ObjectKind::Table).await?;
     let wanted = |name: &str| {
         options
@@ -426,7 +430,15 @@ async fn transfer(
             }
             out.note(&format!("--\n-- Table {target}\n--"))?;
             if options.drop_existing {
-                out.statement(&format!("DROP TABLE IF EXISTS {target}"), false)
+                // PostgreSQL won't drop a table that views or other tables' keys depend on.
+                // When the whole schema is replaced they're recreated too, so they can go;
+                // otherwise the drop fails rather than lose objects the dump won't restore.
+                let cascade = if d == Dialect::Postgres && options.tables.is_none() {
+                    " CASCADE"
+                } else {
+                    ""
+                };
+                out.statement(&format!("DROP TABLE IF EXISTS {target}{cascade}"), false)
                     .await?;
             }
             out.statement(&ddl, false).await?;
@@ -482,7 +494,12 @@ async fn transfer(
                 let name = d.quote_ident(&object.name);
                 out.note(&format!("--\n-- {} {name}\n--", kind.sql_keyword()))?;
                 if options.drop_existing {
-                    let drop = if kind == ObjectKind::Trigger && d == Dialect::Postgres {
+                    let drop = if d == Dialect::Postgres
+                        && kind == ObjectKind::View
+                        && object.detail == "materialized"
+                    {
+                        format!("DROP MATERIALIZED VIEW IF EXISTS {name}")
+                    } else if kind == ObjectKind::Trigger && d == Dialect::Postgres {
                         // Unqualified, like the rest of the dump.
                         format!(
                             "DROP TRIGGER IF EXISTS {name} ON {}",
@@ -506,6 +523,59 @@ async fn transfer(
         out.statement(sql, false).await?;
     }
     Ok(stats)
+}
+
+/// PostgreSQL's types and free-standing sequences, which tables may use, so they come first.
+/// They're created only when missing: a copy may go where they already exist, and replacing a
+/// type would mean dropping every column that uses it. Sequences owned by a column are created
+/// with their table instead.
+async fn types_and_sequences(
+    session: &mut dyn Session,
+    db: &str,
+    adapt: &(dyn Fn(String, ObjectKind) -> String + Send + Sync),
+    out: &mut Output<'_>,
+    progress: &mut (dyn FnMut(&str) + Send),
+) -> Result<usize> {
+    let d = session.dialect();
+    let mut count = 0;
+    for kind in [ObjectKind::Type, ObjectKind::Sequence] {
+        if !kind.exists_in(d) {
+            continue;
+        }
+        let mut objects = session.list_objects(db, kind).await?;
+        // Domains may be based on enums or ranges, and composites may use any of them.
+        let rank = |detail: &str| match detail {
+            "enum" => 0,
+            "range" => 1,
+            "domain" => 2,
+            _ => 3,
+        };
+        objects.sort_by_key(|o| rank(&o.detail));
+        for object in objects {
+            if kind == ObjectKind::Sequence && !object.detail.is_empty() {
+                continue;
+            }
+            progress(&object.name);
+            let ddl = adapt(session.object_ddl(db, &object.name, kind).await?, kind);
+            let sql = if kind == ObjectKind::Sequence {
+                ddl.replacen("CREATE SEQUENCE ", "CREATE SEQUENCE IF NOT EXISTS ", 1)
+            } else {
+                // PostgreSQL has no CREATE TYPE IF NOT EXISTS.
+                format!(
+                    "DO $ovs$ BEGIN {ddl}; EXCEPTION WHEN duplicate_object THEN NULL; END $ovs$"
+                )
+            };
+            out.note(&format!(
+                "--\n-- {} {}\n--",
+                kind.sql_keyword(),
+                d.quote_ident(&object.name)
+            ))?;
+            out.statement(&sql, false).await?;
+            out.note("")?;
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 
 /// Writes `INSERT`s for every row of `table`, fetched in primary-key order in batches.

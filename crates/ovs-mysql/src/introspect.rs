@@ -73,6 +73,7 @@ pub(crate) async fn objects(
             "SELECT EVENT_NAME AS name, STATUS AS detail FROM information_schema.EVENTS \
              WHERE EVENT_SCHEMA = {schema} ORDER BY EVENT_NAME"
         ),
+        ObjectKind::Sequence | ObjectKind::Type => return Ok(Vec::new()),
     };
     let rs = s.query_set(&sql).await?;
     Ok(rs

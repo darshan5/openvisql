@@ -693,3 +693,236 @@ async fn table_designer_alters_tables() {
     );
     cleanup(s, &schema).await;
 }
+
+#[tokio::test]
+async fn sequences_types_and_materialized_views() {
+    use ovs_core::dump::{DumpOptions, copy_database, dump_database, run_script};
+
+    let Some((mut s, schema)) = scratch("types").await else {
+        return;
+    };
+    script(
+        &mut s,
+        "CREATE TYPE mood AS ENUM ('sad', 'ok', 'it''s fine');
+         CREATE DOMAIN email AS text NOT NULL CHECK (VALUE LIKE '%@%');
+         CREATE DOMAIN calm AS mood DEFAULT 'ok';
+         CREATE TYPE floatspan AS RANGE (SUBTYPE = float8);
+         CREATE TYPE pair AS (a integer, b mood);
+         CREATE SEQUENCE ticket START WITH 100 INCREMENT BY 5;
+         SELECT nextval('ticket'), nextval('ticket');
+         CREATE TABLE person (id serial PRIMARY KEY, feeling calm NOT NULL, contact email, \
+             p pair, span floatspan, ticket bigint NOT NULL DEFAULT nextval('ticket'));
+         INSERT INTO person (feeling, contact, p, span) VALUES \
+             ('it''s fine', 'a@b', ROW(1, 'sad'), '[1.5,2)'), ('sad', 'c@d', NULL, NULL);
+         CREATE MATERIALIZED VIEW fine AS SELECT id FROM person WHERE feeling::mood = 'it''s fine';
+         CREATE TYPE unused AS ENUM ('x');",
+    )
+    .await;
+
+    let listed = |objects: Vec<ovs_core::SchemaObject>| -> Vec<(String, String)> {
+        objects.into_iter().map(|o| (o.name, o.detail)).collect()
+    };
+    let pair = |a: &str, b: &str| (a.to_owned(), b.to_owned());
+    assert_eq!(
+        listed(s.list_objects(&schema, ObjectKind::Type).await.unwrap()),
+        [
+            pair("calm", "domain"),
+            pair("email", "domain"),
+            pair("floatspan", "range"),
+            pair("mood", "enum"),
+            pair("pair", "composite"),
+            pair("unused", "enum"),
+        ]
+    );
+    assert_eq!(
+        listed(s.list_objects(&schema, ObjectKind::Sequence).await.unwrap()),
+        [pair("person_id_seq", "person.id"), pair("ticket", "")]
+    );
+    let views = listed(s.list_objects(&schema, ObjectKind::View).await.unwrap());
+    assert_eq!(views, [pair("fine", "materialized")]);
+
+    let ddl = |kind, name: &'static str| (kind, name);
+    let mut shown = Vec::new();
+    for (kind, name) in [
+        ddl(ObjectKind::Type, "mood"),
+        ddl(ObjectKind::Type, "email"),
+        ddl(ObjectKind::Type, "calm"),
+        ddl(ObjectKind::Type, "floatspan"),
+        ddl(ObjectKind::Type, "pair"),
+        ddl(ObjectKind::Sequence, "ticket"),
+    ] {
+        shown.push(s.object_ddl(&schema, name, kind).await.unwrap());
+    }
+    let q = |name: &str| format!("\"{schema}\".\"{name}\"");
+    assert_eq!(
+        shown[0],
+        format!(
+            "CREATE TYPE {} AS ENUM ('sad', 'ok', 'it''s fine')",
+            q("mood")
+        )
+    );
+    assert!(
+        shown[1].starts_with(&format!(
+            "CREATE DOMAIN {} AS text NOT NULL CONSTRAINT",
+            q("email")
+        )) && shown[1].contains("CHECK ((VALUE ~~ '%@%'::text))"),
+        "{}",
+        shown[1]
+    );
+    assert!(shown[2].contains(" DEFAULT 'ok'"), "{}", shown[2]);
+    assert!(
+        shown[3].ends_with("AS RANGE (SUBTYPE = double precision)"),
+        "{}",
+        shown[3]
+    );
+    assert!(shown[4].ends_with("AS (a integer, b mood)"), "{}", shown[4]);
+    assert!(
+        shown[5].contains("AS bigint INCREMENT BY 5")
+            && shown[5].contains("START WITH 100")
+            && shown[5].ends_with(&format!("SELECT setval('{}', 115)", q("ticket"))),
+        "{}",
+        shown[5]
+    );
+
+    // Refreshing picks up new rows; dropping works for each kind.
+    exec(
+        &mut s,
+        "INSERT INTO person (feeling, contact) VALUES ('it''s fine', 'e@f')",
+    )
+    .await;
+    exec(
+        &mut s,
+        &templates::refresh_materialized_view(D, &schema, "fine"),
+    )
+    .await;
+    assert_eq!(
+        rows(&mut s, "SELECT count(*) FROM fine").await.rows[0][0],
+        Value::Int(2)
+    );
+    exec(&mut s, "CREATE MATERIALIZED VIEW gone AS SELECT 1").await;
+    exec(&mut s, "CREATE DOMAIN gone_domain AS integer").await;
+    exec(&mut s, "CREATE SEQUENCE gone_seq").await;
+    for (kind, name, detail) in [
+        (ObjectKind::View, "gone", "materialized"),
+        (ObjectKind::Type, "gone_domain", "domain"),
+        (ObjectKind::Type, "unused", "enum"),
+        (ObjectKind::Sequence, "gone_seq", ""),
+    ] {
+        exec(
+            &mut s,
+            &templates::drop_statement(D, kind, &schema, name, detail),
+        )
+        .await;
+    }
+    exec(
+        &mut s,
+        "CREATE FUNCTION twice(integer) RETURNS integer LANGUAGE sql AS 'SELECT $1 * 2'",
+    )
+    .await;
+    exec(
+        &mut s,
+        "CREATE FUNCTION twice(text) RETURNS text LANGUAGE sql AS 'SELECT $1 || $1'",
+    )
+    .await;
+    let functions = s.list_objects(&schema, ObjectKind::Function).await.unwrap();
+    exec(
+        &mut s,
+        &templates::drop_statement(
+            D,
+            ObjectKind::Function,
+            &schema,
+            "twice",
+            &functions[0].detail,
+        ),
+    )
+    .await;
+    assert_eq!(
+        s.list_objects(&schema, ObjectKind::Function)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // A dump restores into an empty schema: types and the free sequence come first, and the
+    // sequence carries on from where it was.
+    let check = "SELECT string_agg(feeling || '/' || contact || '/' || coalesce(p::text, '-') || '/' || \
+                 coalesce(span::text, '-') || '/' || ticket, ',' ORDER BY id) || '|' || \
+                 (SELECT count(*) FROM fine) FROM person";
+    let expected = rows(&mut s, check).await.rows[0][0].clone();
+    let mut out = Vec::new();
+    dump_database(
+        s.as_mut(),
+        &schema,
+        &DumpOptions::default(),
+        &mut out,
+        &mut |_| {},
+    )
+    .await
+    .unwrap();
+    let dump = String::from_utf8(out).unwrap();
+    let restored = format!("{schema}_restored");
+    exec(&mut s, &format!("DROP SCHEMA IF EXISTS {restored} CASCADE")).await;
+    exec(&mut s, &format!("CREATE SCHEMA {restored}")).await;
+    s.use_database(&restored).await.unwrap();
+    let run = run_script(s.as_mut(), &dump, true, &mut |_, _| {}).await;
+    if !run.errors.is_empty() {
+        let (n, _) = &run.errors[0];
+        let statements = split_statements_for(&dump, D);
+        panic!(
+            "{:?}\n--- statement {n}:\n{}",
+            run.errors,
+            statements[n - 1].sql
+        );
+    }
+    assert_eq!(rows(&mut s, check).await.rows[0][0], expected);
+    assert_eq!(
+        rows(&mut s, "SELECT nextval('ticket')").await.rows[0][0],
+        Value::Int(125)
+    );
+    // Restoring again over it, replacing what's there, keeps the types that already exist.
+    let replace = DumpOptions {
+        drop_existing: true,
+        ..DumpOptions::default()
+    };
+    s.use_database(&schema).await.unwrap();
+    let mut out = Vec::new();
+    dump_database(s.as_mut(), &schema, &replace, &mut out, &mut |_| {})
+        .await
+        .unwrap();
+    s.use_database(&restored).await.unwrap();
+    let run = run_script(
+        s.as_mut(),
+        &String::from_utf8(out).unwrap(),
+        true,
+        &mut |_, _| {},
+    )
+    .await;
+    assert!(run.errors.is_empty(), "{:?}", run.errors);
+    assert_eq!(rows(&mut s, check).await.rows[0][0], expected);
+    exec(&mut s, &format!("DROP SCHEMA {restored} CASCADE")).await;
+
+    // A copy over another connection.
+    let copied = format!("{schema}_copied");
+    let mut other = connect().await.unwrap();
+    exec(
+        &mut other,
+        &format!("DROP SCHEMA IF EXISTS {copied} CASCADE"),
+    )
+    .await;
+    s.use_database(&schema).await.unwrap();
+    copy_database(
+        s.as_mut(),
+        &schema,
+        other.as_mut(),
+        &copied,
+        &DumpOptions::default(),
+        &mut |_| {},
+    )
+    .await
+    .unwrap();
+    other.use_database(&copied).await.unwrap();
+    assert_eq!(rows(&mut other, check).await.rows[0][0], expected);
+    exec(&mut other, &format!("DROP SCHEMA {copied} CASCADE")).await;
+    cleanup(s, &schema).await;
+}

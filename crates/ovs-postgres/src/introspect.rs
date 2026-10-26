@@ -82,10 +82,14 @@ pub(crate) async fn objects(
              FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
              WHERE n.nspname = {ns} AND c.relkind IN ('v', 'm') ORDER BY 1"
         ),
+        // Not those PostgreSQL made itself (a range type's constructors) or that come with an
+        // extension: they're created along with their type or extension.
         ObjectKind::Procedure | ObjectKind::Function => format!(
             "SELECT p.proname AS name, pg_get_function_identity_arguments(p.oid) AS detail \
              FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
-             WHERE n.nspname = {ns} AND p.prokind = '{}' ORDER BY 1, 2",
+             WHERE n.nspname = {ns} AND p.prokind = '{}' \
+             AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_proc'::regclass \
+             AND d.objid = p.oid AND d.deptype IN ('i', 'e')) ORDER BY 1, 2",
             if kind == ObjectKind::Procedure {
                 'p'
             } else {
@@ -99,6 +103,26 @@ pub(crate) async fn objects(
              WHERE n.nspname = {ns} AND NOT t.tgisinternal ORDER BY 1"
         ),
         ObjectKind::Event => return Ok(Vec::new()),
+        // The detail names the column that owns the sequence (serial or identity), if any.
+        ObjectKind::Sequence => format!(
+            "SELECT c.relname AS name, coalesce((SELECT t.relname || '.' || a.attname \
+             FROM pg_depend d JOIN pg_class t ON t.oid = d.refobjid \
+             JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = d.refobjsubid \
+             WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid \
+             AND d.deptype IN ('a', 'i') LIMIT 1), '') AS detail \
+             FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = {ns} AND c.relkind = 'S' ORDER BY 1"
+        ),
+        // Types users create: not tables' row types, arrays, or extensions' types.
+        ObjectKind::Type => format!(
+            "SELECT t.typname AS name, CASE t.typtype WHEN 'e' THEN 'enum' WHEN 'd' THEN 'domain' \
+             WHEN 'c' THEN 'composite' ELSE 'range' END AS detail \
+             FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace \
+             WHERE n.nspname = {ns} AND t.typtype IN ('e', 'd', 'c', 'r') \
+             AND (t.typtype <> 'c' OR (SELECT c.relkind FROM pg_class c WHERE c.oid = t.typrelid) = 'c') \
+             AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_type'::regclass \
+             AND d.objid = t.oid AND d.deptype = 'e') ORDER BY 1"
+        ),
     };
     let rs = s.rows(&sql).await?;
     Ok(rs
@@ -457,6 +481,78 @@ pub(crate) async fn ddl(
         ),
         ObjectKind::Event => {
             return Err(Error::Unsupported("PostgreSQL has no events".into()));
+        }
+        ObjectKind::Sequence => format!(
+            "SELECT 'CREATE SEQUENCE ' || {} || ' AS ' || data_type::text || \
+             ' INCREMENT BY ' || increment_by || ' MINVALUE ' || min_value || \
+             ' MAXVALUE ' || max_value || ' START WITH ' || start_value || \
+             ' CACHE ' || cache_size || CASE WHEN cycle THEN ' CYCLE' ELSE ' NO CYCLE' END || \
+             coalesce(';' || chr(10) || 'SELECT setval(' || quote_literal({}) || ', ' || \
+             last_value || ')', '') AS def \
+             FROM pg_sequences WHERE schemaname = {ns} AND sequencename = {}",
+            D.quote_str(&D.qualified(schema, name)),
+            D.quote_str(&D.qualified(schema, name)),
+            D.quote_str(name)
+        ),
+        ObjectKind::Type => return type_ddl(s, schema, name).await,
+    };
+    let rs = s.rows(&sql).await?;
+    rs.rows
+        .first()
+        .map(|r| text(&rs, r, "def"))
+        .filter(|d| !d.is_empty())
+        .ok_or_else(|| Error::Other(format!("{name} not found")))
+}
+
+/// `CREATE TYPE` (or `CREATE DOMAIN`) for an enum, domain, composite or range type.
+async fn type_ddl(s: &mut PostgresSession, schema: &str, name: &str) -> Result<String> {
+    let found = s
+        .rows(&format!(
+            "SELECT t.oid::text AS oid, t.typtype::text AS kind FROM pg_type t \
+             JOIN pg_namespace n ON n.oid = t.typnamespace \
+             WHERE n.nspname = {} AND t.typname = {}",
+            D.quote_str(schema),
+            D.quote_str(name)
+        ))
+        .await?;
+    let row = found
+        .rows
+        .first()
+        .ok_or_else(|| Error::Other(format!("{name} not found")))?;
+    let (oid, kind) = (text(&found, row, "oid"), text(&found, row, "kind"));
+    let target = D.quote_str(&D.qualified(schema, name));
+    let sql = match kind.as_str() {
+        "e" => format!(
+            "SELECT 'CREATE TYPE ' || {target} || ' AS ENUM (' || \
+             string_agg(quote_literal(enumlabel), ', ' ORDER BY enumsortorder) || ')' AS def \
+             FROM pg_enum WHERE enumtypid = {oid}"
+        ),
+        // PostgreSQL 17 also records NOT NULL as a constraint; typnotnull covers it.
+        "d" => format!(
+            "SELECT 'CREATE DOMAIN ' || {target} || ' AS ' || \
+             format_type(t.typbasetype, t.typtypmod) || \
+             coalesce(' DEFAULT ' || t.typdefault, '') || \
+             CASE WHEN t.typnotnull THEN ' NOT NULL' ELSE '' END || \
+             coalesce((SELECT string_agg(' CONSTRAINT ' || quote_ident(c.conname) || ' ' || \
+             pg_get_constraintdef(c.oid), '' ORDER BY c.conname) \
+             FROM pg_constraint c WHERE c.contypid = t.oid AND c.contype <> 'n'), '') AS def \
+             FROM pg_type t WHERE t.oid = {oid}"
+        ),
+        "c" => format!(
+            "SELECT 'CREATE TYPE ' || {target} || ' AS (' || \
+             string_agg(quote_ident(a.attname) || ' ' || format_type(a.atttypid, a.atttypmod), \
+             ', ' ORDER BY a.attnum) || ')' AS def \
+             FROM pg_type t JOIN pg_attribute a ON a.attrelid = t.typrelid \
+             WHERE t.oid = {oid} AND a.attnum > 0 AND NOT a.attisdropped"
+        ),
+        "r" => format!(
+            "SELECT 'CREATE TYPE ' || {target} || ' AS RANGE (SUBTYPE = ' || \
+             format_type(rngsubtype, NULL) || ')' AS def FROM pg_range WHERE rngtypid = {oid}"
+        ),
+        other => {
+            return Err(Error::Unsupported(format!(
+                "{name} is a kind of type ({other}) that can't be shown"
+            )));
         }
     };
     let rs = s.rows(&sql).await?;

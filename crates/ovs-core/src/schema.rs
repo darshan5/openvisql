@@ -10,18 +10,37 @@ pub enum ObjectKind {
     Function,
     Trigger,
     Event,
+    /// PostgreSQL only.
+    Sequence,
+    /// PostgreSQL only: enums, domains, composite and range types.
+    Type,
 }
 
 impl ObjectKind {
     /// Folder kinds listed under each database, in display order.
-    pub const DATABASE_CHILDREN: [Self; 6] = [
+    pub const DATABASE_CHILDREN: [Self; 8] = [
         Self::Table,
         Self::View,
+        Self::Sequence,
+        Self::Type,
         Self::Procedure,
         Self::Function,
         Self::Trigger,
         Self::Event,
     ];
+
+    /// Whether databases of dialect `d` have objects of this kind.
+    pub fn exists_in(self, d: crate::sql::Dialect) -> bool {
+        use crate::sql::Dialect;
+        match d {
+            Dialect::MySql => !matches!(self, Self::Sequence | Self::Type),
+            Dialect::Postgres => self != Self::Event,
+            Dialect::Sqlite => matches!(
+                self,
+                Self::Database | Self::Table | Self::View | Self::Trigger
+            ),
+        }
+    }
 
     pub fn folder_label(self) -> &'static str {
         match self {
@@ -32,6 +51,8 @@ impl ObjectKind {
             Self::Function => "Functions",
             Self::Trigger => "Triggers",
             Self::Event => "Events",
+            Self::Sequence => "Sequences",
+            Self::Type => "Types",
         }
     }
 
@@ -45,6 +66,8 @@ impl ObjectKind {
             Self::Function => "FUNCTION",
             Self::Trigger => "TRIGGER",
             Self::Event => "EVENT",
+            Self::Sequence => "SEQUENCE",
+            Self::Type => "TYPE",
         }
     }
 

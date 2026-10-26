@@ -42,6 +42,9 @@ pub fn create_template(d: Dialect, kind: ObjectKind, db: &str, table: Option<&st
             "CREATE EVENT {}\nON SCHEDULE EVERY 1 DAY\nDO\n  SELECT 1;\n",
             q("new_event")
         ),
+        ObjectKind::Sequence | ObjectKind::Type => {
+            format!("-- MySQL has no {}s.\n", kind.sql_keyword().to_lowercase())
+        }
     }
 }
 
@@ -73,6 +76,15 @@ fn postgres_create_template(kind: ObjectKind, schema: &str, table: Option<&str>)
             table = q(table.unwrap_or("table_name"))
         ),
         ObjectKind::Event => "-- PostgreSQL has no events; use the pg_cron extension.\n".to_owned(),
+        ObjectKind::Sequence => format!(
+            "CREATE SEQUENCE {}\n  AS bigint\n  START WITH 1\n  INCREMENT BY 1;\n",
+            q("new_sequence")
+        ),
+        // Also: CREATE DOMAIN … AS text CHECK (…), CREATE TYPE … AS (field type, …).
+        ObjectKind::Type => format!(
+            "CREATE TYPE {} AS ENUM ('first', 'second');\n",
+            q("new_type")
+        ),
     }
 }
 
@@ -94,7 +106,12 @@ fn sqlite_create_template(kind: ObjectKind, db: &str, table: Option<&str>) -> St
             q("new_trigger"),
             d.quote_ident(table.unwrap_or("table_name"))
         ),
-        ObjectKind::Database | ObjectKind::Procedure | ObjectKind::Function | ObjectKind::Event => {
+        ObjectKind::Database
+        | ObjectKind::Procedure
+        | ObjectKind::Function
+        | ObjectKind::Event
+        | ObjectKind::Sequence
+        | ObjectKind::Type => {
             format!("-- SQLite has no {}s.\n", kind.sql_keyword().to_lowercase())
         }
     }
@@ -284,6 +301,32 @@ pub fn drop_object(d: Dialect, kind: ObjectKind, db: &str, name: &str) -> String
     }
 }
 
+/// The `DROP` for an object as the browser lists it, where `detail` (see `SchemaObject`) says
+/// what `kind` alone doesn't: a trigger's table, a PostgreSQL function's arguments, whether a
+/// view is materialized or a type is a domain.
+pub fn drop_statement(d: Dialect, kind: ObjectKind, db: &str, name: &str, detail: &str) -> String {
+    let target = d.qualified(db, name);
+    match (d, kind) {
+        (_, ObjectKind::Trigger) => drop_trigger(d, db, name, detail, false),
+        (Dialect::Postgres, ObjectKind::View) if detail == "materialized" => {
+            format!("DROP MATERIALIZED VIEW {target}")
+        }
+        // Overloads share a name; the arguments pick one.
+        (Dialect::Postgres, ObjectKind::Procedure | ObjectKind::Function) => {
+            format!("DROP {} {target}({detail})", kind.sql_keyword())
+        }
+        (Dialect::Postgres, ObjectKind::Type) if detail == "domain" => {
+            format!("DROP DOMAIN {target}")
+        }
+        _ => drop_object(d, kind, db, name),
+    }
+}
+
+/// Re-runs a PostgreSQL materialized view's query.
+pub fn refresh_materialized_view(d: Dialect, db: &str, name: &str) -> String {
+    format!("REFRESH MATERIALIZED VIEW {}", d.qualified(db, name))
+}
+
 /// `DROP TRIGGER`; PostgreSQL names triggers per table, so it needs `table` too.
 pub fn drop_trigger(d: Dialect, db: &str, name: &str, table: &str, if_exists: bool) -> String {
     let exists = if if_exists { "IF EXISTS " } else { "" };
@@ -379,11 +422,55 @@ mod tests {
             ObjectKind::Function,
             ObjectKind::Trigger,
             ObjectKind::Event,
+            ObjectKind::Sequence,
+            ObjectKind::Type,
         ] {
             for d in [Dialect::MySql, Dialect::Sqlite] {
                 let sql = create_template(d, kind, "shop", Some("orders"));
                 assert!(split_statements(&sql).len() <= 1, "{kind:?}: {sql}");
             }
+        }
+    }
+
+    #[test]
+    fn drops_say_what_postgres_needs() {
+        let p = Dialect::Postgres;
+        assert_eq!(
+            drop_statement(p, ObjectKind::View, "s", "mv", "materialized"),
+            "DROP MATERIALIZED VIEW \"s\".\"mv\""
+        );
+        assert_eq!(
+            drop_statement(p, ObjectKind::View, "s", "v", ""),
+            "DROP VIEW \"s\".\"v\""
+        );
+        assert_eq!(
+            drop_statement(p, ObjectKind::Function, "s", "f", "a integer, b text"),
+            "DROP FUNCTION \"s\".\"f\"(a integer, b text)"
+        );
+        assert_eq!(
+            drop_statement(p, ObjectKind::Type, "s", "email", "domain"),
+            "DROP DOMAIN \"s\".\"email\""
+        );
+        assert_eq!(
+            drop_statement(p, ObjectKind::Type, "s", "mood", "enum"),
+            "DROP TYPE \"s\".\"mood\""
+        );
+        assert_eq!(
+            drop_statement(p, ObjectKind::Trigger, "s", "t", "orders"),
+            "DROP TRIGGER \"t\" ON \"s\".\"orders\""
+        );
+        // MySQL routines are dropped by name alone.
+        assert_eq!(
+            drop_statement(D, ObjectKind::Function, "shop", "f", ""),
+            "DROP FUNCTION `shop`.`f`"
+        );
+        assert_eq!(
+            refresh_materialized_view(p, "s", "mv"),
+            "REFRESH MATERIALIZED VIEW \"s\".\"mv\""
+        );
+        for kind in [ObjectKind::Sequence, ObjectKind::Type] {
+            let sql = create_template(p, kind, "s", None);
+            assert_eq!(split_statements(&sql).len(), 1, "{sql}");
         }
     }
 

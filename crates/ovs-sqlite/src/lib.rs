@@ -320,7 +320,11 @@ impl Session for SqliteSession {
             ObjectKind::Table => "table",
             ObjectKind::View => "view",
             ObjectKind::Trigger => "trigger",
-            ObjectKind::Procedure | ObjectKind::Function | ObjectKind::Event => {
+            ObjectKind::Procedure
+            | ObjectKind::Function
+            | ObjectKind::Event
+            | ObjectKind::Sequence
+            | ObjectKind::Type => {
                 return Ok(Vec::new());
             }
         };
