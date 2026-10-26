@@ -489,7 +489,7 @@ impl ObjectBrowser {
         node: Option<&Node>,
         menu: PopupMenu,
     ) -> PopupMenu {
-        // Server-only features: routines, events, backups, copying, the designer.
+        // Server-only features: routines, events, creating databases, the designer.
         let mysql = d == Dialect::MySql;
         let emit = |event: BrowserEvent| {
             let this = this.clone();
@@ -606,23 +606,20 @@ impl ObjectBrowser {
                             None,
                         )));
                 }
-                menu = menu.separator();
-                if mysql {
-                    menu = menu
-                        .item(
-                            PopupMenuItem::new("Back up database…")
-                                .on_click(emit(BrowserEvent::Backup(db.clone()))),
-                        )
-                        .item(
-                            PopupMenuItem::new("Copy to another connection…").on_click(emit(
-                                BrowserEvent::CopyTo {
-                                    db: db.clone(),
-                                    table: None,
-                                },
-                            )),
-                        );
-                }
                 menu = menu
+                    .separator()
+                    .item(
+                        PopupMenuItem::new("Back up database…")
+                            .on_click(emit(BrowserEvent::Backup(db.clone()))),
+                    )
+                    .item(
+                        PopupMenuItem::new("Copy to another connection…").on_click(emit(
+                            BrowserEvent::CopyTo {
+                                db: db.clone(),
+                                table: None,
+                            },
+                        )),
+                    )
                     .item(
                         PopupMenuItem::new("Run SQL script…")
                             .on_click(emit(BrowserEvent::RunScript(db.clone()))),
@@ -708,20 +705,19 @@ impl ObjectBrowser {
                 menu = menu.separator();
                 if *kind == ObjectKind::Table {
                     let (rename_db, rename_from) = (db.clone(), name.clone());
+                    menu = menu.item(PopupMenuItem::new("Copy table to…").on_click(emit(
+                        BrowserEvent::CopyTo {
+                            db: db.clone(),
+                            table: Some(name.clone()),
+                        },
+                    )));
                     if mysql {
-                        menu = menu
-                            .item(PopupMenuItem::new("Copy table to…").on_click(emit(
-                                BrowserEvent::CopyTo {
-                                    db: db.clone(),
-                                    table: Some(name.clone()),
-                                },
-                            )))
-                            .item(PopupMenuItem::new("Design table…").on_click(emit(
-                                BrowserEvent::DesignTable {
-                                    db: db.clone(),
-                                    table: Some(name.clone()),
-                                },
-                            )));
+                        menu = menu.item(PopupMenuItem::new("Design table…").on_click(emit(
+                            BrowserEvent::DesignTable {
+                                db: db.clone(),
+                                table: Some(name.clone()),
+                            },
+                        )));
                     }
                     menu = menu
                         .item(PopupMenuItem::new("New trigger…").on_click(new_object(

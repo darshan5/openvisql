@@ -145,14 +145,28 @@ pub async fn copy_database(
     progress: &mut (dyn FnMut(&str) + Send),
 ) -> Result<DumpStats> {
     let d = target.dialect();
-    target
-        .execute(
-            &format!("CREATE DATABASE IF NOT EXISTS {}", d.quote_ident(target_db)),
-            Some(0),
-        )
-        .await?;
-    target.use_database(target_db).await?;
-    let collations = Collations::of(target).await?;
+    if source.dialect() != d {
+        return Err(Error::Unsupported(
+            "copying between different kinds of database".into(),
+        ));
+    }
+    let collations = match d {
+        Dialect::MySql => {
+            target
+                .execute(
+                    &format!("CREATE DATABASE IF NOT EXISTS {}", d.quote_ident(target_db)),
+                    Some(0),
+                )
+                .await?;
+            target.use_database(target_db).await?;
+            Collations::of(target).await?
+        }
+        // A SQLite database is a file; it (or an attached one) must already be open.
+        Dialect::Sqlite => {
+            target.use_database(target_db).await?;
+            Collations::default()
+        }
+    };
     let (from, to) = (
         format!("{}.", d.quote_ident(db)),
         format!("{}.", d.quote_ident(target_db)),
@@ -171,9 +185,12 @@ pub async fn copy_database(
     let Output::Session(target) = output else {
         unreachable!("output is a session")
     };
-    let restored = target
-        .execute("SET UNIQUE_CHECKS = 1, FOREIGN_KEY_CHECKS = 1", Some(0))
-        .await;
+    let mut restored = Ok(());
+    for sql in checks_on(d) {
+        if let Err(err) = target.execute(sql, Some(0)).await {
+            restored = Err(err);
+        }
+    }
     let stats = result?;
     restored?;
     Ok(stats)
@@ -256,6 +273,25 @@ impl Collations {
     }
 }
 
+/// Statements that make restoring fast and order-independent: no constraint checks.
+fn checks_off(d: Dialect) -> &'static [&'static str] {
+    match d {
+        Dialect::MySql => &[
+            "SET NAMES utf8mb4",
+            "SET FOREIGN_KEY_CHECKS = 0",
+            "SET UNIQUE_CHECKS = 0",
+        ],
+        Dialect::Sqlite => &["PRAGMA foreign_keys = OFF"],
+    }
+}
+
+fn checks_on(d: Dialect) -> &'static [&'static str] {
+    match d {
+        Dialect::MySql => &["SET UNIQUE_CHECKS = 1", "SET FOREIGN_KEY_CHECKS = 1"],
+        Dialect::Sqlite => &["PRAGMA foreign_keys = ON"],
+    }
+}
+
 /// Writes `db`'s objects to `out`, passing each `CREATE` through `adapt` first.
 async fn transfer(
     session: &mut dyn Session,
@@ -274,11 +310,7 @@ async fn transfer(
             ddl
         }
     };
-    for sql in [
-        "SET NAMES utf8mb4",
-        "SET FOREIGN_KEY_CHECKS = 0",
-        "SET UNIQUE_CHECKS = 0",
-    ] {
+    for sql in checks_off(d) {
         out.statement(sql, false).await?;
     }
     out.note("")?;
@@ -349,14 +381,17 @@ async fn transfer(
                     .await?;
                 }
                 // Bodies contain `;`, so routines, triggers and events use another delimiter.
-                out.statement(&ddl, kind != ObjectKind::View).await?;
+                // SQLite needs no DELIMITER: its trigger bodies split correctly as written.
+                out.statement(&ddl, kind != ObjectKind::View && d == Dialect::MySql)
+                    .await?;
                 out.note("")?;
                 stats.other_objects += 1;
             }
         }
     }
-    out.statement("SET UNIQUE_CHECKS = 1", false).await?;
-    out.statement("SET FOREIGN_KEY_CHECKS = 1", false).await?;
+    for sql in checks_on(d) {
+        out.statement(sql, false).await?;
+    }
     Ok(stats)
 }
 

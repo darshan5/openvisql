@@ -51,7 +51,10 @@ impl CopyForm {
     fn pick_target(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.target = ix;
         let same = self.targets[ix].config.id == self.source.config.id;
-        let name = if same {
+        let name = if !self.targets[ix].config.engine.is_server() {
+            // A SQLite connection is one file: copy into it.
+            "main".to_owned()
+        } else if same {
             format!("{}_copy", self.db)
         } else {
             self.db.clone()
@@ -141,10 +144,14 @@ pub fn open(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let mut targets = cx
+    // Copies stay within one kind of database: their DDL isn't portable.
+    let mut targets: Vec<OpenConnection> = cx
         .try_global::<OpenConnections>()
         .map(|open| open.0.clone())
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|t| t.config.engine == source.config.engine)
+        .collect();
     if !targets.iter().any(|t| t.config.id == source.config.id) {
         targets.insert(0, source.clone());
     }

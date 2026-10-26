@@ -110,8 +110,8 @@ Phase 2 is complete.
   by templates, paging, grid edits, export and CSV import.
 - ✅ Object browser shows `main` and attached databases with tables, views and triggers;
   server-only menus are hidden.
-- Table designer for SQLite (its limited `ALTER TABLE` means rebuilding the table), and
-  backup/copy for SQLite files.
+- ✅ Backup to a SQL script, restore by running it, and copy tables between SQLite files.
+- Table designer for SQLite (its limited `ALTER TABLE` means rebuilding the table).
 
 ## Phase 5: PostgreSQL
 

@@ -293,3 +293,84 @@ async fn missing_path_is_reported() {
     };
     assert!(err.to_string().contains("database file"), "{err}");
 }
+
+#[tokio::test]
+async fn dumps_restores_and_copies_databases() {
+    use ovs_core::dump::{DumpOptions, copy_database, dump_database, run_script};
+
+    let src_db = TempDb::new("dump-src");
+    let mut src = src_db.open().await;
+    exec(&mut src, SCHEMA).await;
+    exec(
+        &mut src,
+        "INSERT INTO owners (name, data) VALUES ('ada', X'00FF'), ('it''s', NULL);
+         INSERT INTO pets (owner, tag, weight) VALUES (1, 'rex', 12.5), (2, 'tom', 3);",
+    )
+    .await;
+
+    let mut out = Vec::new();
+    let stats = dump_database(
+        src.as_mut(),
+        "main",
+        &DumpOptions::default(),
+        &mut out,
+        &mut |_| {},
+    )
+    .await
+    .unwrap();
+    // owners and pets, plus the two log rows the trigger wrote.
+    assert_eq!((stats.tables, stats.rows), (3, 6));
+    let script = String::from_utf8(out).unwrap();
+    assert!(!script.contains("DELIMITER"), "{script}");
+    assert!(!script.contains("SET NAMES"), "{script}");
+
+    let restored_db = TempDb::new("dump-dst");
+    let mut restored = restored_db.open().await;
+    let run = run_script(restored.as_mut(), &script, true, &mut |_, _| {}).await;
+    assert!(run.errors.is_empty(), "{:?}", run.errors);
+    let check = "SELECT (SELECT group_concat(x, ',') FROM (SELECT name || hex(coalesce(data, '')) AS x FROM owners ORDER BY id)) || '|' || \
+                 (SELECT group_concat(x, ',') FROM (SELECT tag || weight AS x FROM pets ORDER BY tag)) || '|' || \
+                 (SELECT COUNT(*) FROM log) || '|' || \
+                 (SELECT COUNT(*) FROM sqlite_master WHERE type IN ('view', 'trigger'))";
+    let expected = rows(&mut src, check).await.rows[0][0].clone();
+    assert_eq!(rows(&mut restored, check).await.rows[0][0], expected);
+    // The restored trigger works.
+    exec(&mut restored, "INSERT INTO owners (name) VALUES ('new')").await;
+    assert_eq!(
+        rows(&mut restored, "SELECT COUNT(*) FROM log").await.rows[0][0],
+        Value::Int(3)
+    );
+
+    // Copy just the pets table into a third file.
+    let copy_db = TempDb::new("copy-dst");
+    let mut copy = copy_db.open().await;
+    let options = DumpOptions {
+        tables: Some(vec!["pets".into()]),
+        ..DumpOptions::default()
+    };
+    let stats = copy_database(
+        src.as_mut(),
+        "main",
+        copy.as_mut(),
+        "main",
+        &options,
+        &mut |_| {},
+    )
+    .await
+    .unwrap();
+    assert_eq!(stats.tables, 1);
+    assert_eq!(
+        rows(&mut copy, "SELECT COUNT(*) FROM pets").await.rows[0][0],
+        Value::Int(2)
+    );
+    // The trigger belongs to owners, which wasn't copied.
+    assert_eq!(
+        rows(
+            &mut copy,
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger'"
+        )
+        .await
+        .rows[0][0],
+        Value::Int(0)
+    );
+}
