@@ -159,8 +159,8 @@ Phase 5 is complete.
   join line has a marker to change its kind (INNER, LEFT, RIGHT, FULL where supported) or
   remove it. A grid sets each column's output, alias, sort type and order, aggregate,
   grouping and criteria (`> 100`, `LIKE 'a%'`, `IS NULL`, or a value). Distinct, limit and
-  offset; further queries combined with UNION, UNION ALL, INTERSECT or EXCEPT in tabs. Live
-  SQL; "Open in editor" or "Run" in the connection's window. The generated SQL is tested on
+  offset. One query at a time (decided 2026-10-26). Live SQL; "Open in editor" or "Run" in
+  the connection's window. The generated SQL is tested on
   MySQL, MariaDB, PostgreSQL and SQLite.
 - ✅ ER diagram (right-click a database → "ER diagram…"), in a window of its own: tables as
   boxes listing their columns (primary keys `#`, foreign keys `→`), lines between key

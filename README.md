@@ -68,10 +68,10 @@ the right, and results below.
   DEFINER clauses optional) and **run SQL scripts** to restore, stopping at the first error.
 - **Import CSV** into a table: header matching or by position, NULL markers, one transaction
   that rolls back on error.
-- **Visual query builder** for JOINs and UNIONs without typing them: tables as boxes on a
-  canvas, joined by dragging between columns (foreign keys join themselves), with a grid for
-  aliases, sorting, aggregates, grouping and criteria, and UNION, INTERSECT or EXCEPT parts
-  in tabs. The SQL is shown live and opened or run in a query tab.
+- **Visual query builder** for JOINs without typing them: tables as boxes on a canvas,
+  joined by dragging between columns (foreign keys join themselves), with a grid for
+  aliases, sorting, aggregates, grouping and criteria. The SQL is shown live and opened or
+  run in a query tab.
 - **ER diagram** of a database in its own window: tables with their columns and foreign-key
   lines, laid out automatically; pan, zoom, drag tables, and export as SVG.
 - **Copy** a database or table straight to another server of the same engine (open in a tab

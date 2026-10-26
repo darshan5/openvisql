@@ -1,8 +1,8 @@
 //! The visual query builder, in a window of its own. Tables are boxes on a canvas: tick
 //! columns to select them, and drag from a column to a column of another table to join them
 //! (foreign keys are joined for you). Each join line has a marker to change its kind. The grid
-//! below sets aliases, sorting, aggregates, grouping and criteria per column, and more
-//! `SELECT`s can be combined with `UNION` and friends in tabs. The SQL is shown live.
+//! below sets aliases, sorting, aggregates, grouping and criteria per column. The SQL is shown
+//! live.
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -16,7 +16,6 @@ use gpui_kit::component::{
     input::{Input, InputEvent, InputState},
     menu::{DropdownMenu as _, PopupMenu, PopupMenuItem},
     scroll::ScrollableElement as _,
-    tab::{Tab, TabBar},
     v_flex,
 };
 use gpui_kit::{
@@ -28,7 +27,6 @@ use gpui_kit::{
 use ovs_core::sql::Dialect;
 use ovs_core::sql::builder::{
     Aggregate, ColumnRef, Criterion, JoinKind, OrderItem, Query, SelectItem, SelectPart,
-    SetOperator,
 };
 use ovs_core::{ForeignKeyInfo, ObjectKind};
 
@@ -60,9 +58,9 @@ struct RowUi {
     criteria: Entity<InputState>,
 }
 
-/// One `SELECT`: its tables and joins (in `part`), their places on the canvas, and its grid.
+/// The `SELECT`: its tables and joins (in `part`), their places on the canvas, and its grid.
+#[derive(Default)]
 struct PartUi {
-    operator: SetOperator,
     part: SelectPart,
     boxes: HashMap<String, (f32, f32)>,
     rows: Vec<RowUi>,
@@ -91,8 +89,7 @@ pub struct QueryBuilder {
     filter: Entity<InputState>,
     columns: HashMap<String, Columns>,
     foreign_keys: HashMap<String, Vec<ForeignKeyInfo>>,
-    parts: Vec<PartUi>,
-    active: usize,
+    ui: PartUi,
     limit: Entity<InputState>,
     offset_rows: Entity<InputState>,
     /// Where the canvas origin is drawn, for panning.
@@ -130,8 +127,7 @@ impl QueryBuilder {
             filter: filter.clone(),
             columns: HashMap::new(),
             foreign_keys: HashMap::new(),
-            parts: Vec::new(),
-            active: 0,
+            ui: PartUi::default(),
             limit: limit.clone(),
             offset_rows: offset_rows.clone(),
             offset: point(px(24.), px(24.)),
@@ -145,7 +141,6 @@ impl QueryBuilder {
         for input in [&filter, &limit, &offset_rows] {
             builder.watch(input, cx);
         }
-        builder.add_part(SetOperator::Union);
         builder
     }
 
@@ -158,34 +153,11 @@ impl QueryBuilder {
             }));
     }
 
-    fn add_part(&mut self, operator: SetOperator) {
-        self.parts.push(PartUi {
-            operator,
-            part: SelectPart::default(),
-            boxes: HashMap::new(),
-            rows: Vec::new(),
-        });
-        self.active = self.parts.len() - 1;
-    }
-
-    /// Removes query `ix` (never the first), keeping the same tab selected where possible.
-    fn remove_part(&mut self, ix: usize, cx: &mut Context<Self>) {
-        if ix == 0 || ix >= self.parts.len() {
-            return;
-        }
-        self.parts.remove(ix);
-        // Removing the open tab shows the one before it; later tabs shift down by one.
-        if self.active >= ix {
-            self.active -= 1;
-        }
-        cx.notify();
-    }
-
     fn part(&mut self) -> &mut PartUi {
-        &mut self.parts[self.active]
+        &mut self.ui
     }
 
-    /// Loads `table`'s columns and foreign keys if needed, then adds it to the active query.
+    /// Loads `table`'s columns and foreign keys if needed, then adds it to the query.
     fn add_table(&mut self, table: String, cx: &mut Context<Self>) {
         if self.columns.contains_key(&table) {
             self.insert_table(&table, cx);
@@ -249,7 +221,7 @@ impl QueryBuilder {
     /// of everything, moved down past any box already there.
     fn free_spot(&self, table: &str, partner: Option<&str>) -> (f32, f32) {
         const GAP: f32 = 110.;
-        let ui = &self.parts[self.active];
+        let ui = &self.ui;
         let placed: Vec<(f32, f32, f32, f32)> = ui
             .part
             .tables()
@@ -318,8 +290,8 @@ impl QueryBuilder {
     }
 
     /// The point where a column's row meets the side of its box facing `toward_x`.
-    fn anchor(&self, ix: usize, column: &ColumnRef, toward_x: f32) -> Option<(f32, f32)> {
-        let ui = &self.parts[ix];
+    fn anchor(&self, column: &ColumnRef, toward_x: f32) -> Option<(f32, f32)> {
+        let ui = &self.ui;
         let table = ui
             .part
             .tables()
@@ -347,13 +319,8 @@ impl QueryBuilder {
     }
 
     /// `column`'s anchor on the side of its box facing `other`'s box.
-    fn anchor_toward(
-        &self,
-        ix: usize,
-        column: &ColumnRef,
-        other: &ColumnRef,
-    ) -> Option<(f32, f32)> {
-        let ui = &self.parts[ix];
+    fn anchor_toward(&self, column: &ColumnRef, other: &ColumnRef) -> Option<(f32, f32)> {
+        let ui = &self.ui;
         let &(ox, _) = ui.boxes.get(&other.alias)?;
         let other_table = ui
             .part
@@ -361,14 +328,11 @@ impl QueryBuilder {
             .into_iter()
             .find(|t| t.alias == other.alias)?;
         let other_mid = ox + self.box_width(&other_table.table) / 2.;
-        self.anchor(ix, column, other_mid)
+        self.anchor(column, other_mid)
     }
 
     fn row_of(&self, column: &ColumnRef) -> Option<usize> {
-        self.parts[self.active]
-            .rows
-            .iter()
-            .position(|r| r.column == *column)
+        self.ui.rows.iter().position(|r| r.column == *column)
     }
 
     /// Ticking a column shows it; unticking hides it, keeping it in the grid if it still sorts,
@@ -376,7 +340,7 @@ impl QueryBuilder {
     fn toggle_column(&mut self, column: ColumnRef, window: &mut Window, cx: &mut Context<Self>) {
         match self.row_of(&column) {
             Some(ix) => {
-                let row = &mut self.parts[self.active].rows[ix];
+                let row = &mut self.ui.rows[ix];
                 if row.visible {
                     let used = row.sort.is_some()
                         || row.group
@@ -384,7 +348,7 @@ impl QueryBuilder {
                     if used {
                         row.visible = false;
                     } else {
-                        self.parts[self.active].rows.remove(ix);
+                        self.ui.rows.remove(ix);
                     }
                 } else {
                     row.visible = true;
@@ -401,7 +365,7 @@ impl QueryBuilder {
             cx.new(|cx| InputState::new(window, cx).placeholder("e.g. > 100 or LIKE 'a%'"));
         self.watch(&alias, cx);
         self.watch(&criteria, cx);
-        self.parts[self.active].rows.push(RowUi {
+        self.ui.rows.push(RowUi {
             column,
             visible: true,
             alias,
@@ -418,7 +382,7 @@ impl QueryBuilder {
         if a.alias == b.alias || a.column == "*" || b.column == "*" {
             return;
         }
-        let part = &mut self.parts[self.active].part;
+        let part = &mut self.ui.part;
         let order: Vec<String> = part.tables().iter().map(|t| t.alias.clone()).collect();
         let (Some(ia), Some(ib)) = (
             order.iter().position(|x| *x == a.alias),
@@ -443,75 +407,46 @@ impl QueryBuilder {
     /// The model, with every input's current text.
     fn query(&self, cx: &App) -> Query {
         let number = |input: &Entity<InputState>| input.read(cx).value().trim().parse().ok();
-        let build = |ui: &PartUi| {
-            let mut part = ui.part.clone();
-            part.columns = ui
-                .rows
-                .iter()
-                .filter(|r| r.visible)
-                .map(|r| SelectItem {
-                    column: r.column.clone(),
-                    aggregate: r.aggregate,
-                    alias: r.alias.read(cx).value().trim().to_owned(),
-                })
-                .collect();
-            part.criteria = ui
-                .rows
-                .iter()
-                .map(|r| Criterion {
-                    column: r.column.clone(),
-                    text: r.criteria.read(cx).value().to_string(),
-                })
-                .collect();
-            part.group_by = ui
-                .rows
-                .iter()
-                .filter(|r| r.group)
-                .map(|r| r.column.clone())
-                .collect();
-            let mut sorted: Vec<&RowUi> = ui.rows.iter().filter(|r| r.sort.is_some()).collect();
-            sorted.sort_by_key(|r| r.sorted_at);
-            part.order_by = sorted
-                .iter()
-                .map(|r| OrderItem {
-                    column: r.column.clone(),
-                    descending: r.sort == Some(true),
-                })
-                .collect();
-            part
-        };
-        let mut first = build(&self.parts[0]);
-        let combined = self.parts.len() > 1;
-        // A combined query sorts its result by output column position.
-        let mut union_order = Vec::new();
-        if combined {
-            let visible: Vec<&RowUi> = self.parts[0].rows.iter().filter(|r| r.visible).collect();
-            for item in std::mem::take(&mut first.order_by) {
-                if let Some(p) = visible.iter().position(|r| r.column == item.column) {
-                    union_order.push((p + 1, item.descending));
-                }
-            }
-        } else {
-            first.limit = number(&self.limit);
-            first.offset = number(&self.offset_rows);
-        }
+        let ui = &self.ui;
+        let mut part = ui.part.clone();
+        part.columns = ui
+            .rows
+            .iter()
+            .filter(|r| r.visible)
+            .map(|r| SelectItem {
+                column: r.column.clone(),
+                aggregate: r.aggregate,
+                alias: r.alias.read(cx).value().trim().to_owned(),
+            })
+            .collect();
+        part.criteria = ui
+            .rows
+            .iter()
+            .map(|r| Criterion {
+                column: r.column.clone(),
+                text: r.criteria.read(cx).value().to_string(),
+            })
+            .collect();
+        part.group_by = ui
+            .rows
+            .iter()
+            .filter(|r| r.group)
+            .map(|r| r.column.clone())
+            .collect();
+        let mut sorted: Vec<&RowUi> = ui.rows.iter().filter(|r| r.sort.is_some()).collect();
+        sorted.sort_by_key(|r| r.sorted_at);
+        part.order_by = sorted
+            .iter()
+            .map(|r| OrderItem {
+                column: r.column.clone(),
+                descending: r.sort == Some(true),
+            })
+            .collect();
+        part.limit = number(&self.limit);
+        part.offset = number(&self.offset_rows);
         Query {
-            first,
-            rest: self.parts[1..]
-                .iter()
-                .map(|ui| {
-                    let mut part = build(ui);
-                    part.order_by.clear();
-                    (ui.operator, part)
-                })
-                .collect(),
-            order_by: union_order,
-            limit: if combined { number(&self.limit) } else { None },
-            offset: if combined {
-                number(&self.offset_rows)
-            } else {
-                None
-            },
+            first: part,
+            ..Query::default()
         }
     }
 
@@ -647,8 +582,7 @@ impl QueryBuilder {
     }
 
     fn render_boxes(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let ix = self.active;
-        let ui = &self.parts[ix];
+        let ui = &self.ui;
         let theme = cx.theme();
         let (border, header, muted, bg, hover) = (
             theme.border,
@@ -675,13 +609,13 @@ impl QueryBuilder {
                     let (down, up, tick) = (column.clone(), column.clone(), column);
                     let star = name == "*";
                     h_flex()
-                        .id(SharedString::from(format!("box-{ix}-{alias}-{c}")))
+                        .id(SharedString::from(format!("box-{alias}-{c}")))
                         .h(px(ROW))
                         .px_2()
                         .gap_2()
                         .hover(move |s| s.bg(hover))
                         .child(
-                            Checkbox::new(SharedString::from(format!("tick-{ix}-{alias}-{c}")))
+                            Checkbox::new(SharedString::from(format!("tick-{alias}-{c}")))
                                 .xsmall()
                                 .checked(checked)
                                 .on_change(cx.listener(move |this, _: &bool, window, cx| {
@@ -731,7 +665,7 @@ impl QueryBuilder {
             let (close, moving) = (alias.clone(), alias.clone());
             out.push(
                 v_flex()
-                    .id(("builder-box", ix * 1000 + b))
+                    .id(("builder-box", b))
                     .absolute()
                     .left(self.offset.x + px(x))
                     .top(self.offset.y + px(y))
@@ -770,7 +704,7 @@ impl QueryBuilder {
                                     .child(format!("{} ({})", table.table, table.alias)),
                             )
                             .child(
-                                Button::new(("close-box", ix * 1000 + b))
+                                Button::new(("close-box", b))
                                     .ghost()
                                     .xsmall()
                                     .icon(IconName::Close)
@@ -789,8 +723,7 @@ impl QueryBuilder {
 
     /// A marker on each join's lines, showing its kind; clicking it changes or removes it.
     fn render_markers(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let ix = self.active;
-        let ui = &self.parts[ix];
+        let ui = &self.ui;
         let kinds: Vec<JoinKind> = JoinKind::available(self.dialect)
             .iter()
             .copied()
@@ -799,8 +732,7 @@ impl QueryBuilder {
         let mut out = Vec::new();
         for (j, join) in ui.part.joins.iter().enumerate() {
             for (p, (a, b)) in join.on.iter().enumerate() {
-                let (Some(pa), Some(pb)) =
-                    (self.anchor_toward(ix, a, b), self.anchor_toward(ix, b, a))
+                let (Some(pa), Some(pb)) = (self.anchor_toward(a, b), self.anchor_toward(b, a))
                 else {
                     continue;
                 };
@@ -821,7 +753,7 @@ impl QueryBuilder {
                         .left(self.offset.x + px(mid.0 - 34.))
                         .top(self.offset.y + px(mid.1 - 11.))
                         .child(picker(
-                            ("join-marker", ix * 100_000 + j * 100 + p),
+                            ("join-marker", j * 100 + p),
                             label,
                             68.,
                             items,
@@ -847,7 +779,6 @@ impl QueryBuilder {
     }
 
     fn render_grid(&self, cx: &mut Context<Self>) -> AnyElement {
-        let ix = self.active;
         let muted = cx.theme().muted_foreground;
         let head = |text: &'static str, width: Option<f32>| {
             let cell = div().text_xs().text_color(muted).child(text);
@@ -856,7 +787,8 @@ impl QueryBuilder {
                 None => cell.flex_1(),
             }
         };
-        let mut sorted: Vec<(usize, usize)> = self.parts[ix]
+        let mut sorted: Vec<(usize, usize)> = self
+            .ui
             .rows
             .iter()
             .enumerate()
@@ -868,12 +800,13 @@ impl QueryBuilder {
         let aggregates: Vec<String> = std::iter::once("—".to_owned())
             .chain(Aggregate::ALL.iter().map(|a| a.label().to_owned()))
             .collect();
-        let rows: Vec<AnyElement> = self.parts[ix]
+        let rows: Vec<AnyElement> = self
+            .ui
             .rows
             .iter()
             .enumerate()
             .map(|(r, row)| {
-                let id = ix * 10_000 + r;
+                let id = r;
                 h_flex()
                     .gap_2()
                     .h(px(30.))
@@ -1015,81 +948,16 @@ impl QueryBuilder {
     }
 
     fn render_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
-        let tabs: Vec<Tab> = self
-            .parts
-            .iter()
-            .enumerate()
-            .map(|(i, ui)| {
-                if i == 0 {
-                    return Tab::new().label("Query 1");
-                }
-                Tab::new()
-                    .label(format!("{} · Query {}", ui.operator.keyword(), i + 1))
-                    .suffix(
-                        Button::new(("remove-part", i))
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::Close)
-                            .tooltip("Remove this query")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.remove_part(i, cx);
-                            })),
-                    )
-            })
-            .collect();
-        let active = self.active;
-        let distinct = self.parts[active].part.distinct;
+        let distinct = self.ui.part.distinct;
         h_flex()
             .h(px(44.))
             .px_3()
             .gap_3()
             .border_b_1()
             .border_color(cx.theme().border)
-            .child(
-                TabBar::new("builder-parts")
-                    .underline()
-                    .small()
-                    .selected_index(active)
-                    .on_click(cx.listener(|this, ix: &usize, _, cx| {
-                        // A tab's × removes it first, then the click reaches the bar.
-                        if *ix < this.parts.len() {
-                            this.active = *ix;
-                        }
-                        cx.notify();
-                    }))
-                    .children(tabs),
-            )
-            .child(
-                Button::new("add-part")
-                    .ghost()
-                    .xsmall()
-                    .icon(IconName::Plus)
-                    .label("UNION")
-                    .tooltip("Combine with another SELECT (UNION, INTERSECT, EXCEPT)")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.add_part(SetOperator::Union);
-                        cx.notify();
-                    })),
-            )
-            .when(active > 0, |el| {
-                el.child(picker(
-                    ("set-op", active),
-                    self.parts[active].operator.keyword(),
-                    110.,
-                    SetOperator::ALL
-                        .iter()
-                        .map(|o| o.keyword().to_owned())
-                        .collect(),
-                    move |this, k, _, cx| {
-                        this.part().operator = SetOperator::ALL[k];
-                        cx.notify();
-                    },
-                    cx,
-                ))
-            })
             .child(div().flex_1())
             .child(
-                Checkbox::new(("distinct", active))
+                Checkbox::new("distinct")
                     .label("Distinct")
                     .checked(distinct)
                     .on_change(cx.listener(|this, value: &bool, _, cx| {
@@ -1125,21 +993,17 @@ impl QueryBuilder {
 
 impl Render for QueryBuilder {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.active = self.active.min(self.parts.len() - 1);
         let theme = cx.theme();
         let (line, muted, bg) = (
             theme.muted_foreground,
             theme.muted_foreground,
             theme.background,
         );
-        let ix = self.active;
         // Every join line, plus the one being drawn.
         let mut links: Vec<((f32, f32), (f32, f32))> = Vec::new();
-        for join in &self.parts[ix].part.joins {
+        for join in &self.ui.part.joins {
             for (a, b) in &join.on {
-                if let (Some(pa), Some(pb)) =
-                    (self.anchor_toward(ix, a, b), self.anchor_toward(ix, b, a))
-                {
+                if let (Some(pa), Some(pb)) = (self.anchor_toward(a, b), self.anchor_toward(b, a)) {
                     links.push((pa, pb));
                 }
             }
@@ -1148,7 +1012,7 @@ impl Render for QueryBuilder {
             let origin = self.canvas.get().map_or(Point::default(), |b| b.origin);
             let target = *to - origin - self.offset;
             let target = (f32::from(target.x), f32::from(target.y));
-            if let Some(start) = self.anchor(ix, from, target.0) {
+            if let Some(start) = self.anchor(from, target.0) {
                 links.push((start, target));
             }
         }
@@ -1185,7 +1049,7 @@ impl Render for QueryBuilder {
         )
         .absolute()
         .size_full();
-        let empty = self.parts[ix].part.from.is_none();
+        let empty = self.ui.part.from.is_none();
         let sidebar = self.render_sidebar(cx);
         let boxes = self.render_boxes(cx);
         let markers = self.render_markers(cx);
