@@ -9,7 +9,15 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-use gpui_kit::{EntityId, IntoElement, Pixels, Styled as _, canvas, px};
+use gpui_kit::component::{
+    IconName, Sizable as _,
+    button::{Button, ButtonVariants as _},
+    menu::{DropdownMenu as _, PopupMenuItem},
+};
+use gpui_kit::{
+    Anchor, App, ElementId, EntityId, IntoElement, Pixels, SharedString, Styled as _, Window,
+    canvas, px,
+};
 
 /// Narrowest a tab gets: enough for a few characters, the ellipsis and the close button.
 pub const MIN_TAB_WIDTH: f32 = 90.;
@@ -46,6 +54,48 @@ impl TabFit {
         .absolute()
         .size_full()
     }
+}
+
+/// Callback taking a tab index.
+pub type OnSelect = Rc<dyn Fn(usize, &mut Window, &mut App)>;
+/// Callback for the "new tab" item.
+pub type OnNew = Rc<dyn Fn(&mut Window, &mut App)>;
+
+/// A dropdown at the end of a tab bar listing every tab, with a "new" item first. It stays
+/// visible however many tabs there are, unlike the "+" after the last tab, which scrolls away.
+pub fn tab_list_menu(
+    id: impl Into<ElementId>,
+    new_label: &'static str,
+    titles: Vec<SharedString>,
+    active: usize,
+    on_new: OnNew,
+    on_select: OnSelect,
+) -> impl IntoElement {
+    Button::new(id)
+        .ghost()
+        .xsmall()
+        .dropdown_caret(true)
+        .tooltip("All tabs")
+        .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
+            let on_new = on_new.clone();
+            let mut menu = menu
+                .scrollable(true)
+                .item(
+                    PopupMenuItem::new(new_label)
+                        .icon(IconName::Plus)
+                        .on_click(move |_, window, cx| on_new(window, cx)),
+                )
+                .separator();
+            for (ix, title) in titles.iter().enumerate() {
+                let on_select = on_select.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(title.clone())
+                        .checked(ix == active)
+                        .on_click(move |_, window, cx| on_select(ix, window, cx)),
+                );
+            }
+            menu
+        })
 }
 
 #[allow(clippy::cast_precision_loss)]

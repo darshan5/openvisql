@@ -32,6 +32,13 @@ Behaviour targets come from [FEATURE_SPEC.md](FEATURE_SPEC.md). Source code that
 
 ## Phase 2: Day-to-day essentials
 
+Progress:
+- ✅ Export (2026-10-25)
+- ✅ Autocomplete (2026-10-25)
+- Done along the way:
+  - inline tab rename and tab-list dropdowns with a "New" item
+  - Save, Discard, + Row and Export in the results bar
+
 - **Grid editing, remaining:**
   - Choose the source table for multi-table results.
   - Duplicate a row.

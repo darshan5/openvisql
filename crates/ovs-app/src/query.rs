@@ -1,6 +1,9 @@
 //! A query tab: SQL editor on top, results below. Each tab owns its own server session so a
 //! long-running query in one tab never blocks another tab or the object browser.
 
+use std::cell::RefCell;
+use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -20,12 +23,15 @@ use gpui_kit::{
     Subscription, Task, Window, div, prelude::FluentBuilder as _, px,
 };
 use ovs_core::editing::{EditTarget, single_source_table};
+use ovs_core::export::{ExportOptions, export};
 use ovs_core::sql::{self, Statement, StatementKind};
 use ovs_core::{
     CancelHandle, ConnectionConfig, Error, QueryOutcome, ResultSet, StatementReport, Value,
 };
 use ovs_store::{HistoryEntry, SavedQueryTab, Store};
 
+use crate::completion::{CompletionSource, SqlCompletions};
+use crate::export_dialog::ExportForm;
 use crate::grid::{Editability, ResultGrid};
 use crate::runtime::{self, SharedSession};
 
@@ -109,6 +115,8 @@ pub struct QueryTab {
     editor: Entity<EditorState>,
     session: SessionState,
     database: Option<String>,
+    /// Shared with the completion provider.
+    database_cell: Rc<RefCell<Option<String>>>,
     results: Vec<ResultTab>,
     reports: Vec<StatementReport>,
     /// Index into `results`; `results.len()` selects Messages.
@@ -120,6 +128,8 @@ pub struct QueryTab {
 
 /// What a new query tab starts with.
 pub struct TabSpec {
+    /// Schema cache and metadata session shared by the connection's tabs, for autocomplete.
+    pub completion: CompletionSource,
     pub title: SharedString,
     pub database: Option<String>,
     pub sql: String,
@@ -135,11 +145,18 @@ impl QueryTab {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let database_cell = Rc::new(RefCell::new(spec.database.clone()));
+        let provider = Rc::new(SqlCompletions {
+            source: spec.completion.clone(),
+            database: database_cell.clone(),
+        });
         let editor = cx.new(|cx| {
-            EditorState::new(window, cx)
+            let mut state = EditorState::new(window, cx)
                 .language("sql")
                 .line_number(true)
-                .default_value(spec.sql)
+                .default_value(spec.sql);
+            state.lsp_mut().completion_provider = Some(provider);
+            state
         });
         // Re-render (and let the workspace refresh its Ln/Col) whenever the editor changes.
         cx.observe(&editor, |_, _, cx| {
@@ -161,6 +178,7 @@ impl QueryTab {
             editor,
             session: SessionState::Connecting,
             database: spec.database.clone(),
+            database_cell,
             results: Vec::new(),
             reports: Vec::new(),
             active_result: 0,
@@ -222,6 +240,12 @@ impl QueryTab {
         .detach();
     }
 
+    /// Records the tab's default database, also for autocomplete.
+    fn set_database_name(&mut self, database: Option<String>) {
+        self.database_cell.replace(database.clone());
+        self.database = database;
+    }
+
     pub fn title(&self) -> SharedString {
         self.title.clone()
     }
@@ -279,7 +303,7 @@ impl QueryTab {
                 runtime::run(async move { session.lock().await.use_database(&target).await }).await;
             this.update(cx, |this, cx| {
                 match result {
-                    Ok(()) => this.database = Some(db),
+                    Ok(()) => this.set_database_name(Some(db)),
                     Err(err) => this.push_note(format!("USE {db}: {err}")),
                 }
                 cx.emit(QueryEvent::DatabaseChanged);
@@ -477,7 +501,7 @@ impl QueryTab {
         if report.error.is_none() {
             match &kind {
                 StatementKind::Use(db) => {
-                    self.database = Some(db.clone());
+                    self.set_database_name(Some(db.clone()));
                     cx.emit(QueryEvent::DatabaseChanged);
                 }
                 k if k.changes_schema() => cx.emit(QueryEvent::SchemaChanged),
@@ -545,7 +569,11 @@ impl QueryTab {
             self.detect_editability(table.clone(), schema.clone(), name.clone(), cx);
         }
         self.results.push(ResultTab {
-            label: format!("{n} Result").into(),
+            label: if n == 1 {
+                "Results".into()
+            } else {
+                format!("Results {n}").into()
+            },
             table,
             rows,
             elapsed,
@@ -713,6 +741,134 @@ impl QueryTab {
         }
     }
 
+    /// Opens the Export dialog for the active result.
+    fn open_export(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(result) = self.results.get(self.active_result) else {
+            return;
+        };
+        let data = result.table.read(cx).delegate().data().clone();
+        // "All rows" only makes sense when a LIMIT (or the fetch cap) cut the result short.
+        let fetch_sql = result
+            .source_sql
+            .clone()
+            .filter(|_| result.hit_limit || result.truncated);
+        let table = single_source_table(&data).map_or_else(|| "result".to_owned(), |(_, t)| t);
+        let shown = data.rows.len();
+        let has_more = fetch_sql.is_some();
+        let form = cx.new(|cx| ExportForm::new(shown, has_more, table, window, cx));
+        let this = cx.entity().downgrade();
+        let title = self.title.clone();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let (form, this, data) = (form.clone(), this.clone(), data.clone());
+            let (fetch_sql, title) = (fetch_sql.clone(), title.clone());
+            dialog
+                .title("Export result")
+                .w(px(640.))
+                .child(form.clone())
+                .footer(
+                    h_flex()
+                        .gap_2()
+                        .justify_end()
+                        .child(
+                            Button::new("export-cancel")
+                                .label("Cancel")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("export-go")
+                                .primary()
+                                .label("Export…")
+                                .on_click(move |_, window, cx| {
+                                    let (options, all) = {
+                                        let form = form.read(cx);
+                                        (form.options(cx), form.all_rows())
+                                    };
+                                    window.close_dialog(cx);
+                                    let fetch = fetch_sql.clone().filter(|_| all);
+                                    let (data, title) = (data.clone(), title.clone());
+                                    this.update(cx, |this, cx| {
+                                        this.run_export(data, fetch, options, &title, window, cx);
+                                    })
+                                    .ok();
+                                }),
+                        ),
+                )
+        });
+    }
+
+    /// Asks where to save, then writes the export, re-running `fetch_sql` without its LIMIT
+    /// first when every row was requested.
+    fn run_export(
+        &mut self,
+        data: Arc<ResultSet>,
+        fetch_sql: Option<String>,
+        options: ExportOptions,
+        title: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let SessionState::Ready { session, .. } = &self.session else {
+            return;
+        };
+        let session = session.clone();
+        let dir = dirs::download_dir()
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let safe_title: String = title
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || "-_ ".contains(c) {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let name = format!("{}.{}", safe_title.trim(), options.format.extension());
+        let chosen = cx.prompt_for_new_path(&dir, Some(&name));
+        cx.spawn_in(window, async move |_, cx| {
+            let Ok(Ok(Some(path))) = chosen.await else {
+                return;
+            };
+            let target = path.clone();
+            let outcome = runtime::run(async move {
+                let rs = match fetch_sql {
+                    Some(sql) => {
+                        let out = session
+                            .lock()
+                            .await
+                            .execute(&sql::strip_limit(&sql), None)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        out.into_iter()
+                            .find_map(|o| match o {
+                                QueryOutcome::Rows(rs) => Some(rs),
+                                QueryOutcome::Affected { .. } => None,
+                            })
+                            .ok_or("the query returned no rows")?
+                    }
+                    None => (*data).clone(),
+                };
+                let file = std::fs::File::create(&target).map_err(|e| e.to_string())?;
+                let mut out = std::io::BufWriter::new(file);
+                export(&rs, &options, &mut out)
+                    .and_then(|()| std::io::Write::flush(&mut out))
+                    .map_err(|e| e.to_string())?;
+                Ok::<_, String>(rs.rows.len())
+            })
+            .await;
+            cx.update(|window, cx| {
+                let message = match outcome {
+                    Ok(rows) => format!("Exported {rows} rows to {}", path.display()),
+                    Err(err) => format!("Export failed: {err}"),
+                };
+                window.push_notification(message, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn discard_edits(&mut self, cx: &mut Context<Self>) {
         if let Some(result) = self.results.get(self.active_result) {
             result.table.update(cx, |table, cx| {
@@ -735,56 +891,25 @@ impl QueryTab {
         }
     }
 
-    fn render_result_footer(&self, result: &ResultTab, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let (muted, warning) = (theme.muted_foreground, theme.warning);
+    /// Save, Discard, add row and Export, shown in the results tab bar so they're easy to find.
+    fn render_result_actions(
+        &self,
+        result: &ResultTab,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let grid = result.table.read(cx).delegate();
         let saving = self.running.is_some();
-        let controls = match grid.editability() {
-            Editability::Checking => h_flex(),
-            Editability::ReadOnly(reason) => h_flex()
-                .text_color(muted)
-                .child(format!("Read-only: {reason}")),
-            Editability::Editable(target) => {
-                let pending = grid.pending().row_count();
-                let mut row = h_flex().gap_2();
-                if !target.has_unique_key() {
-                    row = row.child(
-                        div()
-                            .text_color(warning)
-                            .child("No usable key: rows are matched on all columns (LIMIT 1)"),
-                    );
-                }
-                if pending == 0 {
-                    row.child(div().text_color(muted).child("Double-click a cell to edit"))
-                        .child(
-                            Button::new("add-row")
-                                .ghost()
-                                .xsmall()
-                                .icon(IconName::Plus)
-                                .label("Row")
-                                .on_click(cx.listener(|this, _, _, cx| this.add_row(cx))),
-                        )
-                } else {
-                    row.child(div().child(format!(
-                        "{pending} pending change{}",
-                        if pending == 1 { "" } else { "s" }
-                    )))
-                    .child(
-                        Button::new("add-row")
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::Plus)
-                            .label("Row")
-                            .on_click(cx.listener(|this, _, _, cx| this.add_row(cx))),
-                    )
-                    .child(
-                        Button::new("discard-edits")
-                            .xsmall()
-                            .label("Discard")
-                            .disabled(saving)
-                            .on_click(cx.listener(|this, _, _, cx| this.discard_edits(cx))),
-                    )
+        let mut row = h_flex().gap_1().pr_1().items_center();
+        if let Editability::Editable(_) = grid.editability() {
+            let pending = grid.pending().row_count();
+            if pending > 0 {
+                row =
+                    row.child(div().text_xs().text_color(cx.theme().warning).px_1().child(
+                        format!(
+                            "{pending} unsaved change{}",
+                            if pending == 1 { "" } else { "s" }
+                        ),
+                    ))
                     .child(
                         Button::new("save-edits")
                             .primary()
@@ -796,7 +921,50 @@ impl QueryTab {
                                 this.save_edits(window, cx);
                             })),
                     )
-                }
+                    .child(
+                        Button::new("discard-edits")
+                            .xsmall()
+                            .label("Discard")
+                            .disabled(saving)
+                            .on_click(cx.listener(|this, _, _, cx| this.discard_edits(cx))),
+                    );
+            }
+            row = row.child(
+                Button::new("add-row")
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::Plus)
+                    .label("Row")
+                    .tooltip("Add a row")
+                    .on_click(cx.listener(|this, _, _, cx| this.add_row(cx))),
+            );
+        }
+        row.child(
+            Button::new("export")
+                .ghost()
+                .xsmall()
+                .icon(IconName::ArrowDown)
+                .label("Export")
+                .tooltip("Export to CSV, JSON, SQL, Markdown or HTML")
+                .on_click(cx.listener(|this, _, window, cx| this.open_export(window, cx))),
+        )
+    }
+
+    /// Row count and timing on the left; editability hints on the right.
+    fn render_result_footer(result: &ResultTab, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (muted, warning) = (theme.muted_foreground, theme.warning);
+        let grid = result.table.read(cx).delegate();
+        let hint = match grid.editability() {
+            Editability::Checking => div(),
+            Editability::ReadOnly(reason) => div()
+                .text_color(muted)
+                .child(format!("Read-only: {reason}")),
+            Editability::Editable(target) if !target.has_unique_key() => div()
+                .text_color(warning)
+                .child("No usable key: rows are matched on all columns (LIMIT 1)"),
+            Editability::Editable(_) => {
+                div().text_color(muted).child("Double-click a cell to edit")
             }
         };
         h_flex()
@@ -808,7 +976,7 @@ impl QueryTab {
             .border_color(theme.border)
             .text_xs()
             .child(div().text_color(muted).child(result_footer(result)))
-            .child(controls)
+            .child(hint)
     }
 
     /// Inserts `text` at the editor cursor (replacing any selection) and focuses the editor.
@@ -1002,8 +1170,12 @@ impl Render for QueryTab {
             .iter()
             .map(|r| Tab::new().label(r.label.clone()))
             .collect();
-        tabs.push(Tab::new().label(format!("{} Messages", messages_ix + 1)));
+        tabs.push(Tab::new().label("Messages"));
 
+        let actions = self
+            .results
+            .get(active)
+            .map(|result| self.render_result_actions(result, cx).into_any_element());
         let body = if let Some(result) = self.results.get(active) {
             v_flex()
                 .size_full()
@@ -1013,7 +1185,7 @@ impl Render for QueryTab {
                         .min_h_0()
                         .child(DataTable::new(&result.table).small().stripe(true)),
                 )
-                .child(self.render_result_footer(result, cx))
+                .child(Self::render_result_footer(result, cx))
                 .into_any_element()
         } else {
             self.render_messages(cx).into_any_element()
@@ -1057,7 +1229,8 @@ impl Render for QueryTab {
                             this.active_result = *ix;
                             cx.notify();
                         }))
-                        .children(tabs),
+                        .children(tabs)
+                        .when_some(actions, TabBar::suffix),
                 )
                 .when_some(banner, |el, (text, color)| {
                     el.child(div().px_2().py_1().text_sm().text_color(color).child(text))

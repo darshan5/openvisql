@@ -6,6 +6,7 @@
 //! back when the user connects to that connection again.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::time::Duration;
 
 use gpui_kit::component::{
@@ -23,7 +24,7 @@ use ovs_store::{SavedConnectionTab, Session, Store};
 use uuid::Uuid;
 
 use crate::connect::{ConnectEvent, ConnectView};
-use crate::tab_fit::{TAB_BAR_RESERVED, TabFit};
+use crate::tab_fit::{TAB_BAR_RESERVED, TabFit, tab_list_menu};
 use crate::workspace::{Workspace, WorkspaceEvent};
 use crate::{CloseConnection, NewConnection, NextConnection, PreviousConnection, window_options};
 
@@ -229,6 +230,7 @@ impl Render for AppShell {
             Some(ShellTab::Connected(ws)) => div().size_full().child(ws.clone()),
             None => div(),
         };
+        let this = cx.entity().downgrade();
         let tabs: Vec<Tab> = self
             .tabs
             .iter()
@@ -274,7 +276,27 @@ impl Render for AppShell {
                     .child(self.tab_fit.measure(cx.entity_id()))
                     .child(
                         TabBar::new("connection-tabs")
-                            .menu(true)
+                            .suffix(tab_list_menu(
+                                "connection-tab-list",
+                                "New connection",
+                                self.tabs.iter().map(|t| Self::tab_label(t, cx)).collect(),
+                                self.active,
+                                Rc::new({
+                                    let this = this.clone();
+                                    move |window, cx| {
+                                        this.update(cx, |this, cx| {
+                                            this.show_connections(window, cx);
+                                        })
+                                        .ok();
+                                    }
+                                }),
+                                Rc::new({
+                                    let this = this.clone();
+                                    move |ix, _, cx| {
+                                        this.update(cx, |this, cx| this.select(ix, cx)).ok();
+                                    }
+                                }),
+                            ))
                             .max_width(
                                 self.tab_fit
                                     .tab_width(self.tabs.len(), px(TAB_BAR_RESERVED)),

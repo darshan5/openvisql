@@ -21,6 +21,10 @@ the right, and results below.
   triggers, events → columns and indexes. Includes a filter box and context menus (open data,
   show `CREATE`, copy name).
 - SQL editor with syntax highlighting, line numbers, find and replace.
+- **Autocomplete** for tables, views, columns (aliases resolved), databases, functions and
+  keywords. It opens as you type, or with **Ctrl+Space**, and caches schema per connection.
+- **Export** results to CSV, JSON, SQL INSERT, Markdown or HTML, either the rows shown or all
+  rows. The grid's context menu can also copy everything in those formats.
 - Execute the statement under the cursor or the selection (**F9** / **⌘↵**), or everything
   (**Ctrl+F9** / **⇧⌘↵**). Handles `DELIMITER` for stored-program bodies.
 - Runs each query tab on its own connection, so long queries never block the rest of the app.

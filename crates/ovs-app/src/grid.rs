@@ -16,6 +16,7 @@ use gpui_kit::{
     Styled as _, Subscription, Window, div, px,
 };
 use ovs_core::editing::{EditTarget, PendingEdits};
+use ovs_core::export::{ExportFormat, ExportOptions, export_to_string};
 use ovs_core::{ResultSet, Value};
 
 /// Rough average glyph width used to size columns before the user resizes them.
@@ -407,7 +408,8 @@ impl TableDelegate for ResultGrid {
                     cx.write_to_clipboard(ClipboardItem::new_string(row_text.clone()));
                 }),
             )
-            .item(PopupMenuItem::new("Copy all rows with headers").on_click(
+            .item(PopupMenuItem::new("Copy all rows with headers").on_click({
+                let (data, order) = (data.clone(), order.clone());
                 move |_, _, cx: &mut App| {
                     let header = data
                         .columns
@@ -421,8 +423,37 @@ impl TableDelegate for ResultGrid {
                         text.push_str(&tsv_row(&data.rows[r]));
                     }
                     cx.write_to_clipboard(ClipboardItem::new_string(text));
-                },
-            ));
+                }
+            }));
+        // Copy every row, in the order shown, in another format.
+        let ordered = Arc::new(ResultSet {
+            columns: data.columns.clone(),
+            rows: order.iter().map(|&r| data.rows[r].clone()).collect(),
+            truncated: data.truncated,
+        });
+        let copy_as = |format: ExportFormat| {
+            let ordered = ordered.clone();
+            move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| {
+                let options = ExportOptions {
+                    format,
+                    ..ExportOptions::default()
+                };
+                cx.write_to_clipboard(ClipboardItem::new_string(export_to_string(
+                    &ordered, &options,
+                )));
+            }
+        };
+        let menu = menu
+            .item(PopupMenuItem::new("Copy all as CSV").on_click(copy_as(ExportFormat::Csv)))
+            .item(PopupMenuItem::new("Copy all as JSON").on_click(copy_as(ExportFormat::Json)))
+            .item(
+                PopupMenuItem::new("Copy all as Markdown")
+                    .on_click(copy_as(ExportFormat::Markdown)),
+            )
+            .item(
+                PopupMenuItem::new("Copy all as SQL INSERT")
+                    .on_click(copy_as(ExportFormat::SqlInsert)),
+            );
         if self.target().is_none() {
             return menu;
         }

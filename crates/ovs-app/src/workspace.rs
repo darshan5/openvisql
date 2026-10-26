@@ -1,10 +1,10 @@
 //! One connection: toolbar, object browser on the left, query tabs on the right, status bar at
 //! the bottom. Shown inside a connection tab of the main window.
 
-use std::cell::Cell;
+use std::rc::Rc;
 
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, IconName, Sizable as _, WindowExt as _,
+    ActiveTheme as _, Disableable as _, IconName, Sizable as _,
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState},
@@ -14,22 +14,29 @@ use gpui_kit::component::{
     v_flex,
 };
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, EntityId, EventEmitter, Focusable as _,
-    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, px,
+    App, AppContext as _, Context, Entity, EntityId, EventEmitter, InteractiveElement as _,
+    IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
+    Styled as _, Subscription, Window, div, px,
 };
 use ovs_core::sql::Dialect;
 use ovs_core::{ConnectionConfig, ObjectKind};
 use ovs_store::SavedConnectionTab;
 
 use crate::browser::{BrowserEvent, ObjectBrowser};
+use crate::completion::CompletionSource;
 use crate::query::{DEFAULT_ROW_LIMIT, QueryEvent, QueryTab, RunMode, TabSpec, format_duration};
 use crate::runtime::{self, SharedSession};
-use crate::tab_fit::{TAB_BAR_RESERVED, TabFit};
+use crate::tab_fit::{OnNew, OnSelect, TAB_BAR_RESERVED, TabFit, tab_list_menu};
 use crate::{
     CloseQueryTab, ExecuteAll, ExecuteCurrent, NewConnection, NewQueryTab, RefreshBrowser,
     StopQuery, WORKSPACE_CONTEXT,
 };
+
+struct InlineRename {
+    tab: Entity<QueryTab>,
+    input: Entity<InputState>,
+    _subscription: Subscription,
+}
 
 /// Payload of a query tab being dragged to a new position.
 #[derive(Clone)]
@@ -85,6 +92,10 @@ pub struct Workspace {
     active: usize,
     next_tab_number: usize,
     tab_fit: TabFit,
+    /// The query tab whose title is being edited in place.
+    renaming: Option<InlineRename>,
+    /// Autocomplete's schema cache, shared by this connection's query tabs.
+    completion: CompletionSource,
     subscriptions: Vec<Subscription>,
 }
 
@@ -103,6 +114,7 @@ impl Workspace {
             .map(str::to_owned)
             .collect();
         let browser = cx.new(|cx| ObjectBrowser::new(session.clone(), allowed, window, cx));
+        let completion = CompletionSource::new(session.clone());
         let sub = cx.subscribe_in(&browser, window, Self::on_browser_event);
 
         // The version is read once; it's needed for the status bar only.
@@ -126,6 +138,8 @@ impl Workspace {
             active: 0,
             next_tab_number: 1,
             tab_fit: TabFit::default(),
+            renaming: None,
+            completion,
             subscriptions: vec![sub],
         };
         let saved = restore.unwrap_or_default();
@@ -182,62 +196,50 @@ impl Workspace {
         Self::changed(cx);
     }
 
-    fn open_rename(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+    /// Turns a tab's title into a text field for renaming in place.
+    fn start_rename(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = self.tabs.get(ix).cloned() else {
             return;
         };
+        if self
+            .renaming
+            .as_ref()
+            .is_some_and(|r| r.tab.entity_id() == tab.entity_id())
+        {
+            return;
+        }
+        self.finish_rename(cx);
         let current = tab.read(cx).title();
         let input = cx.new(|cx| InputState::new(window, cx).default_value(current));
-        let apply = {
-            let input = input.clone();
-            let tab = tab.clone();
-            let this = cx.entity().downgrade();
-            move |window: &mut Window, cx: &mut App| {
-                let name = input.read(cx).value().trim().to_owned();
-                if !name.is_empty() {
-                    tab.update(cx, |tab, cx| tab.rename(name.into(), cx));
-                    this.update(cx, |_, cx| Self::changed(cx)).ok();
-                }
-                window.close_dialog(cx);
-            }
-        };
-        let on_enter = apply.clone();
-        self.subscriptions.push(cx.subscribe_in(
-            &input,
-            window,
-            move |_, _, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::PressEnter { .. }) {
-                    on_enter(window, cx);
-                }
-            },
-        ));
-        let first_build = Cell::new(true);
-        window.open_dialog(cx, move |dialog, window, cx| {
-            if first_build.replace(false) {
-                input.focus_handle(cx).focus(window, cx);
-            }
-            let apply = apply.clone();
-            dialog
-                .title("Rename query tab")
-                .w(px(380.))
-                .child(Input::new(&input))
-                .footer(
-                    h_flex()
-                        .gap_2()
-                        .justify_end()
-                        .child(
-                            Button::new("rename-cancel")
-                                .label("Cancel")
-                                .on_click(|_, window, cx| window.close_dialog(cx)),
-                        )
-                        .child(
-                            Button::new("rename-ok")
-                                .primary()
-                                .label("Rename")
-                                .on_click(move |_, window, cx| apply(window, cx)),
-                        ),
-                )
+        input.update(cx, |state, cx| {
+            state.focus(window, cx);
+            state.select_all(window, cx);
         });
+        // Runs inside this workspace's update, so it works on `this` directly.
+        let subscription = cx.subscribe(&input, |this, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
+                this.finish_rename(cx);
+            }
+        });
+        self.renaming = Some(InlineRename {
+            tab,
+            input,
+            _subscription: subscription,
+        });
+        cx.notify();
+    }
+
+    /// Applies the name being typed, if any. An empty name keeps the old one.
+    fn finish_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(rename) = self.renaming.take() else {
+            return;
+        };
+        let name = rename.input.read(cx).value().trim().to_owned();
+        if !name.is_empty() {
+            rename.tab.update(cx, |tab, cx| tab.rename(name.into(), cx));
+            Self::changed(cx);
+        }
+        cx.notify();
     }
 
     fn add_tab(
@@ -256,20 +258,24 @@ impl Workspace {
         });
         let config = self.config.clone();
         let password = self.password.clone();
+        let completion = self.completion.clone();
         let tab = cx.new(|cx| {
             let spec = TabSpec {
                 title: title.into(),
                 database,
                 sql,
                 run_on_connect: run,
+                completion,
             };
             QueryTab::new(spec, config, password, window, cx)
         });
         let sub = cx.subscribe_in(&tab, window, |this, _, event: &QueryEvent, _, cx| {
             match event {
-                QueryEvent::SchemaChanged => this
-                    .browser
-                    .update(cx, super::browser::ObjectBrowser::refresh),
+                QueryEvent::SchemaChanged => {
+                    this.completion.invalidate();
+                    this.browser
+                        .update(cx, super::browser::ObjectBrowser::refresh);
+                }
                 QueryEvent::DatabaseChanged | QueryEvent::Edited => {
                     cx.emit(WorkspaceEvent::Changed);
                 }
@@ -367,17 +373,6 @@ impl Workspace {
             .border_b_1()
             .border_color(cx.theme().border)
             .child(
-                Button::new("new-tab")
-                    .ghost()
-                    .small()
-                    .icon(IconName::Plus)
-                    .tooltip("New query tab (⌘T / Ctrl+T)")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        let db = this.active_database(cx);
-                        this.add_tab(None, db, String::new(), false, window, cx);
-                    })),
-            )
-            .child(
                 Button::new("execute")
                     .ghost()
                     .small()
@@ -417,10 +412,7 @@ impl Workspace {
                     .small()
                     .icon(IconName::RefreshCw)
                     .tooltip("Refresh object browser (F5)")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.browser
-                            .update(cx, super::browser::ObjectBrowser::refresh);
-                    })),
+                    .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
             )
             .child(div().flex_1())
             .child(
@@ -445,13 +437,48 @@ impl Workspace {
         let tab_width = self
             .tab_fit
             .tab_width(self.tabs.len(), px(TAB_BAR_RESERVED));
+        let this = cx.entity().downgrade();
+        let on_new: OnNew = Rc::new({
+            let this = this.clone();
+            move |window, cx| {
+                this.update(cx, |this, cx| {
+                    let db = this.active_database(cx);
+                    this.add_tab(None, db, String::new(), false, window, cx);
+                })
+                .ok();
+            }
+        });
+        let on_select: OnSelect = Rc::new(move |ix, _, cx| {
+            this.update(cx, |this, cx| this.select_tab(ix, cx)).ok();
+        });
+        let titles = self.tabs.iter().map(|t| t.read(cx).title()).collect();
         let bar = TabBar::new("query-tabs")
             .small()
-            .menu(true)
             .max_width(tab_width)
+            .suffix(tab_list_menu(
+                "query-tab-list",
+                "New query tab",
+                titles,
+                self.active,
+                on_new,
+                on_select,
+            ))
             .selected_index(self.active)
             .children(self.tabs.iter().enumerate().map(|(ix, tab)| {
                 let title = tab.read(cx).title();
+                let editing = self
+                    .renaming
+                    .as_ref()
+                    .filter(|r| r.tab.entity_id() == tab.entity_id());
+                if let Some(rename) = editing {
+                    // While renaming, the title is a text field and the tab isn't draggable.
+                    return Tab::new().prefix(
+                        div()
+                            .w(tab_width - px(36.))
+                            .pl_1()
+                            .child(Input::new(&rename.input).xsmall()),
+                    );
+                }
                 let drag = DraggedQueryTab {
                     workspace: cx.entity_id(),
                     ix,
@@ -472,7 +499,7 @@ impl Workspace {
                     .on_click(
                         cx.listener(move |this, event: &gpui_kit::ClickEvent, window, cx| {
                             if event.click_count() >= 2 {
-                                this.open_rename(ix, window, cx);
+                                this.start_rename(ix, window, cx);
                             } else {
                                 this.select_tab(ix, cx);
                             }
@@ -539,6 +566,13 @@ impl Workspace {
         ))
     }
 
+    /// Reloads the object browser and forgets autocomplete's cached schema.
+    fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.completion.invalidate();
+        self.browser
+            .update(cx, super::browser::ObjectBrowser::refresh);
+    }
+
     fn execute(&mut self, mode: RunMode, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(tab) = self.active_tab().cloned() {
             tab.update(cx, |tab, cx| tab.execute(mode, window, cx));
@@ -567,10 +601,7 @@ impl Render for Workspace {
                 this.execute(RunMode::All, window, cx);
             }))
             .on_action(cx.listener(|this, _: &StopQuery, _, cx| this.stop(cx)))
-            .on_action(cx.listener(|this, _: &RefreshBrowser, _, cx| {
-                this.browser
-                    .update(cx, super::browser::ObjectBrowser::refresh);
-            }))
+            .on_action(cx.listener(|this, _: &RefreshBrowser, _, cx| this.refresh(cx)))
             .on_action(cx.listener(|this, _: &NewQueryTab, window, cx| {
                 let db = this.active_database(cx);
                 this.add_tab(None, db, String::new(), false, window, cx);

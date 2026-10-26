@@ -143,12 +143,18 @@ pub fn limit_clause(sql: &str) -> Option<LimitClause> {
 /// Wraps a `SELECT` so it returns the number of rows the original would produce without its
 /// own top-level `LIMIT`. Used to show "Showing 50 of 20,000 rows".
 pub fn count_query(sql: &str) -> String {
+    format!("SELECT COUNT(*) FROM ({}) AS ovs_count", strip_limit(sql))
+}
+
+/// The statement without its own top-level `LIMIT`, trimmed. Used to fetch every row.
+pub fn strip_limit(sql: &str) -> String {
     let sql = sql.trim();
-    let body = match limit_clause(sql) {
-        Some(limit) => format!("{}{}", &sql[..limit.range.start], &sql[limit.range.end..]),
+    match limit_clause(sql) {
+        Some(limit) => format!("{}{}", &sql[..limit.range.start], &sql[limit.range.end..])
+            .trim()
+            .to_owned(),
         None => sql.to_owned(),
-    };
-    format!("SELECT COUNT(*) FROM ({}) AS ovs_count", body.trim())
+    }
 }
 
 /// True for an `UPDATE` or `DELETE` with no top-level `WHERE`, i.e. one that would touch every
@@ -200,6 +206,15 @@ mod tests {
             count_query("select * from t limit 50"),
             "SELECT COUNT(*) FROM (select * from t) AS ovs_count"
         );
+    }
+
+    #[test]
+    fn strips_only_the_top_level_limit() {
+        assert_eq!(
+            strip_limit("select * from (select 1 limit 2) x order by 1 limit 50 "),
+            "select * from (select 1 limit 2) x order by 1"
+        );
+        assert_eq!(strip_limit("select 1 for update"), "select 1 for update");
     }
 
     #[test]

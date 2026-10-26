@@ -2,6 +2,7 @@
 //! (highlighting, statement-under-cursor) as well as from drivers.
 
 mod analyze;
+pub mod complete;
 mod dialect;
 mod edit;
 pub mod keywords;
@@ -9,7 +10,8 @@ mod lexer;
 mod splitter;
 
 pub use analyze::{
-    LimitClause, StatementKind, apply_row_limit, classify, count_query, limit_clause, missing_where,
+    LimitClause, StatementKind, apply_row_limit, classify, count_query, limit_clause,
+    missing_where, strip_limit,
 };
 pub use dialect::Dialect;
 pub use edit::{CellEdit, RowEdit, RowKey, generate_edit};

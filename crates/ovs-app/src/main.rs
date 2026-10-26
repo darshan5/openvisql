@@ -1,7 +1,9 @@
 //! OpenViSQL desktop client.
 
 mod browser;
+mod completion;
 mod connect;
+mod export_dialog;
 mod grid;
 mod query;
 mod runtime;
@@ -9,6 +11,7 @@ mod shell;
 mod tab_fit;
 mod workspace;
 
+use gpui_kit::component::input::ShowCompletions;
 use gpui_kit::{
     App, Bounds, KeyBinding, Menu, MenuItem, SharedString, TitlebarOptions, WindowBounds,
     WindowOptions, actions, px, size,
@@ -56,6 +59,8 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-shift-enter", ExecuteAll, ws),
         KeyBinding::new("secondary-.", StopQuery, ws),
         KeyBinding::new("f5", RefreshBrowser, ws),
+        // Suggestions on demand; they also open by themselves while typing.
+        KeyBinding::new("ctrl-space", ShowCompletions, Some("Input")),
     ]);
 }
 
