@@ -409,6 +409,14 @@ impl Workspace {
                 window,
                 cx,
             ),
+            BrowserEvent::ImportCsv { db, table } => crate::import_dialog::open(
+                db.clone(),
+                table.clone(),
+                self.config.clone(),
+                self.password.clone(),
+                window,
+                cx,
+            ),
             BrowserEvent::RunScript(db) => {
                 let this = cx.entity().downgrade();
                 crate::backup::open_run_script(

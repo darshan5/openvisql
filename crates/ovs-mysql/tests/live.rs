@@ -537,3 +537,63 @@ async fn dump_and_restore_round_trip() {
         .unwrap();
     cleanup(s, &db).await;
 }
+
+#[tokio::test]
+async fn csv_import_inserts_and_rolls_back_on_error() {
+    use ovs_core::import::{CsvOptions, import_csv};
+
+    let Some((mut s, db)) = scratch("csv").await else {
+        return;
+    };
+    s.execute(
+        "CREATE TABLE people (id INT PRIMARY KEY, name VARCHAR(40) NOT NULL, born DATE NULL, \
+         score DECIMAL(5,2) NULL)",
+        None,
+    )
+    .await
+    .unwrap();
+
+    let good =
+        "id,name,born,score,ignored\n1,\"Lovelace, Ada\",1815-12-10,9.5,x\n2,Turing,NULL,,y\n";
+    let options = CsvOptions {
+        empty_is_null: true,
+        ..CsvOptions::default()
+    };
+    let (stats, plan) = import_csv(s.as_mut(), &db, "people", good, &options)
+        .await
+        .unwrap();
+    assert_eq!(stats.rows, 2);
+    assert_eq!(plan.skipped, ["ignored"]);
+    let out = s
+        .execute("SELECT name, born, score FROM people ORDER BY id", None)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows(&out[0]),
+        &vec![
+            vec![
+                Value::Text("Lovelace, Ada".into()),
+                Value::Text("1815-12-10".into()),
+                Value::Text("9.50".into()),
+            ],
+            vec![Value::Text("Turing".into()), Value::Null, Value::Null],
+        ]
+    );
+
+    // A duplicate key in the second batch rolls back the first batch too.
+    let bad = "id,name\n3,Hopper\n1,Duplicate\n";
+    let options = CsvOptions {
+        rows_per_insert: 1,
+        ..CsvOptions::default()
+    };
+    let err = import_csv(s.as_mut(), &db, "people", bad, &options)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("nothing was imported"), "{err}");
+    let out = s
+        .execute("SELECT COUNT(*) FROM people", None)
+        .await
+        .unwrap();
+    assert_eq!(rows(&out[0])[0][0], Value::Int(2));
+    cleanup(s, &db).await;
+}

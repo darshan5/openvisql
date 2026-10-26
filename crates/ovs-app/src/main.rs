@@ -6,6 +6,7 @@ mod completion;
 mod connect;
 mod export_dialog;
 mod grid;
+mod import_dialog;
 mod query;
 mod runtime;
 mod settings;

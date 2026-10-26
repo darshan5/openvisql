@@ -222,6 +222,8 @@ pub enum BrowserEvent {
     Backup(String),
     /// Run a SQL script file against a database.
     RunScript(String),
+    /// Import a CSV file into a table.
+    ImportCsv { db: String, table: String },
     /// Ask for a name, then run the statement built from it and refresh.
     PromptExecute {
         title: String,
@@ -644,6 +646,12 @@ impl ObjectBrowser {
                                 build: Rc::new(move |to| {
                                     templates::rename_table(&rename_db, &rename_from, to)
                                 }),
+                            },
+                        )))
+                        .item(PopupMenuItem::new("Import CSV…").on_click(emit(
+                            BrowserEvent::ImportCsv {
+                                db: db.clone(),
+                                table: name.clone(),
                             },
                         )))
                         .item(PopupMenuItem::new("Truncate…").on_click(emit(
