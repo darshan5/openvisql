@@ -543,3 +543,92 @@ async fn table_designer_rebuilds_tables() {
             .is_err()
     );
 }
+
+/// Queries from the query builder, joined on the database's own foreign keys, run as written.
+#[tokio::test]
+async fn query_builder_sql_runs() {
+    use ovs_core::sql::builder::{
+        Aggregate, ColumnRef, Condition, JoinKind, Operator, OrderItem, Query, SelectItem,
+        SelectPart, SetOperator,
+    };
+
+    let db = TempDb::new("builder");
+    let mut s = db.open().await;
+    exec(
+        &mut s,
+        "CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT);
+         CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER REFERENCES customers (id), total REAL);
+         CREATE TABLE suppliers (id INTEGER PRIMARY KEY, name TEXT);
+         INSERT INTO customers VALUES (1, 'ada'), (2, 'bob'), (3, 'cy');
+         INSERT INTO orders VALUES (1, 1, 50), (2, 1, 150), (3, 2, 20);
+         INSERT INTO suppliers VALUES (1, 'acme'), (2, 'ada');",
+    )
+    .await;
+    let mut fks = std::collections::HashMap::new();
+    for table in ["customers", "orders", "suppliers"] {
+        fks.insert(table, s.list_foreign_keys("main", table).await.unwrap());
+    }
+    let lookup = |t: &str| fks.get(t).cloned().unwrap_or_default();
+
+    // Spending per customer, including those with no orders.
+    let mut part = SelectPart::default();
+    part.add_table("customers", &lookup);
+    part.add_table("orders", &lookup);
+    assert_eq!(part.joins[0].on.len(), 1, "joined on the foreign key");
+    part.joins[0].kind = JoinKind::Left;
+    part.columns = vec![
+        SelectItem::column(ColumnRef::new("c", "name")),
+        SelectItem {
+            aggregate: Some(Aggregate::Count),
+            alias: "orders".into(),
+            ..SelectItem::column(ColumnRef::new("o", "id"))
+        },
+    ];
+    part.order_by = vec![OrderItem {
+        column: ColumnRef::new("c", "name"),
+        descending: false,
+    }];
+    let query = Query {
+        first: part,
+        ..Query::default()
+    };
+    let sql = query.sql(s.dialect(), "main").unwrap();
+    let rs = rows(&mut s, &sql).await;
+    assert_eq!(
+        rs.rows,
+        [
+            vec![Value::Text("ada".into()), Value::Int(2)],
+            vec![Value::Text("bob".into()), Value::Int(1)],
+            vec![Value::Text("cy".into()), Value::Int(0)],
+        ]
+    );
+
+    // Names of customers with a big order, and of suppliers, without repeats.
+    let mut big = SelectPart::default();
+    big.add_table("customers", &lookup);
+    big.add_table("orders", &lookup);
+    big.columns = vec![SelectItem::column(ColumnRef::new("c", "name"))];
+    big.conditions = vec![Condition {
+        column: ColumnRef::new("o", "total"),
+        operator: Operator::Gt,
+        value: "100".into(),
+    }];
+    let mut suppliers = SelectPart::default();
+    suppliers.add_table("suppliers", &lookup);
+    suppliers.columns = vec![SelectItem::column(ColumnRef::new("s", "name"))];
+    let query = Query {
+        first: big,
+        rest: vec![(SetOperator::Union, suppliers)],
+        order_by: vec![(1, false)],
+        limit: None,
+    };
+    let sql = query.sql(s.dialect(), "main").unwrap();
+    let rs = rows(&mut s, &sql).await;
+    assert_eq!(
+        rs.rows,
+        [
+            vec![Value::Text("acme".into())],
+            vec![Value::Text("ada".into())],
+        ]
+    );
+}

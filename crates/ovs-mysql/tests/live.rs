@@ -1233,3 +1233,104 @@ async fn table_designer_partitions() {
     assert_eq!(rows(&out[0])[0][0], Value::Int(2));
     cleanup(s, &db).await;
 }
+
+/// Queries from the query builder, joined on the database's own foreign keys, run as written.
+#[tokio::test]
+async fn query_builder_sql_runs() {
+    use ovs_core::sql::builder::{
+        Aggregate, ColumnRef, Condition, JoinKind, Operator, OrderItem, Query, SelectItem,
+        SelectPart, SetOperator,
+    };
+
+    let Some((mut s, db)) = scratch("builder").await else {
+        return;
+    };
+    for sql in [
+        "CREATE TABLE customers (id INT PRIMARY KEY, name VARCHAR(20))",
+        "CREATE TABLE orders (id INT PRIMARY KEY, customer_id INT, total DECIMAL(10,2), \
+         FOREIGN KEY (customer_id) REFERENCES customers (id))",
+        "CREATE TABLE suppliers (id INT PRIMARY KEY, name VARCHAR(20))",
+        "INSERT INTO customers VALUES (1, 'ada'), (2, 'bob'), (3, 'cy')",
+        "INSERT INTO orders VALUES (1, 1, 50), (2, 1, 150), (3, 2, 20)",
+        "INSERT INTO suppliers VALUES (1, 'acme'), (2, 'ada')",
+    ] {
+        s.execute(sql, None)
+            .await
+            .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+    }
+    let mut fks = std::collections::HashMap::new();
+    for table in ["customers", "orders", "suppliers"] {
+        fks.insert(table, s.list_foreign_keys(&db, table).await.unwrap());
+    }
+    let lookup = |t: &str| fks.get(t).cloned().unwrap_or_default();
+    let d = s.dialect();
+
+    let mut part = SelectPart::default();
+    part.add_table("customers", &lookup);
+    part.add_table("orders", &lookup);
+    assert_eq!(part.joins[0].on.len(), 1, "joined on the foreign key");
+    part.joins[0].kind = JoinKind::Left;
+    part.columns = vec![
+        SelectItem::column(ColumnRef::new("c", "name")),
+        SelectItem {
+            aggregate: Some(Aggregate::Count),
+            alias: "orders".into(),
+            ..SelectItem::column(ColumnRef::new("o", "id"))
+        },
+    ];
+    part.order_by = vec![OrderItem {
+        column: ColumnRef::new("c", "name"),
+        descending: false,
+    }];
+    let sql = Query {
+        first: part,
+        ..Query::default()
+    }
+    .sql(d, &db)
+    .unwrap();
+    let out = s
+        .execute(&sql, None)
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+    assert_eq!(
+        rows(&out[0]),
+        &[
+            vec![Value::Text("ada".into()), Value::Int(2)],
+            vec![Value::Text("bob".into()), Value::Int(1)],
+            vec![Value::Text("cy".into()), Value::Int(0)],
+        ]
+    );
+
+    let mut big = SelectPart::default();
+    big.add_table("customers", &lookup);
+    big.add_table("orders", &lookup);
+    big.columns = vec![SelectItem::column(ColumnRef::new("c", "name"))];
+    big.conditions = vec![Condition {
+        column: ColumnRef::new("o", "total"),
+        operator: Operator::Gt,
+        value: "100".into(),
+    }];
+    let mut suppliers = SelectPart::default();
+    suppliers.add_table("suppliers", &lookup);
+    suppliers.columns = vec![SelectItem::column(ColumnRef::new("s", "name"))];
+    let sql = Query {
+        first: big,
+        rest: vec![(SetOperator::Union, suppliers)],
+        order_by: vec![(1, false)],
+        limit: None,
+    }
+    .sql(d, &db)
+    .unwrap();
+    let out = s
+        .execute(&sql, None)
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+    assert_eq!(
+        rows(&out[0]),
+        &[
+            vec![Value::Text("acme".into())],
+            vec![Value::Text("ada".into())]
+        ]
+    );
+    cleanup(s, &db).await;
+}

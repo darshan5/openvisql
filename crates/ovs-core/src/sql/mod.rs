@@ -2,6 +2,7 @@
 //! (highlighting, statement-under-cursor) as well as from drivers.
 
 mod analyze;
+pub mod builder;
 pub mod complete;
 pub mod design;
 mod dialect;
