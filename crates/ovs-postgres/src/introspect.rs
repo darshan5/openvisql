@@ -363,7 +363,34 @@ async fn table_ddl(s: &mut PostgresSession, schema: &str, table: &str) -> Result
             text(&constraints, r, "def")
         )
     }));
-    let mut statements = vec![format!("CREATE TABLE {target} (\n{}\n)", lines.join(",\n"))];
+    // Sequences behind serial columns must exist before the table's defaults name them.
+    let sequences = s
+        .rows(&format!(
+            "SELECT format('%I.%I', sn.nspname, sq.relname) AS seq, a.attname AS col \
+             FROM pg_depend d JOIN pg_class sq ON sq.oid = d.objid AND sq.relkind = 'S' \
+             JOIN pg_namespace sn ON sn.oid = sq.relnamespace \
+             JOIN pg_attribute a ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid \
+             WHERE d.refobjid = {rel} AND d.deptype = 'a' ORDER BY 1"
+        ))
+        .await?;
+    let mut statements: Vec<String> = sequences
+        .rows
+        .iter()
+        .map(|r| {
+            format!(
+                "CREATE SEQUENCE IF NOT EXISTS {}",
+                text(&sequences, r, "seq")
+            )
+        })
+        .collect();
+    statements.push(format!("CREATE TABLE {target} (\n{}\n)", lines.join(",\n")));
+    statements.extend(sequences.rows.iter().map(|r| {
+        format!(
+            "ALTER SEQUENCE {} OWNED BY {target}.{}",
+            text(&sequences, r, "seq"),
+            D.quote_ident(&text(&sequences, r, "col"))
+        )
+    }));
     let indexes = s
         .rows(&format!(
             "SELECT pg_get_indexdef(i.indexrelid) AS def FROM pg_index i \

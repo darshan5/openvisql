@@ -284,6 +284,21 @@ pub fn drop_object(d: Dialect, kind: ObjectKind, db: &str, name: &str) -> String
     }
 }
 
+/// `DROP TRIGGER`; PostgreSQL names triggers per table, so it needs `table` too.
+pub fn drop_trigger(d: Dialect, db: &str, name: &str, table: &str, if_exists: bool) -> String {
+    let exists = if if_exists { "IF EXISTS " } else { "" };
+    match d {
+        Dialect::Postgres => format!(
+            "DROP TRIGGER {exists}{} ON {}",
+            d.quote_ident(name),
+            d.qualified(db, table)
+        ),
+        Dialect::MySql | Dialect::Sqlite => {
+            format!("DROP TRIGGER {exists}{}", d.qualified(db, name))
+        }
+    }
+}
+
 pub fn truncate_table(d: Dialect, db: &str, table: &str) -> String {
     match d {
         Dialect::MySql | Dialect::Postgres => {

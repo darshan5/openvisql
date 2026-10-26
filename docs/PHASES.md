@@ -131,8 +131,11 @@ Phase 4 is complete.
   settings, statistics).
 - ✅ TLS: "encrypt only" or full verification against the web roots plus an optional CA
   file. Cancel requests are encrypted too.
+- ✅ Backup, restore and copy of a schema. Dumps leave out the schema name so they restore
+  anywhere. Foreign keys are added after the data. Identity and serial counters continue
+  after the restored ids.
 - Still to do:
-  - the table designer, backup and copy for PostgreSQL
+  - the table designer for PostgreSQL
   - sequences, types and materialized-view refresh in the browser
 
 ## Packaging

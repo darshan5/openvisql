@@ -127,7 +127,17 @@ pub async fn dump_database(
     )
     .map_err(io)?;
     let mut output = Output::Script(out);
-    let stats = transfer(session, db, &|ddl, _| ddl, options, &mut output, progress).await?;
+    // PostgreSQL's DDL names its schema; leave it out so the dump restores into whichever
+    // schema is current.
+    let postgres = d == Dialect::Postgres;
+    let adapt = |ddl: String, _: ObjectKind| {
+        if postgres {
+            requalify(d, &ddl, db, None)
+        } else {
+            ddl
+        }
+    };
+    let stats = transfer(session, db, &adapt, options, &mut output, progress).await?;
     out.flush().map_err(io)?;
     Ok(stats)
 }
@@ -182,8 +192,14 @@ pub async fn copy_database(
         format!("{}.", d.quote_ident(db)),
         format!("{}.", d.quote_ident(target_db)),
     );
+    // PostgreSQL names the schema in table defaults and function bodies too.
+    let postgres = d == Dialect::Postgres;
+    let target_name = target_db.to_owned();
+    let source_name = db.to_owned();
     let adapt = move |ddl: String, kind: ObjectKind| {
-        let ddl = if kind == ObjectKind::View && from != to {
+        let ddl = if postgres {
+            requalify(d, &ddl, &source_name, Some(&target_name))
+        } else if kind == ObjectKind::View && from != to {
             ddl.replace(&from, &to)
         } else {
             ddl
@@ -284,6 +300,61 @@ impl Collations {
     }
 }
 
+/// Re-points names qualified with `schema` (`"schema".x` or `schema.x`) at `to`, or makes
+/// them unqualified when `to` is `None`. Bare names only match at a word boundary, so a
+/// schema called `s` leaves `items.x` alone.
+pub fn requalify(d: Dialect, ddl: &str, schema: &str, to: Option<&str>) -> String {
+    let quoted = format!("{}.", d.quote_ident(schema));
+    let bare = format!("{schema}.");
+    let replacement = to.map_or_else(String::new, |t| format!("{}.", d.quote_ident(t)));
+    let mut out = String::with_capacity(ddl.len());
+    let mut i = 0;
+    while i < ddl.len() {
+        let rest = &ddl[i..];
+        let boundary = ddl[..i]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !(c.is_alphanumeric() || c == '_' || c == '"' || c == '$'));
+        if boundary && rest.starts_with(&quoted) {
+            out.push_str(&replacement);
+            i += quoted.len();
+        } else if boundary && rest.starts_with(&bare) {
+            out.push_str(&replacement);
+            i += bare.len();
+        } else {
+            let c = rest.chars().next().expect("not at the end");
+            out.push(c);
+            i += c.len_utf8();
+        }
+    }
+    out
+}
+
+/// Takes the foreign keys out of a PostgreSQL `CREATE TABLE` (one `CONSTRAINT … FOREIGN KEY`
+/// line each, as the driver writes them), returning the statement without them and an
+/// `ALTER TABLE … ADD` for each, to run once every table has its rows.
+fn split_foreign_keys(ddl: &str, target: &str) -> (String, Vec<String>) {
+    let mut kept: Vec<&str> = Vec::new();
+    let mut keys = Vec::new();
+    for line in ddl.lines() {
+        let trimmed = line.trim().trim_end_matches(',');
+        if trimmed.starts_with("CONSTRAINT ") && trimmed.contains(" FOREIGN KEY ") {
+            keys.push(format!("ALTER TABLE {target} ADD {trimmed}"));
+        } else {
+            kept.push(line);
+        }
+    }
+    // The line before a removed last item keeps a trailing comma; drop it.
+    let mut out: Vec<String> = kept.iter().map(|l| (*l).to_owned()).collect();
+    for i in 1..out.len() {
+        if out[i].trim_start().starts_with(')') {
+            let prev = out[i - 1].trim_end().trim_end_matches(',').to_owned();
+            out[i - 1] = prev;
+        }
+    }
+    (out.join("\n"), keys)
+}
+
 /// Statements that make restoring fast and order-independent: no constraint checks.
 fn checks_off(d: Dialect) -> &'static [&'static str] {
     match d {
@@ -335,16 +406,24 @@ async fn transfer(
             .as_ref()
             .is_none_or(|only| only.iter().any(|t| t == name))
     };
+    // PostgreSQL can't defer foreign key checks while loading, so its keys are added after
+    // every table has its rows, and identity/serial counters are moved past the loaded ids.
+    let mut deferred = Vec::new();
     for table in tables.iter().filter(|t| wanted(&t.name)) {
         progress(&table.name);
         let target = d.quote_ident(&table.name);
         if options.structure {
-            let ddl = adapt(
+            let mut ddl = adapt(
                 session
                     .object_ddl(db, &table.name, ObjectKind::Table)
                     .await?,
                 ObjectKind::Table,
             );
+            if d == Dialect::Postgres {
+                let (without, keys) = split_foreign_keys(&ddl, &target);
+                ddl = without;
+                deferred.extend(keys);
+            }
             out.note(&format!("--\n-- Table {target}\n--"))?;
             if options.drop_existing {
                 out.statement(&format!("DROP TABLE IF EXISTS {target}"), false)
@@ -355,8 +434,24 @@ async fn transfer(
         }
         if options.data {
             stats.rows += dump_rows(session, d, db, &table.name, options, out).await?;
+            if d == Dialect::Postgres {
+                for column in session.list_columns(db, &table.name).await? {
+                    if column.extra == "auto_increment" {
+                        let col = d.quote_ident(&column.name);
+                        deferred.push(format!(
+                            "SELECT setval(pg_get_serial_sequence({}, {}), \
+                             coalesce(max({col}), 1), max({col}) IS NOT NULL) FROM {target}",
+                            d.quote_str(&target),
+                            d.quote_str(&column.name)
+                        ));
+                    }
+                }
+            }
         }
         stats.tables += 1;
+    }
+    for sql in deferred {
+        out.statement(&sql, false).await?;
     }
 
     let mut others = Vec::new();
@@ -387,11 +482,16 @@ async fn transfer(
                 let name = d.quote_ident(&object.name);
                 out.note(&format!("--\n-- {} {name}\n--", kind.sql_keyword()))?;
                 if options.drop_existing {
-                    out.statement(
-                        &format!("DROP {} IF EXISTS {name}", kind.sql_keyword()),
-                        false,
-                    )
-                    .await?;
+                    let drop = if kind == ObjectKind::Trigger && d == Dialect::Postgres {
+                        // Unqualified, like the rest of the dump.
+                        format!(
+                            "DROP TRIGGER IF EXISTS {name} ON {}",
+                            d.quote_ident(&object.detail)
+                        )
+                    } else {
+                        format!("DROP {} IF EXISTS {name}", kind.sql_keyword())
+                    };
+                    out.statement(&drop, false).await?;
                 }
                 // Bodies contain `;`, so routines, triggers and events use another delimiter.
                 // SQLite needs no DELIMITER: its trigger bodies split correctly as written.
@@ -445,8 +545,14 @@ async fn dump_rows(
         format!(" ORDER BY {}", key.join(", "))
     };
     let target = d.qualified(db, table);
+    // PostgreSQL identity columns refuse given values unless told otherwise.
+    let overriding = if d == Dialect::Postgres {
+        " OVERRIDING SYSTEM VALUE"
+    } else {
+        ""
+    };
     let insert_into = format!(
-        "INSERT INTO {} ({select_cols}) VALUES",
+        "INSERT INTO {} ({select_cols}){overriding} VALUES",
         d.quote_ident(table)
     );
 
@@ -522,6 +628,34 @@ pub async fn run_script(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn requalifies_schema_names() {
+        let d = Dialect::Postgres;
+        let ddl = "CREATE FUNCTION s.f() AS $$ SELECT * FROM \"s\".t, items.x, s.y $$";
+        assert_eq!(
+            requalify(d, ddl, "s", None),
+            "CREATE FUNCTION f() AS $$ SELECT * FROM t, items.x, y $$"
+        );
+        assert_eq!(
+            requalify(d, ddl, "s", Some("n")),
+            "CREATE FUNCTION \"n\".f() AS $$ SELECT * FROM \"n\".t, items.x, \"n\".y $$"
+        );
+    }
+
+    #[test]
+    fn foreign_keys_move_out_of_create_table() {
+        let ddl = "CREATE SEQUENCE IF NOT EXISTS s.t_id_seq;\nCREATE TABLE \"s\".\"t\" (\n  \"id\" integer,\n  \
+                   \"o\" integer,\n  CONSTRAINT \"t_pkey\" PRIMARY KEY (id),\n  \
+                   CONSTRAINT \"t_o_fkey\" FOREIGN KEY (o) REFERENCES s.o(id)\n);\nCREATE INDEX i ON s.t (o)";
+        let (without, keys) = split_foreign_keys(ddl, "\"t\"");
+        assert!(without.contains("PRIMARY KEY (id)\n);"), "{without}");
+        assert!(!without.contains("FOREIGN KEY"));
+        assert_eq!(
+            keys,
+            ["ALTER TABLE \"t\" ADD CONSTRAINT \"t_o_fkey\" FOREIGN KEY (o) REFERENCES s.o(id)"]
+        );
+    }
 
     #[test]
     fn adapts_unknown_collations() {

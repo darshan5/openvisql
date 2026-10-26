@@ -441,3 +441,96 @@ async fn tls_encrypts_and_verifies() {
         "{err}"
     );
 }
+
+#[tokio::test]
+async fn dumps_restore_and_copies_schemas() {
+    use ovs_core::dump::{DumpOptions, copy_database, dump_database, run_script};
+
+    let Some((mut s, schema)) = scratch("dump").await else {
+        return;
+    };
+    script(&mut s, SCHEMA).await;
+    script(
+        &mut s,
+        "CREATE TABLE serials (id serial PRIMARY KEY, v text);
+         INSERT INTO serials (v) VALUES ('a'), ('b');
+         INSERT INTO owners (name, data) VALUES ('ada', '\\x00ff'), ('bob', NULL);
+         INSERT INTO pets (owner, tag, weight) VALUES (2, 'rex', 12.5), (1, 'tom', 3);",
+    )
+    .await;
+    let check = "SELECT (SELECT string_agg(name || coalesce(encode(data, 'hex'), ''), ',' ORDER BY id) FROM owners) \
+                 || '|' || (SELECT string_agg(tag || weight, ',' ORDER BY tag) FROM pets) \
+                 || '|' || (SELECT count(*) FROM log) || '|' || (SELECT string_agg(v, ',' ORDER BY id) FROM serials)";
+    let expected = rows(&mut s, check).await.rows[0][0].clone();
+
+    let mut out = Vec::new();
+    let stats = dump_database(
+        s.as_mut(),
+        &schema,
+        &DumpOptions::default(),
+        &mut out,
+        &mut |_| {},
+    )
+    .await
+    .unwrap();
+    assert_eq!(stats.tables, 4);
+    let dump = String::from_utf8(out).unwrap();
+    assert!(
+        !dump.contains(&format!("{schema}.")) && !dump.contains(&format!("\"{schema}\".")),
+        "the dump qualifies names with its schema:\n{dump}"
+    );
+
+    // Restore into a second schema.
+    let restored = format!("{schema}_restored");
+    exec(&mut s, &format!("DROP SCHEMA IF EXISTS {restored} CASCADE")).await;
+    exec(&mut s, &format!("CREATE SCHEMA {restored}")).await;
+    s.use_database(&restored).await.unwrap();
+    let run = run_script(s.as_mut(), &dump, true, &mut |_, _| {}).await;
+    if !run.errors.is_empty() {
+        let (n, _) = &run.errors[0];
+        let statements = split_statements_for(&dump, D);
+        panic!(
+            "{:?}\n--- statement {n}:\n{}",
+            run.errors,
+            statements[n - 1].sql
+        );
+    }
+    assert_eq!(rows(&mut s, check).await.rows[0][0], expected);
+    // Counters continue after the restored ids, and keys and triggers work.
+    exec(&mut s, "INSERT INTO owners (name) VALUES ('new')").await;
+    exec(&mut s, "INSERT INTO serials (v) VALUES ('c')").await;
+    assert_eq!(
+        rows(&mut s, "SELECT max(id) FROM serials").await.rows[0][0],
+        Value::Int(3)
+    );
+    assert!(
+        s.execute("INSERT INTO pets (owner, tag) VALUES (99, 'x')", None)
+            .await
+            .is_err()
+    );
+    exec(&mut s, &format!("DROP SCHEMA {restored} CASCADE")).await;
+
+    // Copy to another schema over a second connection.
+    let copied = format!("{schema}_copied");
+    let mut other = connect().await.unwrap();
+    exec(
+        &mut other,
+        &format!("DROP SCHEMA IF EXISTS {copied} CASCADE"),
+    )
+    .await;
+    s.use_database(&schema).await.unwrap();
+    copy_database(
+        s.as_mut(),
+        &schema,
+        other.as_mut(),
+        &copied,
+        &DumpOptions::default(),
+        &mut |_| {},
+    )
+    .await
+    .unwrap();
+    assert_eq!(rows(&mut other, check).await.rows[0][0], expected);
+    exec(&mut other, "INSERT INTO owners (name) VALUES ('via copy')").await;
+    exec(&mut other, &format!("DROP SCHEMA {copied} CASCADE")).await;
+    cleanup(s, &schema).await;
+}
