@@ -96,8 +96,10 @@ Phase 2 is complete.
 - ✅ Process list, variables and status views.
 - ✅ User manager: create, rename, drop, change password; global and per-database privileges
   with GRANT OPTION.
-- ✅ Copy a database or table to another open connection (or another database on the same
-  one), adapting collations between MySQL and MariaDB.
+- ✅ Copy a database or table to another connection of the same engine (or another database
+  on the same one), adapting collations between MySQL and MariaDB. The target can be open in
+  a tab or only saved: a saved one is connected for the copy, directly or through its SSH
+  tunnel, and the dialog asks for its password if none is saved.
 - ✅ Session restore (open tabs, editor contents).
 
 ## Phase 4: SQLite
@@ -150,8 +152,3 @@ Phase 4 is complete.
 - Auto-update: not planned (decided 2026-10-26). New versions are downloaded from the
   releases page.
 
-## Next
-
-- Copy a database to any saved connection of the same engine, not only one already open in
-  a tab: connect to it for the copy, directly or through its SSH tunnel, asking for its
-  password if none is saved.

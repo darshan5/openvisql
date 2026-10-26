@@ -15,7 +15,7 @@ use uuid::Uuid;
 /// A session shared between the view that owns it and the tokio tasks that use it.
 pub type SharedSession = Arc<Mutex<Box<dyn Session>>>;
 
-fn runtime() -> &'static Runtime {
+pub(crate) fn runtime() -> &'static Runtime {
     static RUNTIME: OnceLock<Runtime> = OnceLock::new();
     RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()

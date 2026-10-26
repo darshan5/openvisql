@@ -51,6 +51,10 @@ OVS_TEST_PG=127.0.0.1:35432:postgres:secret OVS_TEST_PG_TLS=1 cargo test -p ovs-
 OVS_TEST_SSH=127.0.0.1:2222:tunnel:secret:mysql:3306 OVS_TEST_SSH_PG=postgres:5432 \
   OVS_TEST_SSH_KEY="${PWD}/target/test-ssh/id_ed25519" cargo test -p ovs-ssh -p ovs-app
 
+# Copying a database to a saved connection reached through SSH (here MySQL to MariaDB)
+OVS_TEST_MYSQL=127.0.0.1:33306:root:secret \
+  OVS_TEST_COPY_SSH=127.0.0.1:2222:tunnel:secret:mariadb:3306 cargo test -p ovs-app copy_dialog
+
 # An existing SQLite file (the tests work on a copy)
 OVS_TEST_SQLITE_FILE=/path/to/sample.db cargo test -p ovs-sqlite --test sample
 ```

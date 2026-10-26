@@ -68,8 +68,9 @@ the right, and results below.
   DEFINER clauses optional) and **run SQL scripts** to restore, stopping at the first error.
 - **Import CSV** into a table: header matching or by position, NULL markers, one transaction
   that rolls back on error.
-- **Copy** a database or table to another open connection, or to another database on the same
-  one. Collations are adapted between MySQL and MariaDB.
+- **Copy** a database or table straight to another server of the same engine (open in a tab
+  or just saved, directly or through its SSH tunnel), or to another database on the same one.
+  Collations are adapted between MySQL and MariaDB.
 - **Server tools**: process list with kill, server info, status and system variables, and a
   **user manager** (accounts, passwords, global and per-database privileges).
 - Asks for confirmation before running `UPDATE`/`DELETE` without a `WHERE` clause.
