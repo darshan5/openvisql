@@ -1,0 +1,80 @@
+# Servers for the live tests: docker compose -f compose.test.yml up -d --wait
+# See docs/SETUP.md for the matching OVS_TEST_* variables.
+name: ovs-test
+
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: ovs-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: secret
+    ports: ["33306:3306"]
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-uroot", "-psecret"]
+      interval: 5s
+      retries: 30
+
+  mariadb:
+    image: mariadb:11.4
+    container_name: ovs-mariadb
+    environment:
+      MARIADB_ROOT_PASSWORD: secret
+    ports: ["33307:3306"]
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      retries: 30
+
+  postgres:
+    image: postgres:17
+    container_name: ovs-postgres
+    environment:
+      POSTGRES_PASSWORD: secret
+    # TLS with the image's self-signed certificate, for the OVS_TEST_PG_TLS tests.
+    command:
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/etc/ssl/certs/ssl-cert-snakeoil.pem
+      - -c
+      - ssl_key_file=/etc/ssl/private/ssl-cert-snakeoil.key
+    ports: ["35432:5432"]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 5s
+      retries: 30
+
+  # Reaches the databases by service name (mysql:3306, postgres:5432), or servers published
+  # on the host at host.docker.internal (as in CI). User `tunnel` signs in
+  # with password `secret`, or with the key written to target/test-ssh/id_ed25519
+  # (passphrase `keypass`), which is generated on first start.
+  ssh:
+    image: alpine:3.20
+    container_name: ovs-ssh
+    ports: ["2222:22"]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    volumes:
+      - ./target/test-ssh:/keys
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        apk add --no-cache openssh >/dev/null
+        ssh-keygen -A
+        id tunnel >/dev/null 2>&1 || adduser -D tunnel
+        echo 'tunnel:secret' | chpasswd
+        [ -f /keys/id_ed25519 ] || ssh-keygen -q -t ed25519 -N keypass -C ovs-test -f /keys/id_ed25519
+        chmod 644 /keys/id_ed25519
+        mkdir -p /home/tunnel/.ssh
+        cp /keys/id_ed25519.pub /home/tunnel/.ssh/authorized_keys
+        chown -R tunnel /home/tunnel/.ssh
+        chmod 700 /home/tunnel/.ssh
+        chmod 600 /home/tunnel/.ssh/authorized_keys
+        sed -i 's/^AllowTcpForwarding no/AllowTcpForwarding yes/' /etc/ssh/sshd_config
+        printf 'PasswordAuthentication yes\nPermitRootLogin no\n' >> /etc/ssh/sshd_config
+        exec /usr/sbin/sshd -D -e
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "22"]
+      interval: 3s
+      retries: 40

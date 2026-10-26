@@ -27,25 +27,37 @@ cargo test --workspace
 
 ### Live database tests
 
-`crates/ovs-mysql/tests/live.rs` runs against real servers when `OVS_TEST_MYSQL` is set:
+`compose.test.yml` starts every server the live tests use: MySQL 8.4, MariaDB 11.4,
+PostgreSQL 17 (with TLS) and an SSH server that can reach them.
 
 ```sh
-docker run -d --name ovs-mysql   -e MYSQL_ROOT_PASSWORD=secret   -p 33306:3306 mysql:8.4
-docker run -d --name ovs-mariadb -e MARIADB_ROOT_PASSWORD=secret -p 33307:3306 mariadb:11.4
+docker compose -f compose.test.yml up -d --wait
+```
 
+Each suite runs when its variable is set. Without the variables these tests return early
+and pass, so `cargo test` works offline. The SQLite driver's own tests need no server and
+always run.
+
+```sh
+# MySQL and MariaDB
 OVS_TEST_MYSQL=127.0.0.1:33306:root:secret cargo test -p ovs-mysql --test live
 OVS_TEST_MYSQL=127.0.0.1:33307:root:secret cargo test -p ovs-mysql --test live
+
+# PostgreSQL; OVS_TEST_PG_TLS adds the TLS tests
+OVS_TEST_PG=127.0.0.1:35432:postgres:secret OVS_TEST_PG_TLS=1 cargo test -p ovs-postgres --test live
+
+# SSH tunnels, signing in with the password and with the generated key, to MySQL and
+# PostgreSQL (database addresses as the SSH server sees them)
+OVS_TEST_SSH=127.0.0.1:2222:tunnel:secret:mysql:3306 OVS_TEST_SSH_PG=postgres:5432 \
+  OVS_TEST_SSH_KEY="${PWD}/target/test-ssh/id_ed25519" cargo test -p ovs-ssh -p ovs-app
+
+# An existing SQLite file (the tests work on a copy)
+OVS_TEST_SQLITE_FILE=/path/to/sample.db cargo test -p ovs-sqlite --test sample
 ```
 
-Without the variable these tests return early and pass, so `cargo test` works offline. The
-SQLite driver's tests (`crates/ovs-sqlite/tests/sqlite.rs`) need no server and always run.
-
-PostgreSQL tests run when `OVS_TEST_PG` is set:
-
-```sh
-docker run -d --name ovs-postgres -e POSTGRES_PASSWORD=secret -p 35432:5432 postgres:17
-OVS_TEST_PG=127.0.0.1:35432:postgres:secret cargo test -p ovs-postgres --test live
-```
+The SSH server writes a test key, with passphrase `keypass`, to `target/test-ssh/` on first
+start. The database root/postgres password is `secret`, and the SSH user is `tunnel` with
+password `secret`.
 
 In zsh, brace variables that come before a `:` (`127.0.0.1:${port}:root`), because `$port:r`
 is a history modifier. Otherwise the variable is garbled and the tests skip silently.
@@ -56,19 +68,6 @@ directions, run it twice with the two swapped):
 ```sh
 OVS_TEST_MYSQL=127.0.0.1:33307:root:secret OVS_TEST_MYSQL_TARGET=127.0.0.1:33306:root:secret \
   cargo test -p ovs-mysql --test live copy_database
-```
-
-SSH tunnel tests need an SSH server that can reach MySQL:
-
-```sh
-docker network create ovs-net && docker network connect ovs-net ovs-mysql
-docker run -d --name ovs-ssh --network ovs-net -p 2222:22 alpine:3.20 sh -c \
-  "apk add --no-cache openssh && ssh-keygen -A && adduser -D tunnel && \
-   echo tunnel:secret | chpasswd && \
-   sed -i 's/^AllowTcpForwarding no/AllowTcpForwarding yes/' /etc/ssh/sshd_config && \
-   echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config && exec /usr/sbin/sshd -D -e"
-
-OVS_TEST_SSH=127.0.0.1:2222:tunnel:secret:ovs-mysql:3306 cargo test -p ovs-ssh -p ovs-app
 ```
 
 ## Where data lives

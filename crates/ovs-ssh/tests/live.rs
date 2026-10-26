@@ -1,12 +1,13 @@
 //! Tests against a real SSH server. Skipped unless `OVS_TEST_SSH` is set to
 //! `host:port:user:password:target_host:target_port`, where the target is a MySQL server
 //! reachable from the SSH server. `OVS_TEST_SSH_KEY` may name a private key (passphrase
-//! `keypass`) authorized for the same user.
+//! `keypass`) authorized for the same user. `OVS_TEST_SSH_PG` may name a PostgreSQL server
+//! (`host:port`, as seen from the SSH server) to tunnel to as well.
 
 use std::path::PathBuf;
 
 use ovs_ssh::{SshAuth, SshError, SshSettings, Tunnel};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 fn config() -> Option<(SshSettings, String, u16)> {
@@ -93,4 +94,26 @@ async fn wrong_password_and_changed_host_key_are_refused() {
         .err()
         .unwrap();
     assert!(matches!(err, SshError::AuthFailed(_)), "{err}");
+}
+
+/// PostgreSQL answers an `SSLRequest` with a single `S` or `N`.
+#[tokio::test]
+async fn tunnel_reaches_postgres() {
+    let (Some((settings, _, _)), Ok(pg)) = (config(), std::env::var("OVS_TEST_SSH_PG")) else {
+        return;
+    };
+    let (host, port) = pg.rsplit_once(':').expect("bad OVS_TEST_SSH_PG");
+    let tunnel = Tunnel::open(&settings, host, port.parse().unwrap(), None)
+        .await
+        .unwrap();
+    let mut socket = TcpStream::connect(("127.0.0.1", tunnel.local_port()))
+        .await
+        .unwrap();
+    socket
+        .write_all(&[0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x2f])
+        .await
+        .unwrap();
+    let mut answer = [0u8; 1];
+    socket.read_exact(&mut answer).await.unwrap();
+    assert!(matches!(&answer, b"S" | b"N"), "{answer:?}");
 }

@@ -19,7 +19,7 @@ use gpui_kit::{
     prelude::FluentBuilder as _, px,
 };
 use ovs_core::{ConnectionConfig, Engine, PasswordStore, SshAuthMethod, SshConfig, SslMode};
-use ovs_ssh::{SshAuth, SshSettings};
+use ovs_ssh::SshSettings;
 use ovs_store::Store;
 use uuid::Uuid;
 
@@ -35,13 +35,6 @@ struct Collected {
 }
 
 /// `~/.ssh/key` → `/Users/me/.ssh/key`.
-fn expand_home(path: &str) -> std::path::PathBuf {
-    match path.strip_prefix("~/").zip(dirs::home_dir()) {
-        Some((rest, home)) => home.join(rest),
-        None => std::path::PathBuf::from(path),
-    }
-}
-
 /// A live connection handed to the shell, which turns the tab into a workspace.
 #[derive(Clone)]
 pub struct Connected {
@@ -210,7 +203,7 @@ impl ConnectView {
             // A file needs no password, so nothing is read from or written to a keychain.
             let config = ConnectionConfig {
                 name,
-                path: expand_home(&path).to_string_lossy().into_owned(),
+                path: runtime::expand_home(&path).to_string_lossy().into_owned(),
                 save_password: false,
                 ssh: SshConfig {
                     enabled: false,
@@ -321,28 +314,13 @@ impl ConnectView {
         config: &ConnectionConfig,
         secret: &str,
     ) -> Option<(SshSettings, (String, u16), Option<String>)> {
-        let ssh = config.ssh.clone();
-        if !ssh.enabled {
-            return None;
-        }
-        let auth = match ssh.auth {
-            SshAuthMethod::Password => SshAuth::Password(secret.to_owned()),
-            SshAuthMethod::PrivateKey => SshAuth::PrivateKey {
-                path: expand_home(&ssh.key_path),
-                passphrase: Some(secret.to_owned()).filter(|s| !s.is_empty()),
-            },
-        };
-        let known = self.store.known_host(&ssh.host, ssh.port).ok().flatten();
-        Some((
-            SshSettings {
-                host: ssh.host,
-                port: ssh.port,
-                user: ssh.user,
-                auth,
-            },
-            (config.host.clone(), config.port),
-            known,
-        ))
+        let (settings, target) = runtime::ssh_settings(config, secret)?;
+        let known = self
+            .store
+            .known_host(&settings.host, settings.port)
+            .ok()
+            .flatten();
+        Some((settings, target, known))
     }
 
     /// Remembers the SSH server's host key the first time a tunnel to it connects.

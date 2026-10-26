@@ -6,8 +6,8 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, OnceLock};
 
-use ovs_core::{ConnectionConfig, Driver, Session};
-use ovs_ssh::{SshSettings, Tunnel};
+use ovs_core::{ConnectionConfig, Driver, Session, SshAuthMethod};
+use ovs_ssh::{SshAuth, SshSettings, Tunnel};
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -65,6 +65,42 @@ pub async fn connect(
         Ok(Arc::new(Mutex::new(session)))
     })
     .await
+}
+
+/// `~/` at the start of `path` means the home directory.
+pub fn expand_home(path: &str) -> std::path::PathBuf {
+    match path.strip_prefix("~/").zip(dirs::home_dir()) {
+        Some((rest, home)) => home.join(rest),
+        None => std::path::PathBuf::from(path),
+    }
+}
+
+/// How to sign in to `config`'s SSH server, with `secret` as the password or key passphrase,
+/// and the database's address as the SSH server sees it. `None` without SSH.
+pub fn ssh_settings(
+    config: &ConnectionConfig,
+    secret: &str,
+) -> Option<(SshSettings, (String, u16))> {
+    let ssh = &config.ssh;
+    if !ssh.enabled {
+        return None;
+    }
+    let auth = match ssh.auth {
+        SshAuthMethod::Password => SshAuth::Password(secret.to_owned()),
+        SshAuthMethod::PrivateKey => SshAuth::PrivateKey {
+            path: expand_home(&ssh.key_path),
+            passphrase: Some(secret.to_owned()).filter(|s| !s.is_empty()),
+        },
+    };
+    Some((
+        SshSettings {
+            host: ssh.host.clone(),
+            port: ssh.port,
+            user: ssh.user.clone(),
+            auth,
+        },
+        (config.host.clone(), config.port),
+    ))
 }
 
 /// How to reach a connection's database through SSH, kept for the life of the app so tunnels
@@ -147,7 +183,6 @@ async fn tunnel_port(id: Uuid) -> ovs_core::Result<u16> {
 #[cfg(test)]
 mod tests {
     use ovs_core::{QueryOutcome, SshConfig, Value};
-    use ovs_ssh::SshAuth;
 
     use super::*;
 
@@ -177,24 +212,20 @@ mod tests {
         assert_eq!(rs.rows[0][0], Value::Int(4));
     }
 
-    /// End to end through a real SSH server. Skipped unless `OVS_TEST_SSH` is
-    /// `ssh_host:ssh_port:ssh_user:ssh_password:db_host:db_port` (the database as seen from the
-    /// SSH server); the database user is root with password `OVS_TEST_DB_PASSWORD` or `secret`.
-    #[test]
-    fn connects_through_an_ssh_tunnel() {
-        let Ok(spec) = std::env::var("OVS_TEST_SSH") else {
-            return;
-        };
+    /// The SSH server and database from `OVS_TEST_SSH`, which is
+    /// `ssh_host:ssh_port:ssh_user:ssh_password:db_host:db_port` with the MySQL server as seen
+    /// from the SSH server. Its root password is `OVS_TEST_DB_PASSWORD` or `secret`.
+    fn ssh_test_config() -> Option<(ConnectionConfig, String)> {
+        let spec = std::env::var("OVS_TEST_SSH").ok()?;
         let parts: Vec<&str> = spec.split(':').collect();
         let [ssh_host, ssh_port, ssh_user, ssh_password, db_host, db_port] = parts.as_slice()
         else {
             panic!("bad OVS_TEST_SSH");
         };
-        let db_password =
-            std::env::var("OVS_TEST_DB_PASSWORD").unwrap_or_else(|_| "secret".to_owned());
         let config = ConnectionConfig {
             host: (*db_host).to_owned(),
             port: db_port.parse().unwrap(),
+            user: "root".to_owned(),
             ssh: SshConfig {
                 enabled: true,
                 host: (*ssh_host).to_owned(),
@@ -204,38 +235,85 @@ mod tests {
             },
             ..ConnectionConfig::default()
         };
-        let settings = SshSettings {
-            host: config.ssh.host.clone(),
-            port: config.ssh.port,
-            user: config.ssh.user.clone(),
-            auth: SshAuth::Password((*ssh_password).to_owned()),
-        };
+        Some((config, (*ssh_password).to_owned()))
+    }
+
+    /// Signs in to the SSH server the way a saved connection does, then opens two sessions
+    /// through the one tunnel.
+    fn query_through_tunnel(config: &ConnectionConfig, ssh_secret: &str, db_password: &str) {
+        let (settings, target) = ssh_settings(config, ssh_secret).unwrap();
         runtime().block_on(async {
-            register_tunnel(
-                config.id,
-                settings,
-                (config.host.clone(), config.port),
-                None,
-            )
-            .await;
-            // Two sessions share one tunnel.
+            register_tunnel(config.id, settings, target, None).await;
             for _ in 0..2 {
-                let session = connect(config.clone(), Some(db_password.clone()))
+                let session = connect(config.clone(), Some(db_password.to_owned()))
                     .await
                     .unwrap();
                 let out = session
                     .lock()
                     .await
-                    .execute("SELECT 1", None)
+                    .execute("SELECT 1 + 1", None)
                     .await
                     .unwrap();
                 let QueryOutcome::Rows(rs) = &out[0] else {
                     panic!("expected rows")
                 };
-                assert_eq!(rs.rows[0][0], Value::Int(1));
+                assert_eq!(rs.rows[0][0], Value::Int(2));
             }
             let fingerprint = tunnel_fingerprint(config.id).await.unwrap();
             assert!(fingerprint.starts_with("SHA256:"));
         });
+    }
+
+    fn db_password() -> String {
+        std::env::var("OVS_TEST_DB_PASSWORD").unwrap_or_else(|_| "secret".to_owned())
+    }
+
+    /// End to end through a real SSH server, signing in with a password.
+    #[test]
+    fn connects_through_an_ssh_tunnel() {
+        let Some((config, ssh_password)) = ssh_test_config() else {
+            return;
+        };
+        query_through_tunnel(&config, &ssh_password, &db_password());
+    }
+
+    /// Signing in with a private key instead: `OVS_TEST_SSH_KEY` names a key authorized for
+    /// the same user, with passphrase `keypass`.
+    #[test]
+    fn connects_through_an_ssh_tunnel_with_a_key() {
+        let (Some((mut config, _)), Ok(key)) =
+            (ssh_test_config(), std::env::var("OVS_TEST_SSH_KEY"))
+        else {
+            return;
+        };
+        config.ssh.auth = SshAuthMethod::PrivateKey;
+        config.ssh.key_path = key;
+        query_through_tunnel(&config, "keypass", &db_password());
+
+        // A wrong passphrase is reported, not retried as a password.
+        config.id = Uuid::new_v4();
+        let (settings, target) = ssh_settings(&config, "wrong").unwrap();
+        let err = runtime().block_on(async {
+            register_tunnel(config.id, settings, target, None).await;
+            connect(config.clone(), Some(db_password())).await.err()
+        });
+        assert!(err.is_some_and(|e| e.to_string().contains("SSH")));
+    }
+
+    /// PostgreSQL through the same SSH server: `OVS_TEST_SSH_PG` is `db_host:db_port` as seen
+    /// from the SSH server, for user `postgres`.
+    #[test]
+    fn connects_to_postgres_through_an_ssh_tunnel() {
+        let (Some((mut config, ssh_password)), Ok(target)) =
+            (ssh_test_config(), std::env::var("OVS_TEST_SSH_PG"))
+        else {
+            return;
+        };
+        let (host, port) = target.rsplit_once(':').expect("bad OVS_TEST_SSH_PG");
+        config.engine = ovs_core::Engine::Postgres;
+        host.clone_into(&mut config.host);
+        config.port = port.parse().unwrap();
+        "postgres".clone_into(&mut config.user);
+        query_through_tunnel(&config, &ssh_password, &db_password());
     }
 }

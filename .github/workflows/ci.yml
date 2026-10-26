@@ -35,11 +35,15 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Start the SSH server for the tunnel tests
+        run: docker compose -f compose.test.yml up -d --wait ssh
       - run: cargo fmt --all --check
-      - run: cargo clippy -p ovs-core -p ovs-mysql -p ovs-sqlite -p ovs-store --all-targets
-      - run: cargo test -p ovs-core -p ovs-mysql -p ovs-sqlite -p ovs-store
+      - run: cargo clippy -p ovs-core -p ovs-mysql -p ovs-sqlite -p ovs-store -p ovs-ssh --all-targets
+      - run: cargo test -p ovs-core -p ovs-mysql -p ovs-sqlite -p ovs-store -p ovs-ssh
         env:
           OVS_TEST_MYSQL: 127.0.0.1:3306:root:secret
+          OVS_TEST_SSH: 127.0.0.1:2222:tunnel:secret:host.docker.internal:3306
+          OVS_TEST_SSH_KEY: ${{ github.workspace }}/target/test-ssh/id_ed25519
 
   # The PostgreSQL driver against a real server.
   postgres:
@@ -59,10 +63,16 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Start the SSH server for the tunnel tests
+        run: docker compose -f compose.test.yml up -d --wait ssh
       - run: cargo clippy -p ovs-postgres --all-targets
       - run: cargo test -p ovs-postgres
         env:
           OVS_TEST_PG: 127.0.0.1:5432:postgres:secret
+      - run: cargo test -p ovs-ssh --test live tunnel_reaches_postgres
+        env:
+          OVS_TEST_SSH: 127.0.0.1:2222:tunnel:secret:host.docker.internal:3306
+          OVS_TEST_SSH_PG: host.docker.internal:5432
 
   app:
     strategy:

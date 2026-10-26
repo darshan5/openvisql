@@ -146,5 +146,12 @@ Phase 4 is complete.
 - ✅ A GitHub Actions release workflow that builds them on tags (Apple Silicon, Intel,
   Windows) and attaches them to a draft release.
 - ✅ Signing and notarization run when the certificate secrets are set; see
-  [DEPLOYMENT.md](DEPLOYMENT.md#signing).
-- Auto-update.
+  [DEPLOYMENT.md](DEPLOYMENT.md#signing). Releases are unsigned for now (decided 2026-10-26).
+- Auto-update: not planned (decided 2026-10-26). New versions are downloaded from the
+  releases page.
+
+## Next
+
+- Copy a database to any saved connection of the same engine, not only one already open in
+  a tab: connect to it for the copy, directly or through its SSH tunnel, asking for its
+  password if none is saved.
