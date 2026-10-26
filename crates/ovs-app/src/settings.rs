@@ -9,6 +9,7 @@ use gpui_kit::component::{
     h_flex,
     input::{Input, InputState},
     radio::RadioGroup,
+    scroll::ScrollbarMode,
     v_flex,
 };
 use gpui_kit::{
@@ -32,6 +33,8 @@ pub fn init(cx: &mut App) {
     let preferences = Store::default().load_preferences().unwrap_or_default();
     cx.set_global(Prefs(preferences));
     apply_theme(None, cx);
+    // Scroll bars stay visible rather than fading out, so it's clear what scrolls.
+    Theme::set_scrollbar_mode(ScrollbarMode::Always, cx);
 }
 
 /// Applies the theme preference; `System` follows the window's (or the OS's) appearance.

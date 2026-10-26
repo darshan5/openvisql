@@ -15,6 +15,7 @@ use gpui_kit::component::{
     h_flex,
     input::{Input, InputEvent, InputState},
     menu::{DropdownMenu as _, PopupMenu, PopupMenuItem},
+    scroll::ScrollableElement as _,
     tab::{Tab, TabBar},
     v_flex,
 };
@@ -639,7 +640,7 @@ impl QueryBuilder {
                 v_flex()
                     .id("builder-table-list")
                     .flex_1()
-                    .overflow_y_scroll()
+                    .overflow_y_scrollbar()
                     .children(items),
             )
             .into_any_element()
@@ -969,17 +970,16 @@ impl QueryBuilder {
             })
             .collect();
         let empty = rows.is_empty();
+        // The column headings stay put while the rows scroll.
         v_flex()
-            .id("builder-grid")
             .h(px(200.))
-            .px_3()
-            .py_2()
-            .gap_1()
             .border_t_1()
             .border_color(cx.theme().border)
-            .overflow_y_scroll()
             .child(
                 h_flex()
+                    .px_3()
+                    .pt_2()
+                    .pb_1()
                     .gap_2()
                     .child(div().w(px(24.)))
                     .child(head("Output", Some(54.)))
@@ -991,16 +991,26 @@ impl QueryBuilder {
                     .child(head("Grouping", Some(64.)))
                     .child(head("Criteria", None)),
             )
-            .children(rows)
-            .when(empty, |el| {
-                el.child(
-                    div()
-                        .text_sm()
-                        .text_color(muted)
-                        .pt_2()
-                        .child("Tick columns in the tables above to add them here."),
-                )
-            })
+            .child(
+                v_flex()
+                    .id("builder-grid")
+                    .flex_1()
+                    .min_h_0()
+                    .px_3()
+                    .pb_2()
+                    .gap_1()
+                    .overflow_y_scrollbar()
+                    .children(rows)
+                    .when(empty, |el| {
+                        el.child(
+                            div()
+                                .text_sm()
+                                .text_color(muted)
+                                .pt_2()
+                                .child("Tick columns in the tables above to add them here."),
+                        )
+                    }),
+            )
             .into_any_element()
     }
 
@@ -1255,7 +1265,7 @@ impl Render for QueryBuilder {
                     .p_3()
                     .border_t_1()
                     .border_color(cx.theme().border)
-                    .overflow_y_scroll()
+                    .overflow_y_scrollbar()
                     .font_family(cx.theme().mono_font_family.clone())
                     .text_sm()
                     .child(preview),
