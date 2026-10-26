@@ -568,7 +568,7 @@ impl ObjectBrowser {
                     )));
                 }
                 menu = menu.separator();
-                menu = menu.item(PopupMenuItem::new("New table (designer)…").on_click(emit(
+                menu = menu.item(PopupMenuItem::new("New table…").on_click(emit(
                     BrowserEvent::DesignTable {
                         db: db.clone(),
                         table: None,
@@ -674,6 +674,22 @@ impl ObjectBrowser {
                 }
                 menu.separator()
             }
+            // New tables open in the designer; the SQL template stays available.
+            Some(Node::Folder { db, kind }) if *kind == ObjectKind::Table => menu
+                .item(
+                    PopupMenuItem::new("New table…").on_click(emit(BrowserEvent::DesignTable {
+                        db: db.clone(),
+                        table: None,
+                    })),
+                )
+                .item(
+                    PopupMenuItem::new("New table (SQL template)…").on_click(new_object(
+                        ObjectKind::Table,
+                        db,
+                        None,
+                    )),
+                )
+                .separator(),
             Some(Node::Folder { db, kind }) if *kind != ObjectKind::Trigger => menu
                 .item(
                     PopupMenuItem::new(format!("New {}…", kind.sql_keyword().to_lowercase()))
