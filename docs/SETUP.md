@@ -47,7 +47,8 @@ OVS_TEST_MYSQL=127.0.0.1:33307:root:secret cargo test -p ovs-mysql --test live
 OVS_TEST_PG=127.0.0.1:35432:postgres:secret OVS_TEST_PG_TLS=1 cargo test -p ovs-postgres --test live
 
 # SSH tunnels, signing in with the password and with the generated key, to MySQL and
-# PostgreSQL (database addresses as the SSH server sees them)
+# PostgreSQL (database addresses as the SSH server sees them); with OVS_TEST_SSH alone, a
+# MySQL backup through the tunnel to a local file and a restore back through it
 OVS_TEST_SSH=127.0.0.1:2222:tunnel:secret:mysql:3306 OVS_TEST_SSH_PG=postgres:5432 \
   OVS_TEST_SSH_KEY="${PWD}/target/test-ssh/id_ed25519" cargo test -p ovs-ssh -p ovs-app
 

@@ -15,7 +15,7 @@ use gpui_kit::{
     Styled as _, Window, px,
 };
 use ovs_core::ConnectionConfig;
-use ovs_core::dump::{DumpOptions, dump_database, run_script};
+use ovs_core::dump::{DumpOptions, DumpStats, ScriptStats, dump_database, run_script};
 
 use crate::runtime;
 
@@ -170,21 +170,7 @@ fn choose_file_and_dump(
                 window.push_notification(format!("Backing up {db}…"), cx);
             })
             .ok();
-            let target = path.clone();
-            let database = db.clone();
-            let outcome = async move {
-                let session = runtime::connect(config, password).await?;
-                runtime::run(async move {
-                    let file = std::fs::File::create(&target)
-                        .map_err(|e| ovs_core::Error::Other(e.to_string()))?;
-                    let mut out = BufWriter::new(file);
-                    let mut session = session.lock().await;
-                    dump_database(session.as_mut(), &database, &options, &mut out, &mut |_| {})
-                        .await
-                })
-                .await
-            }
-            .await;
+            let outcome = backup_to_file(config, password, db.clone(), options, path.clone()).await;
             cx.update(|window, cx| {
                 let message = match outcome {
                     Ok(stats) => format!(
@@ -201,6 +187,44 @@ fn choose_file_and_dump(
             .ok();
         })
         .detach();
+}
+
+/// Dumps `database` to a local file at `target`. A connection with SSH is read through its
+/// tunnel, so a remote server is backed up to this machine.
+async fn backup_to_file(
+    config: ConnectionConfig,
+    password: Option<String>,
+    database: String,
+    options: DumpOptions,
+    target: PathBuf,
+) -> ovs_core::Result<DumpStats> {
+    let session = runtime::connect(config, password).await?;
+    runtime::run(async move {
+        let file =
+            std::fs::File::create(&target).map_err(|e| ovs_core::Error::Other(e.to_string()))?;
+        let mut out = BufWriter::new(file);
+        let mut session = session.lock().await;
+        dump_database(session.as_mut(), &database, &options, &mut out, &mut |_| {}).await
+    })
+    .await
+}
+
+/// Runs `script` against `db` (or the server), through the connection's tunnel if it has one.
+async fn restore(
+    config: ConnectionConfig,
+    password: Option<String>,
+    db: Option<String>,
+    script: String,
+) -> ovs_core::Result<ScriptStats> {
+    let session = runtime::connect(config, password).await?;
+    runtime::run(async move {
+        let mut session = session.lock().await;
+        if let Some(db) = db {
+            session.use_database(&db).await?;
+        }
+        Ok(run_script(session.as_mut(), &script, true, &mut |_, _| {}).await)
+    })
+    .await
 }
 
 /// Asks for a `.sql` file, confirms, and runs it against `db`. `done` runs afterwards (to
@@ -296,20 +320,7 @@ fn execute_script(
     window.push_notification("Running script…", cx);
     window
         .spawn(cx, async move |cx| {
-            let outcome = async move {
-                let session = runtime::connect(config, password).await?;
-                runtime::run(async move {
-                    let mut session = session.lock().await;
-                    if let Some(db) = db {
-                        session.use_database(&db).await?;
-                    }
-                    Ok::<_, ovs_core::Error>(
-                        run_script(session.as_mut(), &script, true, &mut |_, _| {}).await,
-                    )
-                })
-                .await
-            }
-            .await;
+            let outcome = restore(config, password, db, script).await;
             cx.update(|window, cx| {
                 let message = match outcome {
                     Ok(stats) if stats.errors.is_empty() => {
@@ -330,4 +341,73 @@ fn execute_script(
             .ok();
         })
         .detach();
+}
+
+#[cfg(test)]
+mod tests {
+    use ovs_core::{QueryOutcome, Value};
+
+    use super::*;
+    use crate::runtime::tests::{db_password, ssh_test_config};
+
+    /// A remote server backed up through SSH to a local file, then restored through SSH into
+    /// another database. Uses `OVS_TEST_SSH` (see `runtime::tests`).
+    #[test]
+    fn backs_up_and_restores_through_an_ssh_tunnel() {
+        let Some((config, ssh_password)) = ssh_test_config() else {
+            return;
+        };
+        let password = Some(db_password());
+        let (settings, target) = runtime::ssh_settings(&config, &ssh_password).unwrap();
+        let file = std::env::temp_dir().join(format!("ovs-ssh-backup-{}.sql", std::process::id()));
+        let query = async |sql: &str| {
+            let session = runtime::connect(config.clone(), password.clone())
+                .await
+                .unwrap();
+            let sql = sql.to_owned();
+            runtime::run(async move { session.lock().await.execute(&sql, None).await })
+                .await
+                .unwrap()
+        };
+        runtime::runtime().block_on(async {
+            runtime::register_tunnel(config.id, settings, target, None).await;
+            query(
+                "DROP DATABASE IF EXISTS ovs_ssh_backup; CREATE DATABASE ovs_ssh_backup; \
+                 CREATE TABLE ovs_ssh_backup.t (id INT PRIMARY KEY, name VARCHAR(20)); \
+                 INSERT INTO ovs_ssh_backup.t VALUES (1, 'ada'), (2, 'bob'), (3, 'cy')",
+            )
+            .await;
+            let stats = backup_to_file(
+                config.clone(),
+                password.clone(),
+                "ovs_ssh_backup".into(),
+                DumpOptions::default(),
+                file.clone(),
+            )
+            .await
+            .unwrap();
+            assert_eq!((stats.tables, stats.rows), (1, 3));
+            let script = std::fs::read_to_string(&file).unwrap();
+            assert!(script.contains("INSERT INTO"), "{script}");
+
+            query("DROP DATABASE IF EXISTS ovs_ssh_restored; CREATE DATABASE ovs_ssh_restored")
+                .await;
+            let run = restore(
+                config.clone(),
+                password.clone(),
+                Some("ovs_ssh_restored".into()),
+                script,
+            )
+            .await
+            .unwrap();
+            assert!(run.errors.is_empty(), "{:?}", run.errors);
+            let out = query("SELECT COUNT(*) FROM ovs_ssh_restored.t").await;
+            query("DROP DATABASE ovs_ssh_backup; DROP DATABASE ovs_ssh_restored").await;
+            let QueryOutcome::Rows(rs) = &out[0] else {
+                panic!("{out:?}")
+            };
+            assert_eq!(rs.rows[0][0], Value::Int(3));
+        });
+        let _ = std::fs::remove_file(&file);
+    }
 }

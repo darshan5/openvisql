@@ -181,7 +181,7 @@ async fn tunnel_port(id: Uuid) -> ovs_core::Result<u16> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use ovs_core::{QueryOutcome, SshConfig, Value};
 
     use super::*;
@@ -215,7 +215,7 @@ mod tests {
     /// The SSH server and database from `OVS_TEST_SSH`, which is
     /// `ssh_host:ssh_port:ssh_user:ssh_password:db_host:db_port` with the MySQL server as seen
     /// from the SSH server. Its root password is `OVS_TEST_DB_PASSWORD` or `secret`.
-    fn ssh_test_config() -> Option<(ConnectionConfig, String)> {
+    pub(crate) fn ssh_test_config() -> Option<(ConnectionConfig, String)> {
         let spec = std::env::var("OVS_TEST_SSH").ok()?;
         let parts: Vec<&str> = spec.split(':').collect();
         let [ssh_host, ssh_port, ssh_user, ssh_password, db_host, db_port] = parts.as_slice()
@@ -264,7 +264,7 @@ mod tests {
         });
     }
 
-    fn db_password() -> String {
+    pub(crate) fn db_password() -> String {
         std::env::var("OVS_TEST_DB_PASSWORD").unwrap_or_else(|_| "secret".to_owned())
     }
 
