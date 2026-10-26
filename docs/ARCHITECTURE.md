@@ -180,7 +180,7 @@ OpenViSQL is MIT-licensed, so its code must stay compatible with MIT:
     re-creates indexes and triggers. All of this runs in one transaction with foreign keys
     off, and is rolled back if any step fails. Generated columns block a rebuild, because
     their expressions aren't loaded.
-  - Driver tests use temp files and run in CI everywhere, with no services.
+  - Driver tests use temp files and run anywhere, with no services.
 
 ## ADR-009: PostgreSQL schemas as browser databases; prepare, then simple-query
 
@@ -202,4 +202,16 @@ OpenViSQL is MIT-licensed, so its code must stay compatible with MIT:
   - Every query costs one extra round trip for the prepare.
   - TLS uses rustls with ring, as MySQL does. "Encrypt only" accepts any certificate but
     still checks handshake signatures. "Verify" uses `webpki-roots` plus the CA file.
+
+---
+
+## ADR-010: GitHub Actions for releases only
+
+- **Date:** 2026-10-26
+- **Context:** A CI workflow ran formatting, clippy and the live database tests on every push.
+- **Decision:** GitHub Actions only builds and publishes releases (`release.yml`). The CI
+  workflow is removed; `scripts/check.sh` runs the same checks locally before committing,
+  against the servers from `compose.test.yml`.
+- **Consequences:** Nothing checks pushes automatically, so the checks must be run before
+  each commit. Windows builds are only exercised by the release workflow.
 

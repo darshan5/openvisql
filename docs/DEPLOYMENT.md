@@ -3,15 +3,19 @@
 OpenViSQL is a desktop app, so there is no server deployment. Releases are installers attached
 to GitHub releases.
 
-## Continuous integration
+## Checks
 
-`.github/workflows/ci.yml` runs on every push and pull request to `main`:
+GitHub Actions only builds and publishes releases; there is no CI workflow. Before
+committing, run the checks locally:
 
-- **Linux, MySQL and MariaDB:** format check, clippy with `-D warnings`, and the core, SQLite
-  and store tests. The MySQL driver's live tests run against MySQL 8.4 and MariaDB 11.4
-  service containers.
-- **Linux, PostgreSQL:** the PostgreSQL driver's tests against a PostgreSQL 17 service.
-- **macOS and Windows:** builds and tests the whole workspace, including the app.
+```sh
+docker compose -f compose.test.yml up -d --wait   # once, for the live database tests
+scripts/check.sh
+```
+
+It checks formatting, runs clippy with `-D warnings`, and runs every test, including the
+MySQL, MariaDB, PostgreSQL and SSH suites when the test servers are up. See
+[SETUP.md](SETUP.md#live-database-tests) for running suites one at a time.
 
 ## Cutting a release
 

@@ -21,9 +21,11 @@ cargo run --release -p ovs-app
 
 ```sh
 cargo fmt --all
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+scripts/check.sh   # format check, clippy -D warnings, every test
 ```
+
+Run this before committing: there is no CI, and GitHub Actions only builds releases. With
+the test servers below running, it includes the live database and SSH tests.
 
 ### Live database tests
 

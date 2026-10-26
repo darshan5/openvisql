@@ -45,7 +45,7 @@ services:
       retries: 30
 
   # Reaches the databases by service name (mysql:3306, postgres:5432), or servers published
-  # on the host at host.docker.internal (as in CI). User `tunnel` signs in
+  # on the host at host.docker.internal. User `tunnel` signs in
   # with password `secret`, or with the key written to target/test-ssh/id_ed25519
   # (passphrase `keypass`), which is generated on first start.
   ssh:

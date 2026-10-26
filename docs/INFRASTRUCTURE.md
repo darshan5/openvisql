@@ -5,7 +5,8 @@
 - **URL:** https://github.com/darshan5/openvisql
 - **Visibility:** public
 - **Default Branch:** main
-- **CI:** GitHub Actions, `.github/workflows/ci.yml` (Linux, macOS, Windows)
+- **GitHub Actions:** releases only. `.github/workflows/release.yml` builds the installers
+  when a version tag is pushed. Checks run locally with `scripts/check.sh`.
 - **Created:** 2026-10-25
 
 ## Hosting
