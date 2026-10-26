@@ -5141,7 +5141,7 @@ dependencies = [
 
 [[package]]
 name = "ovs-app"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5160,7 +5160,7 @@ dependencies = [
 
 [[package]]
 name = "ovs-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "csv",
@@ -5173,7 +5173,7 @@ dependencies = [
 
 [[package]]
 name = "ovs-mysql"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "mysql_async",
@@ -5183,7 +5183,7 @@ dependencies = [
 
 [[package]]
 name = "ovs-postgres"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "futures",
@@ -5197,7 +5197,7 @@ dependencies = [
 
 [[package]]
 name = "ovs-sqlite"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "ovs-core",
@@ -5207,7 +5207,7 @@ dependencies = [
 
 [[package]]
 name = "ovs-ssh"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "russh",
  "thiserror 2.0.21",
@@ -5216,7 +5216,7 @@ dependencies = [
 
 [[package]]
 name = "ovs-store"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64 0.23.1",
  "chacha20poly1305",
