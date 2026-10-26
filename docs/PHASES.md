@@ -82,12 +82,14 @@ Phase 2 is complete.
 ## Phase 3: Power features
 
 - Create/Alter Table designer:
-  - Tabs for columns, indexes, foreign keys, checks, advanced options and SQL preview.
-- SQL dump backup and restore (execute script) with progress and abort-on-error.
-- Import CSV (`LOAD DATA LOCAL INFILE`).
-- User manager; SHOW PROCESSLIST, VARIABLES and STATUS views.
+  - ✅ Columns (name, type, NULL, primary key, auto-increment, default, comment, order) with a
+    live `CREATE TABLE` / `ALTER TABLE` preview; opened from the object browser.
+  - Indexes, foreign keys, checks and advanced options (engine, charset).
+- ✅ SQL dump backup and restore (run script) with abort-on-error.
+- ✅ Import CSV (batched `INSERT`s in one transaction, rolled back on error).
+- ✅ Process list, variables and status views. User manager still to do.
 - Copy database or tables to another connection.
-- Session restore (open tabs, editor contents).
+- ✅ Session restore (open tabs, editor contents).
 
 ## Phase 4: SQLite
 

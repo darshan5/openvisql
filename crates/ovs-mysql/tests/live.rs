@@ -597,3 +597,120 @@ async fn csv_import_inserts_and_rolls_back_on_error() {
     assert_eq!(rows(&out[0])[0][0], Value::Int(2));
     cleanup(s, &db).await;
 }
+
+#[tokio::test]
+async fn table_designer_sql_runs() {
+    use ovs_core::sql::Dialect;
+    use ovs_core::sql::design::{ColumnDef, TableDesign, alter_sql, create_sql};
+
+    let Some((mut s, db)) = scratch("designer").await else {
+        return;
+    };
+    let new_table = TableDesign {
+        name: "items".into(),
+        columns: vec![
+            ColumnDef {
+                name: "id".into(),
+                data_type: "INT UNSIGNED".into(),
+                primary_key: true,
+                auto_increment: true,
+                ..ColumnDef::default()
+            },
+            ColumnDef {
+                name: "label".into(),
+                data_type: "VARCHAR(20)".into(),
+                nullable: true,
+                default_sql: "'it''s new'".into(),
+                comment: "shown to users".into(),
+                ..ColumnDef::default()
+            },
+            ColumnDef {
+                name: "created".into(),
+                data_type: "DATETIME".into(),
+                default_sql: "CURRENT_TIMESTAMP".into(),
+                ..ColumnDef::default()
+            },
+            ColumnDef {
+                name: "legacy".into(),
+                data_type: "INT".into(),
+                nullable: true,
+                ..ColumnDef::default()
+            },
+        ],
+    };
+    s.execute(&create_sql(Dialect::MySql, &db, &new_table), None)
+        .await
+        .unwrap();
+    s.execute("INSERT INTO items (label) VALUES ('a'), (DEFAULT)", None)
+        .await
+        .unwrap();
+
+    let load = |cols: Vec<ovs_core::ColumnInfo>, idx: Vec<ovs_core::IndexInfo>| {
+        TableDesign::from_table("items", &cols, &idx)
+    };
+    let before = load(
+        s.list_columns(&db, "items").await.unwrap(),
+        s.list_indexes(&db, "items").await.unwrap(),
+    );
+    // Loading an existing table and changing nothing produces no ALTER.
+    assert_eq!(
+        alter_sql(Dialect::MySql, &db, &before, &before),
+        None,
+        "{before:?}"
+    );
+
+    let mut after = before.clone();
+    after.columns[1].name = "title".into();
+    after.columns[1].data_type = "VARCHAR(100)".into();
+    after.columns.retain(|c| c.name != "legacy");
+    after.columns.insert(
+        1,
+        ColumnDef {
+            name: "sku".into(),
+            data_type: "VARCHAR(10)".into(),
+            nullable: true,
+            ..ColumnDef::default()
+        },
+    );
+    let sql = alter_sql(Dialect::MySql, &db, &before, &after).unwrap();
+    s.execute(&sql, None)
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+
+    let reloaded = load(
+        s.list_columns(&db, "items").await.unwrap(),
+        s.list_indexes(&db, "items").await.unwrap(),
+    );
+    let names: Vec<&str> = reloaded.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["id", "sku", "title", "created"]);
+    assert!(
+        reloaded.columns[2]
+            .data_type
+            .to_lowercase()
+            .starts_with("varchar(100)")
+    );
+    assert_eq!(reloaded.columns[2].comment, "shown to users");
+    // The data survived the rename.
+    let out = s
+        .execute("SELECT title FROM items ORDER BY id", None)
+        .await
+        .unwrap();
+    assert_eq!(rows(&out[0])[0][0], Value::Text("a".into()));
+    assert_eq!(rows(&out[0])[1][0], Value::Text("it's new".into()));
+
+    // Swap the primary key to (sku, id) while id stays AUTO_INCREMENT.
+    let mut keyed = reloaded.clone();
+    keyed.columns[1].primary_key = true;
+    keyed.columns[1].nullable = false;
+    s.execute("UPDATE items SET sku = CONCAT('S', id)", None)
+        .await
+        .unwrap();
+    let sql = alter_sql(Dialect::MySql, &db, &reloaded, &keyed).unwrap();
+    s.execute(&sql, None)
+        .await
+        .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+    let idx = s.list_indexes(&db, "items").await.unwrap();
+    let pk = idx.iter().find(|i| i.is_primary()).unwrap();
+    assert_eq!(pk.columns, ["id", "sku"]);
+    cleanup(s, &db).await;
+}

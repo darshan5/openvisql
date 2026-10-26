@@ -3,6 +3,7 @@
 
 mod analyze;
 pub mod complete;
+pub mod design;
 mod dialect;
 mod edit;
 pub mod keywords;

@@ -409,6 +409,20 @@ impl Workspace {
                 window,
                 cx,
             ),
+            BrowserEvent::DesignTable { db, table } => {
+                let this = cx.entity().downgrade();
+                crate::designer::open(
+                    db.clone(),
+                    table.clone(),
+                    self.completion.session.clone(),
+                    Rc::new(move |sql, window, cx| {
+                        this.update(cx, |this, cx| this.run_on_metadata(sql, window, cx))
+                            .ok();
+                    }),
+                    window,
+                    cx,
+                );
+            }
             BrowserEvent::ImportCsv { db, table } => crate::import_dialog::open(
                 db.clone(),
                 table.clone(),

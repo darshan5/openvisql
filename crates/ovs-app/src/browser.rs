@@ -224,6 +224,8 @@ pub enum BrowserEvent {
     RunScript(String),
     /// Import a CSV file into a table.
     ImportCsv { db: String, table: String },
+    /// Open the table designer for an existing table, or a new one when `table` is `None`.
+    DesignTable { db: String, table: Option<String> },
     /// Ask for a name, then run the statement built from it and refresh.
     PromptExecute {
         title: String,
@@ -534,11 +536,19 @@ impl ObjectBrowser {
                     },
                 )))
                 .separator()
-                .item(PopupMenuItem::new("New table…").on_click(new_object(
-                    ObjectKind::Table,
-                    db,
-                    None,
+                .item(PopupMenuItem::new("New table (designer)…").on_click(emit(
+                    BrowserEvent::DesignTable {
+                        db: db.clone(),
+                        table: None,
+                    },
                 )))
+                .item(
+                    PopupMenuItem::new("New table (SQL template)…").on_click(new_object(
+                        ObjectKind::Table,
+                        db,
+                        None,
+                    )),
+                )
                 .item(PopupMenuItem::new("New view…").on_click(new_object(
                     ObjectKind::View,
                     db,
@@ -634,6 +644,12 @@ impl ObjectBrowser {
                 if *kind == ObjectKind::Table {
                     let (rename_db, rename_from) = (db.clone(), name.clone());
                     menu = menu
+                        .item(PopupMenuItem::new("Design table…").on_click(emit(
+                            BrowserEvent::DesignTable {
+                                db: db.clone(),
+                                table: Some(name.clone()),
+                            },
+                        )))
                         .item(PopupMenuItem::new("New trigger…").on_click(new_object(
                             ObjectKind::Trigger,
                             db,
