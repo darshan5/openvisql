@@ -680,7 +680,7 @@ impl ObjectBrowser {
                         &db,
                         &table,
                         &columns,
-                        crate::query::DEFAULT_ROW_LIMIT,
+                        crate::settings::prefs(cx).row_limit,
                     );
                     cx.emit(BrowserEvent::InsertText(sql));
                 }

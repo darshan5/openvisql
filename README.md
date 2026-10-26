@@ -55,6 +55,11 @@ the right, and results below.
   copy rows as TSV.
 - Asks for confirmation before running `UPDATE`/`DELETE` without a `WHERE` clause.
 - Query history is saved locally.
+- **Settings** (⌘, / Ctrl+,):
+  - row limit / page size
+  - editor font size
+  - theme: system, light or dark
+  - whether "Execute all" stops at the first error
 
 ## Install and run
 

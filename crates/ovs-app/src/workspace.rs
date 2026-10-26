@@ -25,7 +25,7 @@ use ovs_store::SavedConnectionTab;
 
 use crate::browser::{BrowserEvent, BuildSql, ObjectBrowser};
 use crate::completion::CompletionSource;
-use crate::query::{DEFAULT_ROW_LIMIT, QueryEvent, QueryTab, RunMode, TabSpec, format_duration};
+use crate::query::{QueryEvent, QueryTab, RunMode, TabSpec, format_duration};
 use crate::runtime::{self, SharedSession};
 use crate::tab_fit::{OnNew, OnSelect, TAB_BAR_RESERVED, TabFit, tab_list_menu};
 use crate::{
@@ -319,8 +319,9 @@ impl Workspace {
         match event {
             BrowserEvent::OpenData { db, name } => {
                 let sql = format!(
-                    "SELECT * FROM {} LIMIT {DEFAULT_ROW_LIMIT};",
-                    d.qualified(db, name)
+                    "SELECT * FROM {} LIMIT {};",
+                    d.qualified(db, name),
+                    crate::settings::prefs(cx).row_limit
                 );
                 self.add_tab(Some(name.clone()), Some(db.clone()), sql, true, window, cx);
             }

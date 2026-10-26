@@ -7,6 +7,7 @@ mod export_dialog;
 mod grid;
 mod query;
 mod runtime;
+mod settings;
 mod shell;
 mod tab_fit;
 mod workspace;
@@ -36,6 +37,7 @@ actions!(
         ToggleComment,
         UpperCase,
         LowerCase,
+        OpenSettings,
         Quit
     ]
 );
@@ -49,6 +51,7 @@ fn bind_keys(cx: &mut App) {
         // `secondary` is Cmd on macOS and Ctrl on Windows/Linux.
         KeyBinding::new("secondary-n", NewConnection, None),
         KeyBinding::new("secondary-q", Quit, None),
+        KeyBinding::new("secondary-,", OpenSettings, None),
         KeyBinding::new("secondary-shift-w", CloseConnection, None),
         KeyBinding::new("ctrl-tab", NextConnection, None),
         KeyBinding::new("ctrl-shift-tab", PreviousConnection, None),
@@ -80,7 +83,11 @@ fn set_menus(cx: &mut App) {
     cx.set_menus([
         Menu {
             name: "OpenViSQL".into(),
-            items: vec![MenuItem::action("Quit OpenViSQL", Quit)],
+            items: vec![
+                MenuItem::action("Settings…", OpenSettings),
+                MenuItem::separator(),
+                MenuItem::action("Quit OpenViSQL", Quit),
+            ],
             disabled: false,
         },
         Menu {
@@ -142,6 +149,7 @@ fn main() {
         .with_assets(gpui_kit::assets::Assets)
         .run(|cx| {
             gpui_kit::init(cx);
+            settings::init(cx);
             bind_keys(cx);
             set_menus(cx);
             cx.on_action(|_: &Quit, cx| cx.quit());

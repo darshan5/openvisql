@@ -26,7 +26,10 @@ use uuid::Uuid;
 use crate::connect::{ConnectEvent, ConnectView};
 use crate::tab_fit::{TAB_BAR_RESERVED, TabFit, tab_list_menu};
 use crate::workspace::{Workspace, WorkspaceEvent};
-use crate::{CloseConnection, NewConnection, NextConnection, PreviousConnection, window_options};
+use crate::{
+    CloseConnection, NewConnection, NextConnection, OpenSettings, PreviousConnection,
+    window_options,
+};
 
 /// Delay between the last change and writing the session file.
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(700);
@@ -63,6 +66,13 @@ impl AppShell {
         // Focus the shell so app shortcuts reach it before any control has been clicked.
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
+        // With the "System" theme, follow the OS switching between light and dark.
+        let appearance = cx.observe_window_appearance(window, |_, window, cx| {
+            if crate::settings::prefs(cx).theme == ovs_store::ThemePreference::System {
+                crate::settings::apply_theme(Some(window), cx);
+            }
+        });
+        crate::settings::apply_theme(Some(window), cx);
         let quit = cx.on_app_quit(|this: &mut Self, cx| {
             this.save_now(cx);
             async {}
@@ -75,7 +85,7 @@ impl AppShell {
             saved_tabs: HashMap::new(),
             save_task: None,
             tab_fit: TabFit::default(),
-            subscriptions: vec![quit],
+            subscriptions: vec![quit, appearance],
         };
         // A corrupt session file shouldn't stop the app from starting.
         let session = shell.store.load_session().unwrap_or_default();
@@ -261,6 +271,9 @@ impl Render for AppShell {
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
+            .on_action(cx.listener(|_, _: &OpenSettings, window, cx| {
+                crate::settings::open(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &NewConnection, window, cx| {
                 this.show_connections(window, cx);
             }))

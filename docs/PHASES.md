@@ -50,6 +50,13 @@ Progress:
   - statement templates
   - Info tabs
 - ✅ SSH tunnels (2026-10-26)
+- ✅ Preferences (2026-10-26), in Settings (⌘, / Ctrl+,):
+  - row limit / page size
+  - editor font size
+  - theme: system, light or dark
+  - stop "Execute all" at the first error
+
+Phase 2 is complete.
 - Done along the way:
   - inline tab rename and tab-list dropdowns with a "New" item
   - Save, Discard, + Row and Export in the results bar

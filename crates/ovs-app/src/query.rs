@@ -39,8 +39,6 @@ use crate::export_dialog::ExportForm;
 use crate::grid::{Editability, OpenValue, ResultGrid, ServerSort};
 use crate::runtime::{self, SharedSession};
 
-/// `LIMIT` appended to plain SELECTs that don't have one.
-pub const DEFAULT_ROW_LIMIT: usize = 50;
 /// Hard cap per result set for statements we can't add a LIMIT to (SHOW, CALL, ...).
 const MAX_FETCH_ROWS: usize = 50_000;
 /// Largest part of a binary value shown as hex in the value viewer.
@@ -563,10 +561,14 @@ impl QueryTab {
         self.active_result = 0;
         self.last_run = None;
         let started = Instant::now();
+        let (row_limit, stop_on_error) = {
+            let prefs = crate::settings::prefs(cx);
+            (prefs.row_limit, prefs.stop_on_error)
+        };
 
         self.running = Some(cx.spawn_in(window, async move |this, cx| {
             for stmt in statements {
-                let limited = sql::apply_row_limit(&stmt.sql, DEFAULT_ROW_LIMIT);
+                let limited = sql::apply_row_limit(&stmt.sql, row_limit);
                 let auto_limited = limited.is_some();
                 let to_run = limited.unwrap_or_else(|| stmt.sql.clone());
                 let t0 = Instant::now();
@@ -587,7 +589,7 @@ impl QueryTab {
                 // join) just leaves the total unknown.
                 let is_select = sql::classify(&stmt.sql) == StatementKind::Select;
                 let limit = if auto_limited {
-                    Some(DEFAULT_ROW_LIMIT as u64)
+                    Some(row_limit as u64)
                 } else if is_select {
                     sql::limit_clause(&stmt.sql).map(|l| l.row_count)
                 } else {
@@ -621,8 +623,7 @@ impl QueryTab {
                     None
                 };
                 let source_sql = is_select.then(|| {
-                    sql::apply_row_limit(&stmt.sql, DEFAULT_ROW_LIMIT)
-                        .unwrap_or_else(|| stmt.sql.clone())
+                    sql::apply_row_limit(&stmt.sql, row_limit).unwrap_or_else(|| stmt.sql.clone())
                 });
                 let page = is_select.then(|| {
                     let own = sql::limit_clause(&stmt.sql);
@@ -631,7 +632,7 @@ impl QueryTab {
                         filter: String::new(),
                         sort: None,
                         offset: own.as_ref().map_or(0, |l| l.offset),
-                        page_size: own.map_or(DEFAULT_ROW_LIMIT as u64, |l| l.row_count).max(1),
+                        page_size: own.map_or(row_limit as u64, |l| l.row_count).max(1),
                     }
                 });
                 let limits = Limits {
@@ -661,7 +662,12 @@ impl QueryTab {
                         this.push_report(report, &limits, window, cx);
                     })
                     .is_ok();
-                if cancelled || !alive {
+                let failed = this
+                    .read_with(cx, |this, _| {
+                        this.reports.last().is_some_and(|r| r.error.is_some())
+                    })
+                    .unwrap_or(false);
+                if cancelled || !alive || (stop_on_error && failed) {
                     break;
                 }
             }
@@ -1888,7 +1894,8 @@ impl QueryTab {
 fn result_footer(r: &ResultTab) -> String {
     let rows = thousands(r.rows as u64);
     let added = if r.auto_limited {
-        format!(" (LIMIT {DEFAULT_ROW_LIMIT} added automatically)")
+        let limit = r.paging.as_ref().map_or(0, |p| p.spec.page_size);
+        format!(" (LIMIT {limit} added automatically)")
     } else {
         String::new()
     };
@@ -1997,7 +2004,12 @@ impl Render for QueryTab {
             resizable_panel()
                 .size(px(280.))
                 .size_range(px(80.)..px(2000.))
-                .child(Editor::new(&self.editor).size_full().bordered(false)),
+                .child(
+                    Editor::new(&self.editor)
+                        .text_size(px(crate::settings::prefs(cx).editor_font_size))
+                        .size_full()
+                        .bordered(false),
+                ),
         )
         .child(
             v_flex()

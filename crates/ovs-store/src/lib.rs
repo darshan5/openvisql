@@ -99,6 +99,44 @@ pub struct Session {
     pub active: usize,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemePreference {
+    /// Follow the operating system's light/dark appearance.
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+/// App-wide settings, in `preferences.toml`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Preferences {
+    /// `LIMIT` added to plain SELECTs, and the page size for browsing results.
+    pub row_limit: usize,
+    pub editor_font_size: f32,
+    pub theme: ThemePreference,
+    /// "Execute all" stops at the first statement that fails.
+    pub stop_on_error: bool,
+}
+
+impl Preferences {
+    pub const ROW_LIMIT_RANGE: std::ops::RangeInclusive<usize> = 1..=100_000;
+    pub const FONT_SIZE_RANGE: std::ops::RangeInclusive<f32> = 8.0..=32.0;
+}
+
+impl Default for Preferences {
+    fn default() -> Self {
+        Self {
+            row_limit: 50,
+            editor_font_size: 14.0,
+            theme: ThemePreference::System,
+            stop_on_error: false,
+        }
+    }
+}
+
 /// A secret belonging to a connection.
 #[derive(Clone, Copy)]
 enum Secret {
@@ -228,6 +266,14 @@ impl Store {
         file.hosts
             .insert(format!("{host}:{port}"), fingerprint.to_owned());
         write_toml(&path, &file)
+    }
+
+    pub fn load_preferences(&self) -> Result<Preferences> {
+        read_toml(&self.path("preferences.toml"))
+    }
+
+    pub fn save_preferences(&self, preferences: &Preferences) -> Result<()> {
+        write_toml(&self.path("preferences.toml"), preferences)
     }
 
     pub fn load_session(&self) -> Result<Session> {
@@ -364,6 +410,25 @@ mod tests {
             store.known_host("db.example", 22).unwrap().as_deref(),
             Some("SHA256:abc")
         );
+    }
+
+    #[test]
+    fn preferences_default_and_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        assert_eq!(store.load_preferences().unwrap(), Preferences::default());
+        let prefs = Preferences {
+            row_limit: 200,
+            theme: ThemePreference::Dark,
+            ..Preferences::default()
+        };
+        store.save_preferences(&prefs).unwrap();
+        assert_eq!(store.load_preferences().unwrap(), prefs);
+        // Missing keys fall back to defaults.
+        fs::write(dir.path().join("preferences.toml"), "row_limit = 10\n").unwrap();
+        let partial = store.load_preferences().unwrap();
+        assert_eq!(partial.row_limit, 10);
+        assert!((partial.editor_font_size - 14.0).abs() < f32::EPSILON);
     }
 
     #[test]
