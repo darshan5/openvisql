@@ -129,6 +129,19 @@ impl QueryBuilder {
         cx.notify();
     }
 
+    /// Removes query `ix` (never the first), keeping the same tab selected where possible.
+    fn remove_part(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if ix == 0 || ix >= self.parts.len() {
+            return;
+        }
+        self.parts.remove(ix);
+        // Removing the open tab shows the one before it; later tabs shift down by one.
+        if self.active >= ix {
+            self.active -= 1;
+        }
+        cx.notify();
+    }
+
     fn part(&mut self) -> &mut PartUi {
         &mut self.parts[self.active]
     }
@@ -842,17 +855,29 @@ impl QueryBuilder {
 
 impl Render for QueryBuilder {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.active = self.active.min(self.parts.len() - 1);
         let muted = cx.theme().muted_foreground;
         let tabs: Vec<Tab> = self
             .parts
             .iter()
             .enumerate()
             .map(|(i, ui)| {
-                Tab::new().label(if i == 0 {
-                    "Query 1".to_owned()
-                } else {
-                    format!("{} · Query {}", ui.operator.keyword(), i + 1)
-                })
+                if i == 0 {
+                    return Tab::new().label("Query 1");
+                }
+                // Every query but the first can be removed from its tab.
+                Tab::new()
+                    .label(format!("{} · Query {}", ui.operator.keyword(), i + 1))
+                    .suffix(
+                        Button::new(("remove-part", i))
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::Close)
+                            .tooltip("Remove this query")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.remove_part(i, cx);
+                            })),
+                    )
             })
             .collect();
         let preview = match self.sql(cx) {
@@ -882,21 +907,6 @@ impl Render for QueryBuilder {
                     },
                     cx,
                 ))
-                .child(div().flex_1())
-                .child(
-                    Button::new(("remove-part", active))
-                        .ghost()
-                        .xsmall()
-                        .icon(IconName::Close)
-                        .label("Remove this query")
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if active > 0 && active < this.parts.len() {
-                                this.parts.remove(active);
-                                this.active = active - 1;
-                            }
-                            cx.notify();
-                        })),
-                )
         });
         let tables = self.render_tables(cx);
         let columns = self.render_columns(cx);
@@ -913,7 +923,10 @@ impl Render for QueryBuilder {
                             .small()
                             .selected_index(self.active)
                             .on_click(cx.listener(|this, ix: &usize, _, cx| {
-                                this.active = *ix;
+                                // A tab's × removes it first, then the click reaches the bar.
+                                if *ix < this.parts.len() {
+                                    this.active = *ix;
+                                }
                                 cx.notify();
                             }))
                             .children(tabs),
