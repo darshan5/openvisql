@@ -16,6 +16,9 @@ pub struct ColumnDef {
     pub auto_increment: bool,
     pub primary_key: bool,
     pub comment: String,
+    /// Kept from the existing column so changing it doesn't reset it to the table default;
+    /// empty for the default.
+    pub collation: String,
     /// The column's name in the existing table; `None` for a new column.
     pub original_name: Option<String>,
 }
@@ -216,6 +219,7 @@ impl TableDesign {
                     auto_increment: extra.contains("auto_increment"),
                     primary_key: primary.contains(&&c.name),
                     comment: c.comment.clone(),
+                    collation: c.collation.clone(),
                     original_name: Some(c.name.clone()),
                 }
             })
@@ -455,6 +459,10 @@ impl TableDesign {
 /// `name TYPE [NOT NULL] [DEFAULT x] [AUTO_INCREMENT] [COMMENT '...']`.
 pub fn column_sql(d: Dialect, c: &ColumnDef) -> String {
     let mut sql = format!("{} {}", d.quote_ident(&c.name), c.data_type.trim());
+    if !c.collation.trim().is_empty() {
+        sql.push_str(" COLLATE ");
+        sql.push_str(c.collation.trim());
+    }
     sql.push_str(if c.nullable && !c.primary_key {
         " NULL"
     } else {
@@ -534,14 +542,11 @@ fn changed_text(before: &str, after: &str) -> String {
     }
 }
 
-/// One `ALTER TABLE` turning `before` into `after`, or `None` when nothing changed. Columns
-/// are matched by `original_name`, so renames keep their data.
-pub fn alter_sql(
-    d: Dialect,
-    db: &str,
-    before: &TableDesign,
-    after: &TableDesign,
-) -> Option<String> {
+/// The `ALTER TABLE` statements turning `before` into `after`; none when nothing changed.
+/// Columns are matched by `original_name`, so renames keep their data. It's one statement,
+/// plus a second when a foreign key is re-created under its old name (InnoDB won't drop and
+/// add the same constraint name in one statement).
+pub fn alter_sql(d: Dialect, db: &str, before: &TableDesign, after: &TableDesign) -> Vec<String> {
     let mut clauses = Vec::new();
 
     // Foreign keys that went away or changed are dropped first, as they may need an index
@@ -550,6 +555,8 @@ pub fn alter_sql(
     renamed.columns.clone_from(&after.columns);
     renamed.follow_renames();
     let mut added_fks = Vec::new();
+    // Indexes dropped along with the foreign key they were made for.
+    let mut replaced_indexes: Vec<String> = Vec::new();
     for (old, old_renamed) in before.foreign_keys.iter().zip(&renamed.foreign_keys) {
         let new = after
             .foreign_keys
@@ -568,6 +575,22 @@ pub fn alter_sql(
             clauses.push(format!("DROP FOREIGN KEY {}", d.quote_ident(&old.name)));
             if let Some(new) = new {
                 added_fks.push(new);
+                // The index the server made for the old key has the key's name; the new key
+                // gets its own, so the old one goes (unless the user changed it themselves).
+                let auto_index = before
+                    .indexes
+                    .iter()
+                    .find(|i| i.name == old.name && i.columns == old.columns);
+                let kept_as_is = auto_index.is_some_and(|i| {
+                    after.indexes.iter().any(|a| {
+                        a.original_name.as_deref() == Some(i.name.as_str())
+                            && a.name == i.name
+                            && a.kind == i.kind
+                    })
+                });
+                if kept_as_is {
+                    replaced_indexes.push(old.name.clone());
+                }
             }
         }
     }
@@ -600,7 +623,14 @@ pub fn alter_sql(
     // Indexes that went away or changed are dropped before any column, so dropping a column
     // can't remove an index this statement still refers to; changed ones are re-added last.
     let mut added_indexes = Vec::new();
-    for old in &before.indexes {
+    for name in &replaced_indexes {
+        clauses.push(format!("DROP INDEX {}", d.quote_ident(name)));
+    }
+    for old in before
+        .indexes
+        .iter()
+        .filter(|i| !replaced_indexes.contains(&i.name))
+    {
         let new = after
             .indexes
             .iter()
@@ -702,8 +732,14 @@ pub fn alter_sql(
     for index in added_indexes {
         clauses.push(format!("ADD {}", index_sql(d, index)));
     }
+    let mut deferred = Vec::new();
     for fk in added_fks {
-        clauses.push(format!("ADD {}", foreign_key_sql(d, db, fk)));
+        let clause = format!("ADD {}", foreign_key_sql(d, db, fk));
+        if before.foreign_keys.iter().any(|old| old.name == fk.name) {
+            deferred.push(clause);
+        } else {
+            clauses.push(clause);
+        }
     }
     for check in added_checks {
         clauses.push(format!("ADD {}", check_sql(d, check)));
@@ -720,14 +756,22 @@ pub fn alter_sql(
     if before.name != after.name {
         clauses.push(format!("RENAME TO {}", d.qualified(db, &after.name)));
     }
-    if clauses.is_empty() {
-        return None;
+    let mut out = Vec::new();
+    if !clauses.is_empty() {
+        out.push(format!(
+            "ALTER TABLE {}\n  {}",
+            d.qualified(db, &before.name),
+            clauses.join(",\n  ")
+        ));
     }
-    Some(format!(
-        "ALTER TABLE {}\n  {}",
-        d.qualified(db, &before.name),
-        clauses.join(",\n  ")
-    ))
+    if !deferred.is_empty() {
+        out.push(format!(
+            "ALTER TABLE {}\n  {}",
+            d.qualified(db, &after.name),
+            deferred.join(",\n  ")
+        ));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -787,7 +831,7 @@ mod tests {
         after.columns[1].name = "label".into();
         after.follow_renames();
         assert_eq!(after.checks[0].clause, "(`label` <> 'x')");
-        let sql = alter_sql(D, "s", &before, &after).unwrap();
+        let sql = alter_sql(D, "s", &before, &after).join(";\n");
         assert!(
             sql.starts_with("ALTER TABLE `s`.`t`\n  DROP CONSTRAINT `name_ok`,"),
             "{sql}"
@@ -831,19 +875,20 @@ mod tests {
         after.follow_renames();
         after.options.engine = "innodb".into();
         // A rename alone keeps the constraint; only the column changes.
-        let sql = alter_sql(D, "s", &before, &after).unwrap();
+        let sql = alter_sql(D, "s", &before, &after).join(";\n");
         assert!(!sql.contains("FOREIGN KEY"), "{sql}");
         assert!(!sql.contains("ENGINE"), "{sql}");
 
         after.foreign_keys[0].on_update = "SET NULL".into();
         after.options.comment = String::new();
-        let sql = alter_sql(D, "s", &before, &after).unwrap();
+        let sql = alter_sql(D, "s", &before, &after).join(";\n");
         assert!(sql.contains("  DROP FOREIGN KEY `fk_owner`,"), "{sql}");
         assert!(
             sql.contains("ADD CONSTRAINT `fk_owner` FOREIGN KEY (`owner`)"),
             "{sql}"
         );
-        assert!(sql.ends_with("ON UPDATE SET NULL,\n  COMMENT=''"), "{sql}");
+        // Re-created under its old name, in a statement of its own.
+        assert!(sql.ends_with("COMMENT='';\nALTER TABLE `s`.`t`\n  ADD CONSTRAINT `fk_owner` FOREIGN KEY (`owner`) REFERENCES `s`.`owners` (`login`) ON DELETE CASCADE ON UPDATE SET NULL"), "{sql}");
 
         after.foreign_keys[0].ref_columns.push("x".into());
         assert!(after.validate().unwrap_err().contains("as many"));
@@ -887,7 +932,7 @@ mod tests {
             original_name: None,
             ..index("ft", IndexKind::Fulltext, &["label"])
         });
-        let sql = alter_sql(D, "s", &before, &after).unwrap();
+        let sql = alter_sql(D, "s", &before, &after).join(";\n");
         assert!(!sql.contains("`keep`"), "{sql}");
         assert!(
             sql.starts_with("ALTER TABLE `s`.`t`\n  DROP INDEX `gone`,\n  DROP INDEX `widen`,"),
@@ -915,7 +960,7 @@ mod tests {
 
     #[test]
     fn unchanged_design_needs_no_alter() {
-        assert_eq!(alter_sql(D, "shop", &table(), &table()), None);
+        assert_eq!(alter_sql(D, "shop", &table(), &table()).len(), 0);
     }
 
     #[test]
@@ -929,14 +974,14 @@ mod tests {
             ..col("born", "DATE")
         });
         assert_eq!(
-            alter_sql(D, "shop", &before, &after).unwrap(),
+            alter_sql(D, "shop", &before, &after).join(";\n"),
             "ALTER TABLE `shop`.`t`\n  CHANGE COLUMN `name` `full_name` VARCHAR(100) NULL \
              DEFAULT 'n/a' COMMENT 'who',\n  ADD COLUMN `born` DATE NULL AFTER `full_name`"
         );
         let mut dropped = table();
         dropped.columns.pop();
         assert_eq!(
-            alter_sql(D, "shop", &before, &dropped).unwrap(),
+            alter_sql(D, "shop", &before, &dropped).join(";\n"),
             "ALTER TABLE `shop`.`t`\n  DROP COLUMN `name`"
         );
     }
@@ -948,7 +993,7 @@ mod tests {
         after.columns.swap(0, 1);
         after.columns[0].primary_key = true;
         after.columns[0].nullable = false;
-        let sql = alter_sql(D, "shop", &before, &after).unwrap();
+        let sql = alter_sql(D, "shop", &before, &after).join(";\n");
         assert!(sql.contains("DROP PRIMARY KEY"), "{sql}");
         assert!(
             sql.contains("CHANGE COLUMN `name` `name` VARCHAR(40) NOT NULL"),

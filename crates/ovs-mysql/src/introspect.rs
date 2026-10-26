@@ -111,6 +111,7 @@ pub(crate) async fn columns(
             },
             extra: text(&rs, r, "Extra"),
             comment: text(&rs, r, "Comment"),
+            collation: text(&rs, r, "Collation"),
         })
         .collect())
 }
@@ -188,32 +189,43 @@ pub(crate) async fn foreign_keys(
 }
 
 pub(crate) async fn checks(s: &mut MySqlSession, db: &str, table: &str) -> Result<Vec<CheckInfo>> {
-    // MariaDB names CHECK_CONSTRAINTS rows by table too, and also lists column-level checks
-    // (part of a column's definition, like JSON's json_valid), which are left out.
-    let sql = format!(
-        "SELECT cc.* FROM information_schema.TABLE_CONSTRAINTS tc \
-         JOIN information_schema.CHECK_CONSTRAINTS cc \
-           ON cc.CONSTRAINT_SCHEMA = tc.CONSTRAINT_SCHEMA \
-          AND cc.CONSTRAINT_NAME = tc.CONSTRAINT_NAME \
-         WHERE tc.TABLE_SCHEMA = {} AND tc.TABLE_NAME = {} AND tc.CONSTRAINT_TYPE = 'CHECK' \
-         ORDER BY cc.CONSTRAINT_NAME",
-        D.quote_str(db),
-        D.quote_str(table)
-    );
-    let rs = s.query_set(&sql).await?;
-    Ok(rs
-        .rows
-        .iter()
-        .filter(|r| {
-            let table_name = text(&rs, r, "TABLE_NAME");
-            (table_name.is_empty() || table_name == table)
-                && !text(&rs, r, "LEVEL").eq_ignore_ascii_case("Column")
+    // information_schema escapes quotes in CHECK_CLAUSE (`\'`), which isn't valid SQL, so the
+    // expressions come from SHOW CREATE TABLE. Column-level checks (MariaDB, e.g. JSON's
+    // json_valid) are part of their column and aren't listed.
+    let ddl = ddl(s, db, table, ObjectKind::Table).await?;
+    Ok(parse_checks(&ddl))
+}
+
+/// The `CONSTRAINT name CHECK (expr)` lines of a `SHOW CREATE TABLE` statement.
+fn parse_checks(ddl: &str) -> Vec<CheckInfo> {
+    ddl.lines()
+        .filter_map(|line| {
+            let rest = line.trim().strip_prefix("CONSTRAINT `")?;
+            // The name ends at the first backtick that isn't doubled.
+            let mut name = String::new();
+            let mut chars = rest.char_indices().peekable();
+            let end = loop {
+                let (i, c) = chars.next()?;
+                if c == '`' {
+                    if chars.peek().is_some_and(|(_, n)| *n == '`') {
+                        chars.next();
+                    } else {
+                        break i + 1;
+                    }
+                }
+                name.push(c);
+            };
+            let body = rest[end..].trim_start().strip_prefix("CHECK (")?;
+            let body = body.trim_end().trim_end_matches(',');
+            // MySQL marks unenforced checks with a version comment after the expression.
+            let body = body.rfind(" /*!").map_or(body, |at| &body[..at]).trim_end();
+            let clause = body.strip_suffix(')')?;
+            Some(CheckInfo {
+                name,
+                clause: clause.to_owned(),
+            })
         })
-        .map(|r| CheckInfo {
-            name: text(&rs, r, "CONSTRAINT_NAME"),
-            clause: text(&rs, r, "CHECK_CLAUSE"),
-        })
-        .collect())
+        .collect()
 }
 
 pub(crate) async fn table_options(
@@ -272,4 +284,21 @@ pub(crate) async fn ddl(
                 v => Ok(v.to_string()),
             },
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_checks_from_create_table() {
+        let ddl = "CREATE TABLE `t` (\n  `a` int(11) DEFAULT NULL CHECK (`a` > 0),\n  \
+                   CONSTRAINT `b ``ok` CHECK ((`b` <> _utf8mb4'x\\'y')) /*!80016 NOT ENFORCED */,\n  \
+                   CONSTRAINT `t_chk_1` CHECK (`a` > 0),\n  CONSTRAINT `fk` FOREIGN KEY (`a`) REFERENCES `o` (`id`)\n) ENGINE=InnoDB";
+        let checks = parse_checks(ddl);
+        assert_eq!(checks.len(), 2, "{checks:?}");
+        assert_eq!(checks[0].name, "b `ok");
+        assert_eq!(checks[0].clause, "(`b` <> _utf8mb4'x\\'y')");
+        assert_eq!(checks[1].clause, "`a` > 0");
+    }
 }

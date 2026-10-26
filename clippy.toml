@@ -1,1 +1,1 @@
-doc-valid-idents = ["OpenViSQL", "MySQL", "MariaDB", "PostgreSQL", "SQLite", ".."]
+doc-valid-idents = ["InnoDB", "OpenViSQL", "MySQL", "MariaDB", "PostgreSQL", "SQLite", ".."]

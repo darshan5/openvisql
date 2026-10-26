@@ -388,6 +388,7 @@ impl Session for SqliteSession {
                     default,
                     extra: extra.to_owned(),
                     comment: String::new(),
+                    collation: String::new(),
                 }
             })
             .collect())

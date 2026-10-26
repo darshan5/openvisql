@@ -684,8 +684,8 @@ async fn table_designer_sql_runs() {
     );
     // Loading an existing table and changing nothing produces no ALTER.
     assert_eq!(
-        alter_sql(Dialect::MySql, &db, &before, &before),
-        None,
+        alter_sql(Dialect::MySql, &db, &before, &before).len(),
+        0,
         "{before:?}"
     );
 
@@ -704,10 +704,11 @@ async fn table_designer_sql_runs() {
             ..ColumnDef::default()
         },
     );
-    let sql = alter_sql(Dialect::MySql, &db, &before, &after).unwrap();
-    s.execute(&sql, None)
-        .await
-        .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+    for sql in alter_sql(Dialect::MySql, &db, &before, &after) {
+        s.execute(&sql, None)
+            .await
+            .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+    }
 
     let reloaded = load(
         s.list_columns(&db, "items").await.unwrap(),
@@ -739,10 +740,11 @@ async fn table_designer_sql_runs() {
     s.execute("UPDATE items SET sku = CONCAT('S', id)", None)
         .await
         .unwrap();
-    let sql = alter_sql(Dialect::MySql, &db, &reloaded, &keyed).unwrap();
-    s.execute(&sql, None)
-        .await
-        .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+    for sql in alter_sql(Dialect::MySql, &db, &reloaded, &keyed) {
+        s.execute(&sql, None)
+            .await
+            .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+    }
     let idx = s.list_indexes(&db, "items").await.unwrap();
     let pk = idx.iter().find(|i| i.is_primary()).unwrap();
     assert_eq!(pk.columns, ["id", "sku"]);
@@ -763,10 +765,11 @@ async fn table_designer_sql_runs() {
         columns: vec!["title".into()],
         original_name: None,
     });
-    let sql = alter_sql(Dialect::MySql, &db, &current, &indexed).unwrap();
-    s.execute(&sql, None)
-        .await
-        .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+    for sql in alter_sql(Dialect::MySql, &db, &current, &indexed) {
+        s.execute(&sql, None)
+            .await
+            .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+    }
     let final_design = load(
         s.list_columns(&db, "items").await.unwrap(),
         s.list_indexes(&db, "items").await.unwrap(),
@@ -832,9 +835,10 @@ async fn table_designer_foreign_keys_and_options() {
         ("", "owners")
     );
     assert_eq!(fk.on_delete, "CASCADE");
-    let names: Vec<&str> = before.checks.iter().map(|c| c.name.as_str()).collect();
+    let mut names: Vec<&str> = before.checks.iter().map(|c| c.name.as_str()).collect();
+    names.sort_unstable();
     assert_eq!(names, ["id_positive", "owner_set"]);
-    assert_eq!(alter_sql(Dialect::MySql, &db, &before, &before), None);
+    assert_eq!(alter_sql(Dialect::MySql, &db, &before, &before).len(), 0);
 
     // Rename the referencing column, widen the key to two columns and change the options.
     let mut after = before.clone();
@@ -843,20 +847,21 @@ async fn table_designer_foreign_keys_and_options() {
     let fk = &mut after.foreign_keys[0];
     fk.columns.insert(0, "team".into());
     fk.ref_columns.insert(0, "team".into());
-    fk.on_delete = "SET NULL".into();
+    fk.on_delete = "RESTRICT".into();
     after.options.comment = "pets and owners".into();
     after.options.collation = "utf8mb4_general_ci".into();
     after.validate().unwrap();
-    let sql = alter_sql(Dialect::MySql, &db, &before, &after).unwrap();
-    s.execute(&sql, None)
-        .await
-        .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+    for sql in alter_sql(Dialect::MySql, &db, &before, &after) {
+        s.execute(&sql, None)
+            .await
+            .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+    }
 
     let reloaded = load(&mut s, &db).await;
     let fk = &reloaded.foreign_keys[0];
     assert_eq!(fk.columns, ["team", "owner_login"]);
     assert_eq!(fk.ref_columns, ["team", "login"]);
-    assert_eq!(fk.on_delete, "SET NULL");
+    assert_eq!(fk.on_delete, "RESTRICT");
     assert_eq!(reloaded.options.comment, "pets and owners");
     assert_eq!(reloaded.options.collation, "utf8mb4_general_ci");
     // The check on the renamed column was re-created against its new name.
@@ -875,10 +880,11 @@ async fn table_designer_foreign_keys_and_options() {
     // Dropping the foreign key leaves the index the server made for it alone.
     let mut dropped = reloaded.clone();
     dropped.foreign_keys.clear();
-    let sql = alter_sql(Dialect::MySql, &db, &reloaded, &dropped).unwrap();
-    s.execute(&sql, None)
-        .await
-        .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+    for sql in alter_sql(Dialect::MySql, &db, &reloaded, &dropped) {
+        s.execute(&sql, None)
+            .await
+            .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+    }
     assert_eq!(s.list_foreign_keys(&db, "pets").await.unwrap().len(), 0);
     cleanup(s, &db).await;
 }

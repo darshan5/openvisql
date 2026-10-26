@@ -73,6 +73,8 @@ pub struct ColumnInfo {
     pub default: Option<String>,
     pub extra: String,
     pub comment: String,
+    /// For text columns, e.g. `utf8mb4_unicode_ci`; empty when not reported.
+    pub collation: String,
 }
 
 impl ColumnInfo {

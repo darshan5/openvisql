@@ -441,9 +441,11 @@ impl Workspace {
                     db.clone(),
                     table.clone(),
                     self.completion.session.clone(),
-                    Rc::new(move |sql, window, cx| {
-                        this.update(cx, |this, cx| this.run_on_metadata(sql, window, cx))
-                            .ok();
+                    Rc::new(move |statements, window, cx| {
+                        this.update(cx, |this, cx| {
+                            this.run_all_on_metadata(statements, window, cx);
+                        })
+                        .ok();
                     }),
                     window,
                     cx,
@@ -476,15 +478,30 @@ impl Workspace {
     /// Runs a schema change on the metadata session, then refreshes the browser and
     /// autocomplete. The outcome is reported as a notification.
     fn run_on_metadata(&mut self, sql: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.run_all_on_metadata(vec![sql], window, cx);
+    }
+
+    /// Runs `statements` in order on the metadata session, stopping at the first error.
+    fn run_all_on_metadata(
+        &mut self,
+        statements: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let session = self.completion.session.clone();
-        let statement = sql.clone();
+        let summary = statements.join(";\n");
         cx.spawn_in(window, async move |this, cx| {
-            let result =
-                runtime::run(async move { session.lock().await.execute(&statement, None).await })
-                    .await;
+            let result = runtime::run(async move {
+                let mut session = session.lock().await;
+                for statement in &statements {
+                    session.execute(statement, None).await?;
+                }
+                Ok::<_, ovs_core::Error>(())
+            })
+            .await;
             this.update_in(cx, |this, window, cx| {
                 match result {
-                    Ok(_) => window.push_notification(format!("Done: {sql}"), cx),
+                    Ok(()) => window.push_notification(format!("Done: {summary}"), cx),
                     Err(err) => window.push_notification(format!("Failed: {err}"), cx),
                 }
                 this.refresh(cx);

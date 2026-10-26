@@ -27,8 +27,8 @@ use ovs_core::sql::design::{
 
 use crate::runtime::{self, SharedSession};
 
-/// Runs the SQL the designer produced.
-pub type ApplySql = Rc<dyn Fn(String, &mut Window, &mut App)>;
+/// Runs the statements the designer produced, in order.
+pub type ApplySql = Rc<dyn Fn(Vec<String>, &mut Window, &mut App)>;
 
 struct Row {
     id: usize,
@@ -39,6 +39,8 @@ struct Row {
     nullable: bool,
     primary_key: bool,
     auto_increment: bool,
+    /// Not edited here; kept so a changed column keeps its collation.
+    collation: String,
     original_name: Option<String>,
 }
 
@@ -217,6 +219,7 @@ impl TableDesigner {
             nullable: column.nullable,
             primary_key: column.primary_key,
             auto_increment: column.auto_increment,
+            collation: column.collation,
             original_name: column.original_name,
         };
         self.next_id += 1;
@@ -320,6 +323,7 @@ impl TableDesigner {
                     auto_increment: row.auto_increment,
                     primary_key: row.primary_key,
                     comment: row.comment.read(cx).value().to_string(),
+                    collation: row.collation.clone(),
                     original_name: row.original_name.clone(),
                 })
                 .collect(),
@@ -371,13 +375,13 @@ impl TableDesigner {
         }
     }
 
-    /// The statement to run: `Ok(None)` when an existing table is unchanged.
-    fn sql(&self, cx: &App) -> Result<Option<String>, String> {
+    /// The statements to run; none when an existing table is unchanged.
+    fn sql(&self, cx: &App) -> Result<Vec<String>, String> {
         let mut design = self.design(cx);
         design.follow_renames();
         design.validate()?;
         Ok(match &self.original {
-            None => Some(create_sql(Dialect::MySql, &self.db, &design)),
+            None => vec![create_sql(Dialect::MySql, &self.db, &design)],
             Some(original) => alter_sql(Dialect::MySql, &self.db, original, &design),
         })
     }
@@ -613,8 +617,8 @@ impl Render for TableDesigner {
             }
         };
         let preview = match self.sql(cx) {
-            Ok(Some(sql)) => div().child(sql),
-            Ok(None) => div().text_color(muted).child("No changes."),
+            Ok(sql) if sql.is_empty() => div().text_color(muted).child("No changes."),
+            Ok(sql) => div().child(sql.join(";\n\n") + ";"),
             Err(err) => div().text_color(cx.theme().danger).child(err),
         };
         let add = |id: &'static str, label: &'static str| {
@@ -874,11 +878,11 @@ fn show(
                             .primary()
                             .label("Apply")
                             .on_click(move |_, window, cx| match designer.read(cx).sql(cx) {
-                                Ok(Some(sql)) => {
+                                Ok(sql) if sql.is_empty() => window.close_dialog(cx),
+                                Ok(sql) => {
                                     window.close_dialog(cx);
                                     apply(sql, window, cx);
                                 }
-                                Ok(None) => window.close_dialog(cx),
                                 // The preview already shows what's wrong.
                                 Err(_) => {}
                             }),
