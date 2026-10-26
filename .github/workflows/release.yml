@@ -1,7 +1,8 @@
 name: Release
 
 # Pushing a tag like v0.2.0 builds installers and attaches them to a draft GitHub release.
-# Signing is optional: without the secrets below, unsigned packages are built.
+# Signing is optional: without the secrets below, the macOS app gets an ad-hoc signature
+# (no certificate) and the Windows installer is unsigned.
 #
 # macOS signing and notarization:
 #   APPLE_CERTIFICATE (base64 .p12), APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY,
@@ -67,6 +68,10 @@ jobs:
               export APPLE_ID="$SECRET_APPLE_ID" APPLE_PASSWORD="$SECRET_APPLE_PASSWORD" \
                 APPLE_TEAM_ID="$SECRET_APPLE_TEAM_ID"
             fi
+          elif [ "$RUNNER_OS" = macOS ]; then
+            # Ad-hoc signature. Without it only the binary is signed, the bundle isn't sealed,
+            # and Gatekeeper reports a downloaded app as "damaged" instead of unverified.
+            printf 'signing-identity = "-"\n' >> Cargo.toml
           fi
           cargo packager --release --target ${{ matrix.target }} --formats ${{ matrix.formats }}
 

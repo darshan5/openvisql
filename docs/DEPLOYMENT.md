@@ -39,9 +39,12 @@ then kept as workflow artifacts and no release is created.
 
 ## Signing
 
-Without secrets, the packages are unsigned. macOS asks users to approve the app in
-System Settings → Privacy & Security, and Windows SmartScreen warns about it. Add these
-repository secrets to sign:
+Without secrets, the macOS app gets an ad-hoc signature (`codesign -s -`) and the Windows
+installer is unsigned. The ad-hoc signature is required: an app bundle with no signature of
+its own is reported by macOS as "damaged" after download. Ad-hoc signed, macOS reports it as
+from an unverified developer instead, and users approve it once in System Settings →
+Privacy & Security → Open Anyway. Windows SmartScreen warns about the unsigned installer
+(More info → Run anyway). Add these repository secrets to sign:
 
 | Secret | What it is |
 | --- | --- |

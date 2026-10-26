@@ -92,6 +92,13 @@ the right, and results below.
 Installers for macOS on Apple Silicon (`.dmg`) and Windows (`-setup.exe`) are
 attached to [GitHub releases](https://github.com/darshan5/openvisql/releases).
 
+The builds aren't signed with a developer certificate yet, so the first launch needs one
+approval:
+
+- **macOS:** open the app once, then go to System Settings → Privacy & Security and click
+  **Open Anyway**. Or run `xattr -dr com.apple.quarantine /Applications/OpenViSQL.app`.
+- **Windows:** in the SmartScreen prompt click **More info** → **Run anyway**.
+
 ## Build from source
 
 Prerequisites:
