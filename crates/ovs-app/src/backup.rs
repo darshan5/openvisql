@@ -23,10 +23,14 @@ use crate::runtime;
 type Done = std::rc::Rc<dyn Fn(&mut Window, &mut App)>;
 
 pub struct BackupForm {
-    options: DumpOptions,
+    pub options: DumpOptions,
 }
 
 impl BackupForm {
+    pub fn new(options: DumpOptions) -> Self {
+        Self { options }
+    }
+
     fn toggle(
         &self,
         id: &'static str,

@@ -224,6 +224,8 @@ pub enum BrowserEvent {
     RunScript(String),
     /// Import a CSV file into a table.
     ImportCsv { db: String, table: String },
+    /// Copy a database, or one table when `table` is set, to another connection.
+    CopyTo { db: String, table: Option<String> },
     /// Open the table designer for an existing table, or a new one when `table` is `None`.
     DesignTable { db: String, table: Option<String> },
     /// Ask for a name, then run the statement built from it and refresh.
@@ -577,6 +579,14 @@ impl ObjectBrowser {
                         .on_click(emit(BrowserEvent::Backup(db.clone()))),
                 )
                 .item(
+                    PopupMenuItem::new("Copy to another connection…").on_click(emit(
+                        BrowserEvent::CopyTo {
+                            db: db.clone(),
+                            table: None,
+                        },
+                    )),
+                )
+                .item(
                     PopupMenuItem::new("Run SQL script…")
                         .on_click(emit(BrowserEvent::RunScript(db.clone()))),
                 )
@@ -644,6 +654,12 @@ impl ObjectBrowser {
                 if *kind == ObjectKind::Table {
                     let (rename_db, rename_from) = (db.clone(), name.clone());
                     menu = menu
+                        .item(PopupMenuItem::new("Copy table to…").on_click(emit(
+                            BrowserEvent::CopyTo {
+                                db: db.clone(),
+                                table: Some(name.clone()),
+                            },
+                        )))
                         .item(PopupMenuItem::new("Design table…").on_click(emit(
                             BrowserEvent::DesignTable {
                                 db: db.clone(),

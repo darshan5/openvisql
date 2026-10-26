@@ -39,6 +39,14 @@ OVS_TEST_MYSQL=127.0.0.1:33307:root:secret cargo test -p ovs-mysql --test live
 
 Without the variable these tests return early and pass, so `cargo test` works offline.
 
+Set `OVS_TEST_MYSQL_TARGET` as well to also copy a database across servers (in both
+directions, run it twice with the two swapped):
+
+```sh
+OVS_TEST_MYSQL=127.0.0.1:33307:root:secret OVS_TEST_MYSQL_TARGET=127.0.0.1:33306:root:secret \
+  cargo test -p ovs-mysql --test live copy_database
+```
+
 SSH tunnel tests need an SSH server that can reach MySQL:
 
 ```sh

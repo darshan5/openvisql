@@ -4,6 +4,7 @@ mod backup;
 mod browser;
 mod completion;
 mod connect;
+mod copy_dialog;
 mod designer;
 mod export_dialog;
 mod grid;

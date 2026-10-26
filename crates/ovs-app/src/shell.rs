@@ -163,6 +163,7 @@ impl AppShell {
         self.subscriptions.push(sub);
         self.tabs[ix] = ShellTab::Connected(workspace);
         self.active = ix;
+        self.publish_open_connections(cx);
         self.schedule_save(cx);
         cx.notify();
     }
@@ -182,9 +183,23 @@ impl AppShell {
         if self.tabs.is_empty() {
             self.push_connect_tab(window, cx);
         }
+        self.publish_open_connections(cx);
         self.active = self.active.min(self.tabs.len() - 1);
         self.schedule_save(cx);
         cx.notify();
+    }
+
+    /// Tells the copy dialog which connections are open.
+    fn publish_open_connections(&self, cx: &mut Context<Self>) {
+        let open = self
+            .tabs
+            .iter()
+            .filter_map(|t| match t {
+                ShellTab::Connected(ws) => Some(ws.read(cx).connection()),
+                ShellTab::Connect(_) => None,
+            })
+            .collect();
+        cx.set_global(crate::copy_dialog::OpenConnections(open));
     }
 
     fn select(&mut self, ix: usize, cx: &mut Context<Self>) {

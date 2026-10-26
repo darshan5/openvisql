@@ -25,6 +25,8 @@ pub struct DumpOptions {
     /// Remove `DEFINER=...` so the dump restores under any user.
     pub strip_definer: bool,
     pub rows_per_insert: usize,
+    /// Only these tables (and their triggers); `None` for all of them.
+    pub tables: Option<Vec<String>>,
 }
 
 impl Default for DumpOptions {
@@ -39,6 +41,7 @@ impl Default for DumpOptions {
             events: true,
             strip_definer: true,
             rows_per_insert: 100,
+            tables: None,
         }
     }
 }
@@ -80,12 +83,186 @@ pub fn strip_definer(ddl: &str) -> String {
     format!("{}{after}", &ddl[..start])
 }
 
+/// Where dumped statements go: a script file, or straight into another session (copying).
+enum Output<'a> {
+    Script(&'a mut (dyn Write + Send)),
+    Session(&'a mut dyn Session),
+}
+
+impl Output<'_> {
+    /// One statement; `compound` ones (routine bodies) need another delimiter in a script.
+    async fn statement(&mut self, sql: &str, compound: bool) -> Result<()> {
+        match self {
+            Self::Script(out) if compound => {
+                writeln!(out, "DELIMITER $$\n{sql}$$\nDELIMITER ;\n").map_err(io)
+            }
+            Self::Script(out) => writeln!(out, "{sql};").map_err(io),
+            Self::Session(session) => session.execute(sql, Some(0)).await.map(|_| ()),
+        }
+    }
+
+    /// Text that only appears in scripts (comments, blank lines).
+    fn note(&mut self, text: &str) -> Result<()> {
+        match self {
+            Self::Script(out) => writeln!(out, "{text}").map_err(io),
+            Self::Session(_) => Ok(()),
+        }
+    }
+}
+
 /// Writes a dump of `db` to `out`. `progress` is told which object is being written.
 pub async fn dump_database(
     session: &mut dyn Session,
     db: &str,
     options: &DumpOptions,
     out: &mut (dyn Write + Send),
+    progress: &mut (dyn FnMut(&str) + Send),
+) -> Result<DumpStats> {
+    let d = session.dialect();
+    writeln!(
+        out,
+        "-- OpenViSQL dump of {}\n-- Server: {}\n",
+        d.quote_ident(db),
+        session.server_version()
+    )
+    .map_err(io)?;
+    let mut output = Output::Script(out);
+    let stats = transfer(session, db, &|ddl, _| ddl, options, &mut output, progress).await?;
+    out.flush().map_err(io)?;
+    Ok(stats)
+}
+
+/// Copies `db` (or the tables in `options.tables`) from `source` into `target_db` on
+/// `target`, creating the database if needed. Views are pointed at `target_db`; routines,
+/// triggers and events are copied as their DDL reads. Collations the target server doesn't
+/// have (copying between MySQL and MariaDB) become its default for the character set.
+pub async fn copy_database(
+    source: &mut dyn Session,
+    db: &str,
+    target: &mut dyn Session,
+    target_db: &str,
+    options: &DumpOptions,
+    progress: &mut (dyn FnMut(&str) + Send),
+) -> Result<DumpStats> {
+    let d = target.dialect();
+    target
+        .execute(
+            &format!("CREATE DATABASE IF NOT EXISTS {}", d.quote_ident(target_db)),
+            Some(0),
+        )
+        .await?;
+    target.use_database(target_db).await?;
+    let collations = Collations::of(target).await?;
+    let (from, to) = (
+        format!("{}.", d.quote_ident(db)),
+        format!("{}.", d.quote_ident(target_db)),
+    );
+    let adapt = move |ddl: String, kind: ObjectKind| {
+        let ddl = if kind == ObjectKind::View && from != to {
+            ddl.replace(&from, &to)
+        } else {
+            ddl
+        };
+        collations.adapt(&ddl)
+    };
+    let mut output = Output::Session(target);
+    let result = transfer(source, db, &adapt, options, &mut output, progress).await;
+    // Restore the checks even when the copy failed part-way.
+    let Output::Session(target) = output else {
+        unreachable!("output is a session")
+    };
+    let restored = target
+        .execute("SET UNIQUE_CHECKS = 1, FOREIGN_KEY_CHECKS = 1", Some(0))
+        .await;
+    let stats = result?;
+    restored?;
+    Ok(stats)
+}
+
+/// The collations a server knows, and its default one per character set.
+#[derive(Debug, Clone, Default)]
+pub struct Collations {
+    known: std::collections::HashSet<String>,
+    defaults: std::collections::HashMap<String, String>,
+}
+
+impl Collations {
+    async fn of(session: &mut dyn Session) -> Result<Self> {
+        let mut out = Self::default();
+        let Some(QueryOutcome::Rows(rs)) = session
+            .execute("SHOW COLLATION", None)
+            .await?
+            .into_iter()
+            .next()
+        else {
+            return Ok(out);
+        };
+        let col = |name: &str| {
+            rs.columns
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(name))
+        };
+        let (Some(name), Some(charset), Some(default)) =
+            (col("Collation"), col("Charset"), col("Default"))
+        else {
+            return Ok(out);
+        };
+        for row in &rs.rows {
+            let collation = row[name].to_string().to_ascii_lowercase();
+            if row[default].to_string().eq_ignore_ascii_case("yes") {
+                out.defaults.insert(
+                    row[charset].to_string().to_ascii_lowercase(),
+                    collation.clone(),
+                );
+            }
+            out.known.insert(collation);
+        }
+        Ok(out)
+    }
+
+    /// Replaces every `COLLATE x` / `COLLATE=x` naming a collation this server lacks.
+    pub fn adapt(&self, ddl: &str) -> String {
+        if self.known.is_empty() {
+            return ddl.to_owned();
+        }
+        let mut out = String::with_capacity(ddl.len());
+        let mut rest = ddl;
+        while let Some(at) = rest.find("COLLATE") {
+            let (before, after) = rest.split_at(at + "COLLATE".len());
+            out.push_str(before);
+            let gap = after.len() - after.trim_start_matches([' ', '=']).len();
+            let (sep, tail) = after.split_at(gap);
+            out.push_str(sep);
+            let end = tail
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(tail.len());
+            let (name, tail) = tail.split_at(end);
+            let lower = name.to_ascii_lowercase();
+            if gap == 0 || name.is_empty() || self.known.contains(&lower) {
+                out.push_str(name);
+            } else {
+                let charset = lower.split('_').next().unwrap_or_default();
+                let replacement = self
+                    .defaults
+                    .get(charset)
+                    .or_else(|| self.defaults.get("utf8mb4"))
+                    .map_or(name, String::as_str);
+                out.push_str(replacement);
+            }
+            rest = tail;
+        }
+        out.push_str(rest);
+        out
+    }
+}
+
+/// Writes `db`'s objects to `out`, passing each `CREATE` through `adapt` first.
+async fn transfer(
+    session: &mut dyn Session,
+    db: &str,
+    adapt: &(dyn Fn(String, ObjectKind) -> String + Send + Sync),
+    options: &DumpOptions,
+    out: &mut Output<'_>,
     progress: &mut (dyn FnMut(&str) + Send),
 ) -> Result<DumpStats> {
     let d = session.dialect();
@@ -97,26 +274,39 @@ pub async fn dump_database(
             ddl
         }
     };
-    writeln!(
-        out,
-        "-- OpenViSQL dump of {}\n-- Server: {}\n\nSET NAMES utf8mb4;\nSET FOREIGN_KEY_CHECKS = 0;\nSET UNIQUE_CHECKS = 0;\n",
-        d.quote_ident(db),
-        session.server_version()
-    )
-    .map_err(io)?;
+    for sql in [
+        "SET NAMES utf8mb4",
+        "SET FOREIGN_KEY_CHECKS = 0",
+        "SET UNIQUE_CHECKS = 0",
+    ] {
+        out.statement(sql, false).await?;
+    }
+    out.note("")?;
 
-    for table in session.list_objects(db, ObjectKind::Table).await? {
+    let tables = session.list_objects(db, ObjectKind::Table).await?;
+    let wanted = |name: &str| {
+        options
+            .tables
+            .as_ref()
+            .is_none_or(|only| only.iter().any(|t| t == name))
+    };
+    for table in tables.iter().filter(|t| wanted(&t.name)) {
         progress(&table.name);
         let target = d.quote_ident(&table.name);
         if options.structure {
-            let ddl = session
-                .object_ddl(db, &table.name, ObjectKind::Table)
-                .await?;
-            writeln!(out, "--\n-- Table {target}\n--").map_err(io)?;
+            let ddl = adapt(
+                session
+                    .object_ddl(db, &table.name, ObjectKind::Table)
+                    .await?,
+                ObjectKind::Table,
+            );
+            out.note(&format!("--\n-- Table {target}\n--"))?;
             if options.drop_existing {
-                writeln!(out, "DROP TABLE IF EXISTS {target};").map_err(io)?;
+                out.statement(&format!("DROP TABLE IF EXISTS {target}"), false)
+                    .await?;
             }
-            writeln!(out, "{ddl};\n").map_err(io)?;
+            out.statement(&ddl, false).await?;
+            out.note("")?;
         }
         if options.data {
             stats.rows += dump_rows(session, d, db, &table.name, options, out).await?;
@@ -140,25 +330,33 @@ pub async fn dump_database(
     if options.structure {
         for kind in others {
             for object in session.list_objects(db, kind).await? {
+                // A trigger belongs to its table, which may not have been included.
+                if kind == ObjectKind::Trigger && !wanted(&object.detail) {
+                    continue;
+                }
                 progress(&object.name);
-                let ddl = clean(session.object_ddl(db, &object.name, kind).await?);
+                let ddl = adapt(
+                    clean(session.object_ddl(db, &object.name, kind).await?),
+                    kind,
+                );
                 let name = d.quote_ident(&object.name);
-                writeln!(out, "--\n-- {} {name}\n--", kind.sql_keyword()).map_err(io)?;
+                out.note(&format!("--\n-- {} {name}\n--", kind.sql_keyword()))?;
                 if options.drop_existing {
-                    writeln!(out, "DROP {} IF EXISTS {name};", kind.sql_keyword()).map_err(io)?;
+                    out.statement(
+                        &format!("DROP {} IF EXISTS {name}", kind.sql_keyword()),
+                        false,
+                    )
+                    .await?;
                 }
                 // Bodies contain `;`, so routines, triggers and events use another delimiter.
-                if kind == ObjectKind::View {
-                    writeln!(out, "{ddl};\n").map_err(io)?;
-                } else {
-                    writeln!(out, "DELIMITER $$\n{ddl}$$\nDELIMITER ;\n").map_err(io)?;
-                }
+                out.statement(&ddl, kind != ObjectKind::View).await?;
+                out.note("")?;
                 stats.other_objects += 1;
             }
         }
     }
-    writeln!(out, "SET UNIQUE_CHECKS = 1;\nSET FOREIGN_KEY_CHECKS = 1;").map_err(io)?;
-    out.flush().map_err(io)?;
+    out.statement("SET UNIQUE_CHECKS = 1", false).await?;
+    out.statement("SET FOREIGN_KEY_CHECKS = 1", false).await?;
     Ok(stats)
 }
 
@@ -169,7 +367,7 @@ async fn dump_rows(
     db: &str,
     table: &str,
     options: &DumpOptions,
-    out: &mut (dyn Write + Send),
+    out: &mut Output<'_>,
 ) -> Result<u64> {
     let columns = session.list_columns(db, table).await?;
     // Generated columns can't be inserted into.
@@ -223,7 +421,8 @@ async fn dump_rows(
                 })
                 .collect::<Vec<_>>()
                 .join(",\n");
-            writeln!(out, "{insert_into}\n{values};").map_err(io)?;
+            out.statement(&format!("{insert_into}\n{values}"), false)
+                .await?;
         }
         total += fetched;
         if fetched < FETCH_BATCH {
@@ -232,7 +431,7 @@ async fn dump_rows(
         offset += FETCH_BATCH;
     }
     if total > 0 {
-        writeln!(out).map_err(io)?;
+        out.note("")?;
     }
     Ok(total)
 }
@@ -274,6 +473,31 @@ pub async fn run_script(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adapts_unknown_collations() {
+        let collations = Collations {
+            known: ["utf8mb4_0900_ai_ci", "utf8mb4_bin", "latin1_swedish_ci"]
+                .map(String::from)
+                .into(),
+            defaults: [
+                ("utf8mb4".to_owned(), "utf8mb4_0900_ai_ci".to_owned()),
+                ("latin1".to_owned(), "latin1_swedish_ci".to_owned()),
+            ]
+            .into(),
+        };
+        assert_eq!(
+            collations.adapt(
+                "CREATE TABLE t (a varchar(5) COLLATE utf8mb4_bin, b text COLLATE \
+                 latin1_german1_ci) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 \
+                 COLLATE=utf8mb4_uca1400_ai_ci"
+            ),
+            "CREATE TABLE t (a varchar(5) COLLATE utf8mb4_bin, b text COLLATE \
+             latin1_swedish_ci) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 \
+             COLLATE=utf8mb4_0900_ai_ci"
+        );
+        assert_eq!(Collations::default().adapt("x COLLATE=y"), "x COLLATE=y");
+    }
 
     #[test]
     fn strips_definer_clauses() {

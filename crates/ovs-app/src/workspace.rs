@@ -104,6 +104,14 @@ pub struct Workspace {
 }
 
 impl Workspace {
+    /// The connection this workspace is connected with.
+    pub fn connection(&self) -> crate::copy_dialog::OpenConnection {
+        crate::copy_dialog::OpenConnection {
+            config: self.config.clone(),
+            password: self.password.clone(),
+        }
+    }
+
     pub fn new(
         config: ConnectionConfig,
         password: Option<String>,
@@ -409,6 +417,22 @@ impl Workspace {
                 window,
                 cx,
             ),
+            BrowserEvent::CopyTo { db, table } => {
+                let this = cx.entity().downgrade();
+                crate::copy_dialog::open(
+                    crate::copy_dialog::OpenConnection {
+                        config: self.config.clone(),
+                        password: self.password.clone(),
+                    },
+                    db.clone(),
+                    table.clone().map(|t| vec![t]),
+                    Rc::new(move |_, cx| {
+                        this.update(cx, Workspace::refresh).ok();
+                    }),
+                    window,
+                    cx,
+                );
+            }
             BrowserEvent::DesignTable { db, table } => {
                 let this = cx.entity().downgrade();
                 crate::designer::open(

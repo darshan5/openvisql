@@ -969,3 +969,119 @@ async fn user_manager_statements_run() {
     assert!(!parse_accounts(&query(&mut s, LIST_ACCOUNTS).await).contains(&renamed));
     cleanup(s, &db).await;
 }
+
+#[tokio::test]
+async fn copy_database_between_sessions() {
+    use ovs_core::dump::{DumpOptions, copy_database};
+
+    let Some((mut src, db)) = scratch("copy_src").await else {
+        return;
+    };
+    for sql in [
+        "CREATE TABLE parent (id INT PRIMARY KEY, name VARCHAR(20))",
+        "CREATE TABLE child (id INT PRIMARY KEY, parent INT, \
+         FOREIGN KEY (parent) REFERENCES parent (id))",
+        "CREATE TABLE skipped (id INT PRIMARY KEY)",
+        "INSERT INTO parent VALUES (1, 'a'), (2, 'it''s')",
+        "INSERT INTO child VALUES (10, 1), (11, 2), (12, 2)",
+        "CREATE VIEW v_child AS SELECT c.id, p.name FROM child c JOIN parent p ON p.id = c.parent",
+        "CREATE TRIGGER t_skip BEFORE INSERT ON skipped FOR EACH ROW SET NEW.id = NEW.id + 0",
+    ] {
+        src.execute(sql, None)
+            .await
+            .unwrap_or_else(|e| panic!("{e}: {sql}"));
+    }
+    let (cfg, password) = config().unwrap();
+    let mut dst = MySqlDriver.connect(&cfg, Some(&password)).await.unwrap();
+    let target = format!("{db}_dst");
+    dst.execute(&format!("DROP DATABASE IF EXISTS {target}"), None)
+        .await
+        .unwrap();
+
+    let options = DumpOptions {
+        tables: Some(vec!["child".into(), "parent".into()]),
+        events: false,
+        routines: false,
+        ..DumpOptions::default()
+    };
+    let stats = copy_database(
+        src.as_mut(),
+        &db,
+        dst.as_mut(),
+        &target,
+        &options,
+        &mut |_| {},
+    )
+    .await
+    .unwrap();
+    assert_eq!((stats.tables, stats.rows, stats.other_objects), (2, 5, 1));
+
+    let tables: Vec<String> = dst
+        .list_objects(&target, ObjectKind::Table)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|o| o.name)
+        .collect();
+    assert_eq!(tables, ["child", "parent"]);
+    assert_eq!(
+        dst.list_objects(&target, ObjectKind::Trigger)
+            .await
+            .unwrap()
+            .len(),
+        0
+    );
+    // With a second server configured, copy across servers too (e.g. MySQL to MariaDB).
+    if let Ok(spec) = std::env::var("OVS_TEST_MYSQL_TARGET") {
+        let parts: Vec<&str> = spec.splitn(4, ':').collect();
+        let other = ConnectionConfig {
+            host: parts[0].to_owned(),
+            port: parts[1].parse().unwrap(),
+            user: parts[2].to_owned(),
+            ..cfg.clone()
+        };
+        let mut far = MySqlDriver
+            .connect(&other, parts.get(3).copied())
+            .await
+            .unwrap();
+        let stats = copy_database(
+            src.as_mut(),
+            &db,
+            far.as_mut(),
+            &target,
+            &DumpOptions::default(),
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!((stats.tables, stats.rows), (3, 5));
+        let out = far
+            .execute(&format!("SELECT COUNT(*) FROM {target}.v_child"), None)
+            .await
+            .unwrap();
+        assert_eq!(rows(&out[0])[0][0].to_string(), "3");
+        far.execute(&format!("DROP DATABASE {target}"), None)
+            .await
+            .unwrap();
+    }
+    // The view reads the copied tables, not the source database.
+    src.execute(&format!("DROP DATABASE {db}"), None)
+        .await
+        .unwrap();
+    let out = dst
+        .execute(
+            &format!("SELECT name FROM {target}.v_child ORDER BY id"),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows(&out[0])[2][0], Value::Text("it's".into()));
+    // Recreate the source so cleanup has something to drop.
+    src.execute(&format!("CREATE DATABASE {db}"), None)
+        .await
+        .unwrap();
+    dst.execute(&format!("DROP DATABASE {target}"), None)
+        .await
+        .unwrap();
+    cleanup(src, &db).await;
+}

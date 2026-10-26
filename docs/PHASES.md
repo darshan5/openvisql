@@ -94,7 +94,8 @@ Phase 2 is complete.
 - ✅ Process list, variables and status views.
 - ✅ User manager: create, rename, drop, change password; global and per-database privileges
   with GRANT OPTION.
-- Copy database or tables to another connection.
+- ✅ Copy a database or table to another open connection (or another database on the same
+  one), adapting collations between MySQL and MariaDB.
 - ✅ Session restore (open tabs, editor contents).
 
 ## Phase 4: SQLite
