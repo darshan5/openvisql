@@ -794,7 +794,7 @@ async fn table_designer_foreign_keys_and_options() {
     };
     for sql in [
         "CREATE TABLE owners (login VARCHAR(20) NOT NULL PRIMARY KEY, team INT NOT NULL, \
-         UNIQUE KEY by_team (team, login))",
+         UNIQUE KEY by_team (team, login)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
         "CREATE TABLE pets (id INT NOT NULL PRIMARY KEY, owner VARCHAR(20) NULL, \
          team INT NULL, CONSTRAINT fk_owner FOREIGN KEY (owner) REFERENCES owners (login) \
          ON DELETE CASCADE, CONSTRAINT owner_set CHECK (owner <> ''), \
