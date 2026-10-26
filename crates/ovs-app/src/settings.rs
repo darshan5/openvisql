@@ -158,6 +158,15 @@ impl Render for SettingsForm {
                         ),
                     )
                     .child(
+                        Field::new().label("Shortcuts").child(
+                            h_flex().child(
+                                Button::new("settings-shortcuts")
+                                    .label("Show keyboard shortcuts…")
+                                    .on_click(|_, window, cx| crate::shortcuts::open(window, cx)),
+                            ),
+                        ),
+                    )
+                    .child(
                         Field::new().label_indent(true).child(
                             Checkbox::new("settings-stop-on-error")
                                 .label("Execute all stops at the first error")
