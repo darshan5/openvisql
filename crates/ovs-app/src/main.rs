@@ -117,12 +117,19 @@ fn set_menus(cx: &mut App) {
 }
 
 pub fn window_options(title: impl Into<SharedString>, cx: &App) -> WindowOptions {
+    window_options_at(title, None, cx)
+}
+
+/// Like [`window_options`], at `bounds` when given (otherwise centered at the default size).
+pub fn window_options_at(
+    title: impl Into<SharedString>,
+    bounds: Option<WindowBounds>,
+    cx: &App,
+) -> WindowOptions {
     WindowOptions {
-        window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-            None,
-            size(px(1280.), px(820.)),
-            cx,
-        ))),
+        window_bounds: Some(bounds.unwrap_or_else(|| {
+            WindowBounds::Windowed(Bounds::centered(None, size(px(1280.), px(820.)), cx))
+        })),
         titlebar: Some(TitlebarOptions {
             title: Some(title.into()),
             ..TitlebarOptions::default()

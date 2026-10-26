@@ -91,12 +91,26 @@ pub struct SavedConnectionTab {
 }
 
 /// Everything needed to restore the main window.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Session {
     #[serde(rename = "connection")]
     pub connections: Vec<SavedConnectionTab>,
     pub active: usize,
+    /// Where the main window was, to reopen it there.
+    pub window: Option<WindowGeometry>,
+}
+
+/// A window's place and size in logical pixels, and whether it was maximized (the place and
+/// size are then where it returns to when restored).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct WindowGeometry {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    #[serde(default)]
+    pub maximized: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -372,6 +386,13 @@ mod tests {
                 active_tab: 1,
             }],
             active: 0,
+            window: Some(WindowGeometry {
+                x: -1200.,
+                y: 40.,
+                width: 1440.,
+                height: 900.,
+                maximized: true,
+            }),
         };
         store.save_session(&session).unwrap();
         assert_eq!(store.load_session().unwrap(), session);

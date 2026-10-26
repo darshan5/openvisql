@@ -18,11 +18,11 @@ use gpui_kit::component::{
     v_flex,
 };
 use gpui_kit::{
-    Anchor, App, AppContext as _, Context, Entity, FocusHandle, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, SharedString, Styled as _, Subscription, Task, Window,
-    div, px,
+    Anchor, App, AppContext as _, Bounds, Context, Entity, FocusHandle, InteractiveElement as _,
+    IntoElement, ParentElement as _, Pixels, Render, SharedString, Size, Styled as _, Subscription,
+    Task, Window, WindowBounds, div, point, px, size,
 };
-use ovs_store::{SavedConnectionTab, Session, Store, ThemePreference};
+use ovs_store::{SavedConnectionTab, Session, Store, ThemePreference, WindowGeometry};
 use uuid::Uuid;
 
 use crate::connect::{ConnectEvent, ConnectView};
@@ -30,7 +30,7 @@ use crate::tab_fit::{APP_BUTTONS_WIDTH, TAB_BAR_RESERVED, TabFit, tab_list_menu}
 use crate::workspace::{Workspace, WorkspaceEvent};
 use crate::{
     CloseConnection, NewConnection, NextConnection, OpenSettings, PreviousConnection, ThemeDark,
-    ThemeLight, ThemeSystem, window_options,
+    ThemeLight, ThemeSystem, window_options_at,
 };
 
 /// Delay between the last change and writing the session file.
@@ -38,9 +38,10 @@ const SAVE_DEBOUNCE: Duration = Duration::from_millis(700);
 
 /// Opens a new main window, restoring the previous session if there is one.
 pub fn open_window(cx: &mut App) {
-    let options = window_options("OpenViSQL", cx);
-    gpui_kit::open_window(options, cx, |window, cx| {
-        cx.new(|cx| AppShell::new(window, cx))
+    let options = window_options_at("OpenViSQL", saved_window_bounds(cx), cx);
+    let requested = options.window_bounds;
+    gpui_kit::open_window(options, cx, move |window, cx| {
+        cx.new(|cx| AppShell::new(window, requested, cx))
     })
     .expect("failed to open the main window");
 }
@@ -59,12 +60,17 @@ pub struct AppShell {
     /// when the connection is opened and kept in the session file until then.
     saved_tabs: HashMap<Uuid, SavedConnectionTab>,
     save_task: Option<Task<()>>,
+    /// The window's latest place and size, saved with the session.
+    window_geometry: Option<WindowGeometry>,
+    /// How much bigger the window reports itself than the size it was opened with (the title
+    /// bar, on macOS). Taken off before saving, so a reopened window keeps its size.
+    chrome: Size<Pixels>,
     tab_fit: TabFit,
     subscriptions: Vec<Subscription>,
 }
 
 impl AppShell {
-    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(window: &mut Window, requested: Option<WindowBounds>, cx: &mut Context<Self>) -> Self {
         // Focus the shell so app shortcuts reach it before any control has been clicked.
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
@@ -75,6 +81,19 @@ impl AppShell {
             }
         });
         crate::settings::apply_theme(Some(window), cx);
+        // Remember where the window is and how big, whenever it moves or resizes.
+        let moved = cx.observe_window_bounds(window, |this, window, cx| {
+            this.window_geometry = Some(geometry(window.window_bounds(), this.chrome));
+            this.schedule_save(cx);
+        });
+        // A maximized window's reported size isn't the one it was opened with.
+        let chrome = match requested {
+            Some(WindowBounds::Windowed(asked)) if !window.is_maximized() => {
+                let got = window.window_bounds().get_bounds().size;
+                size(got.width - asked.size.width, got.height - asked.size.height)
+            }
+            _ => Size::default(),
+        };
         let quit = cx.on_app_quit(|this: &mut Self, cx| {
             this.save_now(cx);
             async {}
@@ -86,8 +105,10 @@ impl AppShell {
             active: 0,
             saved_tabs: HashMap::new(),
             save_task: None,
+            window_geometry: Some(geometry(window.window_bounds(), chrome)),
+            chrome,
             tab_fit: TabFit::default(),
-            subscriptions: vec![quit, appearance],
+            subscriptions: vec![quit, appearance, moved],
         };
         // A corrupt session file shouldn't stop the app from starting.
         let session = shell.store.load_session().unwrap_or_default();
@@ -238,6 +259,7 @@ impl AppShell {
         session
             .connections
             .extend(self.saved_tabs.values().cloned());
+        session.window = self.window_geometry;
         // Losing the session is an inconvenience, not a reason to interrupt the user.
         let _ = self.store.save_session(&session);
     }
@@ -402,4 +424,42 @@ fn theme_menu(cx: &App) -> impl IntoElement {
                 )
             })
         })
+}
+
+/// `bounds` as saved in the session file, without the window's `chrome`.
+fn geometry(bounds: WindowBounds, chrome: Size<Pixels>) -> WindowGeometry {
+    let b = bounds.get_bounds();
+    WindowGeometry {
+        x: f32::from(b.origin.x),
+        y: f32::from(b.origin.y),
+        width: f32::from(b.size.width - chrome.width),
+        height: f32::from(b.size.height - chrome.height),
+        maximized: matches!(bounds, WindowBounds::Maximized(_)),
+    }
+}
+
+/// Where the main window was last time, if that's still on a connected display.
+fn saved_window_bounds(cx: &App) -> Option<WindowBounds> {
+    let saved = Store::default().load_session().ok()?.window?;
+    // Too small to use usually means a bad file; let the default apply.
+    if saved.width < 400. || saved.height < 300. {
+        return None;
+    }
+    let bounds = Bounds::new(
+        point(px(saved.x), px(saved.y)),
+        size(px(saved.width), px(saved.height)),
+    );
+    // A display that was unplugged would leave the window out of sight.
+    if !cx
+        .displays()
+        .iter()
+        .any(|display| display.bounds().intersects(&bounds))
+    {
+        return None;
+    }
+    Some(if saved.maximized {
+        WindowBounds::Maximized(bounds)
+    } else {
+        WindowBounds::Windowed(bounds)
+    })
 }
