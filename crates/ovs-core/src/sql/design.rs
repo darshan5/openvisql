@@ -290,6 +290,9 @@ impl TableDesign {
     /// after its column list in `create` (its `CREATE TABLE` statement).
     #[must_use]
     pub fn with_sqlite_parts(mut self, create: &str, triggers: Vec<String>) -> Self {
+        // The table's DDL may be followed by its indexes; only the CREATE TABLE matters here.
+        let statements = super::split_statements_for(create, Dialect::Sqlite);
+        let create = statements.first().map_or(create, |s| s.sql.as_str());
         let tail = create.rfind(')').map_or("", |at| &create[at + 1..]);
         tail.trim()
             .trim_end_matches(';')

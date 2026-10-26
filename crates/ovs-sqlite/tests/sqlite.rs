@@ -331,7 +331,7 @@ async fn dumps_restores_and_copies_databases() {
     let check = "SELECT (SELECT group_concat(x, ',') FROM (SELECT name || hex(coalesce(data, '')) AS x FROM owners ORDER BY id)) || '|' || \
                  (SELECT group_concat(x, ',') FROM (SELECT tag || weight AS x FROM pets ORDER BY tag)) || '|' || \
                  (SELECT COUNT(*) FROM log) || '|' || \
-                 (SELECT COUNT(*) FROM sqlite_master WHERE type IN ('view', 'trigger'))";
+                 (SELECT COUNT(*) FROM sqlite_master WHERE type IN ('view', 'trigger', 'index'))";
     let expected = rows(&mut src, check).await.rows[0][0].clone();
     assert_eq!(rows(&mut restored, check).await.rows[0][0], expected);
     // The restored trigger works.

@@ -514,10 +514,27 @@ impl Session for SqliteSession {
                 D.quote_str(name)
             ))
             .await?;
-        rs.rows
+        let ddl = rs
+            .rows
             .first()
             .map(|r| text(&rs, r, "sql"))
-            .ok_or_else(|| Error::Other(format!("{name} not found")))
+            .ok_or_else(|| Error::Other(format!("{name} not found")))?;
+        if kind != ObjectKind::Table {
+            return Ok(ddl);
+        }
+        // A table's indexes are separate objects; follow its CREATE with theirs, as the
+        // other engines' table DDL does. Automatic indexes (for UNIQUE, PRIMARY KEY) have none.
+        let indexes = self
+            .rows(format!(
+                "SELECT sql FROM {}.sqlite_master WHERE type = 'index' AND tbl_name = {} \
+                 AND sql IS NOT NULL ORDER BY name",
+                D.quote_ident(database),
+                D.quote_str(name)
+            ))
+            .await?;
+        let mut statements = vec![ddl];
+        statements.extend(indexes.rows.iter().map(|r| text(&indexes, r, "sql")));
+        Ok(statements.join(";\n"))
     }
 
     async fn close(self: Box<Self>) -> Result<()> {
