@@ -13,6 +13,7 @@ mod runtime;
 mod settings;
 mod shell;
 mod tab_fit;
+mod users;
 mod workspace;
 
 use gpui_kit::component::input::ShowCompletions;

@@ -91,7 +91,9 @@ Phase 2 is complete.
   - CHECK constraints, partitions.
 - ✅ SQL dump backup and restore (run script) with abort-on-error.
 - ✅ Import CSV (batched `INSERT`s in one transaction, rolled back on error).
-- ✅ Process list, variables and status views. User manager still to do.
+- ✅ Process list, variables and status views.
+- ✅ User manager: create, rename, drop, change password; global and per-database privileges
+  with GRANT OPTION.
 - Copy database or tables to another connection.
 - ✅ Session restore (open tabs, editor contents).
 

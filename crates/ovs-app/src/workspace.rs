@@ -680,6 +680,21 @@ impl Workspace {
                             PopupMenuItem::new("System variables")
                                 .on_click(open("Variables", templates::SYSTEM_VARIABLES)),
                         )
+                        .separator()
+                        .item(
+                            PopupMenuItem::new("Users and privileges…").on_click({
+                                let this = this.clone();
+                                move |_, window, cx| {
+                                    let Some(session) = this
+                                        .read_with(cx, |this, _| this.completion.session.clone())
+                                        .ok()
+                                    else {
+                                        return;
+                                    };
+                                    crate::users::open(session, window, cx);
+                                }
+                            }),
+                        )
                     })
             })
             .child(div().flex_1())

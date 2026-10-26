@@ -850,3 +850,122 @@ async fn table_designer_foreign_keys_and_options() {
     assert_eq!(s.list_foreign_keys(&db, "pets").await.unwrap().len(), 0);
     cleanup(s, &db).await;
 }
+
+#[tokio::test]
+async fn user_manager_statements_run() {
+    use ovs_core::sql::Dialect;
+    use ovs_core::sql::users::{
+        Account, AccountChange, Grants, LIST_ACCOUNTS, Scope, account_statements, drop_user,
+        grant_statements, list_database_grants, parse_accounts, parse_privileges, privileges_query,
+    };
+
+    const D: Dialect = Dialect::MySql;
+    async fn query(s: &mut Box<dyn Session>, sql: &str) -> ovs_core::ResultSet {
+        let out = s.execute(sql, None).await.unwrap();
+        match out.into_iter().next() {
+            Some(QueryOutcome::Rows(rs)) => rs,
+            other => panic!("{other:?}"),
+        }
+    }
+    async fn run(s: &mut Box<dyn Session>, statements: Vec<String>) {
+        for sql in statements {
+            s.execute(&sql, None)
+                .await
+                .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+        }
+    }
+    let Some((mut s, db)) = scratch("users").await else {
+        return;
+    };
+    let account = Account {
+        user: "ovs_test_user".into(),
+        host: "10.0.0.%".into(),
+    };
+    let _ = s.execute(&drop_user(D, &account), None).await;
+    run(
+        &mut s,
+        account_statements(
+            D,
+            &AccountChange {
+                original: None,
+                account: account.clone(),
+                password: Some("first-Pass1".into()),
+            },
+        ),
+    )
+    .await;
+    assert!(parse_accounts(&query(&mut s, LIST_ACCOUNTS).await).contains(&account));
+
+    let scope = Scope::Database(db.clone());
+    let none = parse_privileges(
+        &query(&mut s, &privileges_query(D, &account, &scope)).await,
+        &scope,
+    );
+    assert_eq!(none, Grants::default());
+    let wanted = Grants {
+        privileges: ["SELECT", "INSERT", "EXECUTE"].map(String::from).into(),
+        grant_option: true,
+    };
+    run(
+        &mut s,
+        grant_statements(D, &account, &scope, &none, &wanted),
+    )
+    .await;
+    let read = parse_privileges(
+        &query(&mut s, &privileges_query(D, &account, &scope)).await,
+        &scope,
+    );
+    assert_eq!(read, wanted);
+    let dbs = query(&mut s, &list_database_grants(D, &account)).await;
+    assert_eq!(dbs.rows.len(), 1);
+
+    let fewer = Grants {
+        privileges: ["SELECT", "UPDATE"].map(String::from).into(),
+        grant_option: false,
+    };
+    run(&mut s, grant_statements(D, &account, &scope, &read, &fewer)).await;
+    let read = parse_privileges(
+        &query(&mut s, &privileges_query(D, &account, &scope)).await,
+        &scope,
+    );
+    assert_eq!(read, fewer);
+
+    let global_before = parse_privileges(
+        &query(&mut s, &privileges_query(D, &account, &Scope::Global)).await,
+        &Scope::Global,
+    );
+    let global_after = Grants {
+        privileges: ["PROCESS".to_owned()].into(),
+        grant_option: false,
+    };
+    run(
+        &mut s,
+        grant_statements(D, &account, &Scope::Global, &global_before, &global_after),
+    )
+    .await;
+
+    let renamed = Account {
+        host: "10.1.%".into(),
+        ..account.clone()
+    };
+    run(
+        &mut s,
+        account_statements(
+            D,
+            &AccountChange {
+                original: Some(account.clone()),
+                account: renamed.clone(),
+                password: Some("second-Pass2".into()),
+            },
+        ),
+    )
+    .await;
+    let global = parse_privileges(
+        &query(&mut s, &privileges_query(D, &renamed, &Scope::Global)).await,
+        &Scope::Global,
+    );
+    assert_eq!(global, global_after);
+    run(&mut s, vec![drop_user(D, &renamed)]).await;
+    assert!(!parse_accounts(&query(&mut s, LIST_ACCOUNTS).await).contains(&renamed));
+    cleanup(s, &db).await;
+}
