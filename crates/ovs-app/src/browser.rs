@@ -230,6 +230,8 @@ pub enum BrowserEvent {
     CopyTo { db: String, table: Option<String> },
     /// Open the table designer for an existing table, or a new one when `table` is `None`.
     DesignTable { db: String, table: Option<String> },
+    /// Open the query builder on `db`, starting with `table` when set.
+    QueryBuilder { db: String, table: Option<String> },
     /// Ask for a name, then run the statement built from it and refresh.
     PromptExecute {
         title: String,
@@ -568,6 +570,12 @@ impl ObjectBrowser {
                     )));
                 }
                 menu = menu.separator();
+                menu = menu.item(PopupMenuItem::new("Query builder…").on_click(emit(
+                    BrowserEvent::QueryBuilder {
+                        db: db.clone(),
+                        table: None,
+                    },
+                )));
                 menu = menu.item(PopupMenuItem::new("New table…").on_click(emit(
                     BrowserEvent::DesignTable {
                         db: db.clone(),
@@ -747,6 +755,14 @@ impl ObjectBrowser {
                     }
                 }
                 menu = menu.separator();
+                if kind.has_data() {
+                    menu = menu.item(PopupMenuItem::new("Query builder…").on_click(emit(
+                        BrowserEvent::QueryBuilder {
+                            db: db.clone(),
+                            table: Some(name.clone()),
+                        },
+                    )));
+                }
                 if *kind == ObjectKind::Table {
                     let (rename_db, rename_from) = (db.clone(), name.clone());
                     menu = menu.item(PopupMenuItem::new("Copy table to…").on_click(emit(

@@ -68,6 +68,10 @@ the right, and results below.
   DEFINER clauses optional) and **run SQL scripts** to restore, stopping at the first error.
 - **Import CSV** into a table: header matching or by position, NULL markers, one transaction
   that rolls back on error.
+- **Query builder** for JOINs and UNIONs without typing them: add tables (joins are suggested
+  from foreign keys), tick columns, add aggregates, conditions, sorting and a limit, and
+  combine several queries with UNION, UNION ALL, INTERSECT or EXCEPT. The SQL is previewed
+  live and opened or run in a query tab.
 - **Copy** a database or table straight to another server of the same engine (open in a tab
   or just saved, directly or through its SSH tunnel), or to another database on the same one.
   Collations are adapted between MySQL and MariaDB.

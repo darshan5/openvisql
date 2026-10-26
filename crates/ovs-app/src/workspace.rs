@@ -453,6 +453,31 @@ impl Workspace {
                     cx,
                 );
             }
+            BrowserEvent::QueryBuilder { db, table } => {
+                let this = cx.entity().downgrade();
+                let tab_db = db.clone();
+                crate::query_builder::open(
+                    d,
+                    db.clone(),
+                    table.clone(),
+                    self.completion.session.clone(),
+                    Rc::new(move |sql, run, window, cx| {
+                        this.update(cx, |this, cx| {
+                            this.add_tab(
+                                Some("Query builder".into()),
+                                Some(tab_db.clone()),
+                                sql,
+                                run,
+                                window,
+                                cx,
+                            );
+                        })
+                        .ok();
+                    }),
+                    window,
+                    cx,
+                );
+            }
             BrowserEvent::ImportCsv { db, table } => crate::import_dialog::open(
                 db.clone(),
                 table.clone(),

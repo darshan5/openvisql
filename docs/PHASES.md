@@ -150,6 +150,17 @@ Phase 4 is complete.
 
 Phase 5 is complete.
 
+## Phase 6: Visual tools
+
+- ✅ Query builder (right-click a database or table → "Query builder…"): tables joined on
+  their foreign keys, with the join type and matched columns editable; ticked columns with
+  aggregates (automatic GROUP BY) and aliases; WHERE conditions; sorting and a limit; and
+  further queries combined with UNION, UNION ALL, INTERSECT or EXCEPT. Live SQL preview;
+  "Open in editor" or "Run". The generated SQL is tested on MySQL, MariaDB, PostgreSQL and
+  SQLite.
+- ER diagram of a database: tables as boxes with their columns and foreign-key lines,
+  arranged automatically, exportable as an image (next).
+
 ## Packaging
 
 - ✅ macOS `.app` bundle and `.dmg`, Windows NSIS installer (cargo-packager), with an app icon.

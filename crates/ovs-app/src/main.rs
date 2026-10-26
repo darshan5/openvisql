@@ -14,6 +14,7 @@ mod export_dialog;
 mod grid;
 mod import_dialog;
 mod query;
+mod query_builder;
 mod runtime;
 mod settings;
 mod shell;
