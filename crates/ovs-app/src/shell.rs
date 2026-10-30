@@ -33,6 +33,9 @@ use crate::{
     ThemeLight, ThemeSystem, window_options_at,
 };
 
+/// Width of the tab bar's "Update available" button, shown when there's a newer release.
+const UPDATE_BUTTON_WIDTH: f32 = 112.;
+
 /// Delay between the last change and writing the session file.
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(700);
 
@@ -340,6 +343,19 @@ impl Render for AppShell {
                             .suffix(
                                 h_flex()
                                     .items_center()
+                                    // Windows has no menu bar to show File > Update Available.
+                                    .children(crate::update::available(cx).map(|update| {
+                                        let url = update.url.clone();
+                                        Button::new("update-available")
+                                            .ghost()
+                                            .xsmall()
+                                            .label("Update available")
+                                            .tooltip(format!(
+                                                "Version {} is available",
+                                                update.version
+                                            ))
+                                            .on_click(move |_, _, cx| cx.open_url(&url))
+                                    }))
                                     .child(theme_menu(cx))
                                     .child(
                                         Button::new("open-settings")
@@ -376,7 +392,13 @@ impl Render for AppShell {
                             )
                             .max_width(self.tab_fit.tab_width(
                                 self.tabs.len(),
-                                px(TAB_BAR_RESERVED + APP_BUTTONS_WIDTH),
+                                px(TAB_BAR_RESERVED
+                                    + APP_BUTTONS_WIDTH
+                                    + if crate::update::available(cx).is_some() {
+                                        UPDATE_BUTTON_WIDTH
+                                    } else {
+                                        0.
+                                    }),
                             ))
                             .selected_index(self.active)
                             .on_click(cx.listener(|this, ix: &usize, _, cx| this.select(*ix, cx)))

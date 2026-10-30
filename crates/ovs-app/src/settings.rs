@@ -8,15 +8,18 @@ use gpui_kit::component::{
     form::{Field, Form},
     h_flex,
     input::{Input, InputState},
+    link::Link,
     radio::RadioGroup,
     scroll::ScrollbarMode,
     v_flex,
 };
 use gpui_kit::{
     App, AppContext as _, Axis, Context, Entity, Global, IntoElement, ParentElement as _, Render,
-    Styled as _, Window, div, px,
+    Styled as _, Task, Window, div, prelude::FluentBuilder as _, px,
 };
 use ovs_store::{Preferences, Store, ThemePreference};
+
+use crate::update::{self, CheckResult};
 
 /// The current preferences, readable from anywhere with [`prefs`].
 pub struct Prefs(pub Preferences);
@@ -77,6 +80,10 @@ pub struct SettingsForm {
     font_size: Entity<InputState>,
     theme: ThemePreference,
     stop_on_error: bool,
+    check_for_updates: bool,
+    /// The last Check now, if there's been one.
+    update_check: Option<UpdateCheck>,
+    update_task: Option<Task<()>>,
     error: Option<String>,
 }
 
@@ -91,8 +98,28 @@ impl SettingsForm {
             }),
             theme: current.theme,
             stop_on_error: current.stop_on_error,
+            check_for_updates: current.check_for_updates,
+            update_check: None,
+            update_task: None,
             error: None,
         }
+    }
+
+    fn check_now(&mut self, cx: &mut Context<Self>) {
+        self.update_check = Some(UpdateCheck::Running);
+        let job = cx.background_executor().spawn(async { update::check() });
+        self.update_task = Some(cx.spawn(async move |this, cx| {
+            let result = job.await;
+            this.update(cx, |this, cx| {
+                if let Ok(Some(found)) = &result {
+                    update::set_available(Some(found.clone()), cx);
+                }
+                this.update_check = Some(UpdateCheck::Done(result));
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
     }
 
     /// The edited preferences, or why they're invalid.
@@ -126,6 +153,7 @@ impl SettingsForm {
             editor_font_size,
             theme: self.theme,
             stop_on_error: self.stop_on_error,
+            check_for_updates: self.check_for_updates,
         })
     }
 }
@@ -179,6 +207,49 @@ impl Render for SettingsForm {
                                     cx.notify();
                                 })),
                         ),
+                    )
+                    .child(
+                        Field::new()
+                            .label("Updates")
+                            .description(format!(
+                                "Version {}. A check sends only the app's name and version to \
+                                 GitHub.",
+                                update::current_version()
+                            ))
+                            .child(
+                                v_flex()
+                                    .gap_2()
+                                    .child(
+                                        Checkbox::new("settings-check-updates")
+                                            .label("Check for updates at startup")
+                                            .checked(self.check_for_updates)
+                                            .on_change(cx.listener(|this, value: &bool, _, cx| {
+                                                this.check_for_updates = *value;
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .gap_2()
+                                            .items_center()
+                                            .child(
+                                                Button::new("settings-check-now")
+                                                    .label("Check now")
+                                                    .loading(matches!(
+                                                        self.update_check,
+                                                        Some(UpdateCheck::Running)
+                                                    ))
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.check_now(cx);
+                                                    })),
+                                            )
+                                            .children(
+                                                self.update_check
+                                                    .as_ref()
+                                                    .map(|check| update_status(check, cx)),
+                                            ),
+                                    ),
+                            ),
                     ),
             )
             .children(
@@ -187,6 +258,46 @@ impl Render for SettingsForm {
                     .map(|err| div().text_sm().text_color(cx.theme().danger).child(err)),
             )
     }
+}
+
+/// Settings > Updates > Check now.
+enum UpdateCheck {
+    Running,
+    Done(CheckResult),
+}
+
+/// What Check now found, as Settings shows it: the message, and a link to a newer release.
+fn update_message(check: &UpdateCheck) -> (String, Option<String>) {
+    match check {
+        UpdateCheck::Running => ("Checking…".to_owned(), None),
+        UpdateCheck::Done(Ok(None)) => (
+            format!(
+                "You have the latest version ({}).",
+                update::current_version()
+            ),
+            None,
+        ),
+        UpdateCheck::Done(Ok(Some(found))) => (
+            format!("Version {} is available.", found.version),
+            Some(found.url.clone()),
+        ),
+        UpdateCheck::Done(Err(err)) => (err.clone(), None),
+    }
+}
+
+fn update_status(check: &UpdateCheck, cx: &App) -> impl IntoElement {
+    let failed = matches!(check, UpdateCheck::Done(Err(_)));
+    let (message, url) = update_message(check);
+    h_flex()
+        .gap_2()
+        .text_sm()
+        .when(failed, |el| el.text_color(cx.theme().danger))
+        .child(message)
+        .children(url.map(|url| {
+            Link::new("settings-update-link")
+                .href(url)
+                .child("Download")
+        }))
 }
 
 /// Opens the Settings dialog in `window`.
@@ -238,4 +349,39 @@ pub fn open(window: &mut Window, cx: &mut App) {
                     ),
             )
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check_now_reports_each_outcome() {
+        assert_eq!(update_message(&UpdateCheck::Running).0, "Checking…");
+        assert_eq!(
+            update_message(&UpdateCheck::Done(Ok(None))),
+            (
+                format!(
+                    "You have the latest version ({}).",
+                    update::current_version()
+                ),
+                None
+            )
+        );
+        let found = update::Update {
+            version: "9.0.0".into(),
+            url: "https://example.com/r".into(),
+        };
+        assert_eq!(
+            update_message(&UpdateCheck::Done(Ok(Some(found)))),
+            (
+                "Version 9.0.0 is available.".to_owned(),
+                Some("https://example.com/r".to_owned())
+            )
+        );
+        assert_eq!(
+            update_message(&UpdateCheck::Done(Err("Couldn't reach GitHub.".into()))).0,
+            "Couldn't reach GitHub."
+        );
+    }
 }

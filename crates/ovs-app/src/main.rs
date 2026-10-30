@@ -21,6 +21,7 @@ mod settings;
 mod shell;
 mod shortcuts;
 mod tab_fit;
+mod update;
 mod users;
 mod workspace;
 
@@ -52,6 +53,7 @@ actions!(
         ThemeSystem,
         ThemeLight,
         ThemeDark,
+        OpenUpdate,
         Quit
     ]
 );
@@ -59,7 +61,21 @@ actions!(
 /// Key context of a connection window; workspace bindings only fire inside it.
 pub const WORKSPACE_CONTEXT: &str = "Workspace";
 
-fn set_menus(cx: &mut App) {
+/// Sets the menu bar. Called again when an update is found, to show it in File.
+pub fn set_menus(cx: &mut App) {
+    let mut file = file_menu_update_items(update::available(cx));
+    file.extend([
+        MenuItem::action("New Connection…", NewConnection),
+        MenuItem::action("Close Connection", CloseConnection),
+        MenuItem::action("Next Connection", NextConnection),
+        MenuItem::action("Previous Connection", PreviousConnection),
+        MenuItem::separator(),
+        MenuItem::action("New Query Tab", NewQueryTab),
+        MenuItem::action("Open SQL File…", OpenSqlFile),
+        MenuItem::action("Save", SaveSqlFile),
+        MenuItem::action("Save As…", SaveSqlFileAs),
+        MenuItem::action("Close Query Tab", CloseQueryTab),
+    ]);
     cx.set_menus([
         Menu {
             name: "OpenViSQL".into(),
@@ -72,18 +88,7 @@ fn set_menus(cx: &mut App) {
         },
         Menu {
             name: "File".into(),
-            items: vec![
-                MenuItem::action("New Connection…", NewConnection),
-                MenuItem::action("Close Connection", CloseConnection),
-                MenuItem::action("Next Connection", NextConnection),
-                MenuItem::action("Previous Connection", PreviousConnection),
-                MenuItem::separator(),
-                MenuItem::action("New Query Tab", NewQueryTab),
-                MenuItem::action("Open SQL File…", OpenSqlFile),
-                MenuItem::action("Save", SaveSqlFile),
-                MenuItem::action("Save As…", SaveSqlFileAs),
-                MenuItem::action("Close Query Tab", CloseQueryTab),
-            ],
+            items: file,
             disabled: false,
         },
         Menu {
@@ -118,6 +123,20 @@ fn set_menus(cx: &mut App) {
     ]);
 }
 
+/// The "Update Available" item at the top of the File menu, when there's a newer release.
+fn file_menu_update_items(update: Option<&update::Update>) -> Vec<MenuItem> {
+    update.map_or_else(Vec::new, |u| {
+        vec![
+            MenuItem::action(update_menu_label(u), OpenUpdate),
+            MenuItem::separator(),
+        ]
+    })
+}
+
+fn update_menu_label(update: &update::Update) -> String {
+    format!("Update Available (v{})…", update.version)
+}
+
 pub fn window_options(title: impl Into<SharedString>, cx: &App) -> WindowOptions {
     window_options_at(title, None, cx)
 }
@@ -149,9 +168,35 @@ fn main() {
             shortcuts::bind(cx);
             set_menus(cx);
             cx.on_action(|_: &Quit, cx| cx.quit());
+            cx.on_action(|_: &OpenUpdate, cx| {
+                if let Some(update) = update::available(cx) {
+                    cx.open_url(&update.url);
+                }
+            });
             // Inside a window the shell adds a tab; this only fires when no window has focus.
             cx.on_action(|_: &NewConnection, cx| shell::open_window(cx));
             cx.activate(true);
             shell::open_window(cx);
+            // Only here, once per run: windows opened later don't check again.
+            update::check_at_startup(cx);
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_menu_offers_a_newer_release_first() {
+        assert!(file_menu_update_items(None).is_empty());
+        let update = update::Update {
+            version: "0.3.0".into(),
+            url: "https://example.com".into(),
+        };
+        let items = file_menu_update_items(Some(&update));
+        assert!(
+            matches!(&items[0], MenuItem::Action { name, .. } if name == "Update Available (v0.3.0)…")
+        );
+        assert!(matches!(items[1], MenuItem::Separator));
+    }
 }

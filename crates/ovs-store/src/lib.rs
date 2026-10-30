@@ -133,6 +133,8 @@ pub struct Preferences {
     pub theme: ThemePreference,
     /// "Execute all" stops at the first statement that fails.
     pub stop_on_error: bool,
+    /// Ask GitHub for a newer release when the app starts.
+    pub check_for_updates: bool,
 }
 
 impl Preferences {
@@ -147,6 +149,7 @@ impl Default for Preferences {
             editor_font_size: 14.0,
             theme: ThemePreference::System,
             stop_on_error: false,
+            check_for_updates: true,
         }
     }
 }
@@ -452,6 +455,7 @@ mod tests {
         assert!((partial.editor_font_size - 14.0).abs() < f32::EPSILON);
         // The app follows the system's appearance until another theme is chosen.
         assert_eq!(partial.theme, ThemePreference::System);
+        assert!(partial.check_for_updates);
     }
 
     #[test]

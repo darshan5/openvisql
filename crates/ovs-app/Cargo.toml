@@ -23,6 +23,7 @@ ovs-postgres.workspace = true
 ovs-sqlite.workspace = true
 ovs-ssh.workspace = true
 ovs-store.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 uuid.workspace = true
 
