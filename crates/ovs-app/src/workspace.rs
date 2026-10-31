@@ -779,26 +779,27 @@ impl Workspace {
                                     })
                                     .on_click(open("Variables", variables)),
                                 );
-                            // The user manager speaks MySQL's account model.
-                            if dialect != Dialect::MySql {
-                                return menu;
-                            }
-                            menu.separator().item(
-                                PopupMenuItem::new("Users and privileges…").on_click({
-                                    let this = this.clone();
-                                    move |_, window, cx| {
-                                        let Some(session) = this
-                                            .read_with(cx, |this, _| {
-                                                this.completion.session.clone()
-                                            })
-                                            .ok()
-                                        else {
-                                            return;
-                                        };
-                                        crate::users::open(session, window, cx);
+                            // Each engine has its own account model; SQLite has none.
+                            let (label, open_manager): (_, fn(_, &mut Window, &mut App)) =
+                                match dialect {
+                                    Dialect::MySql => ("Users and privileges…", crate::users::open),
+                                    Dialect::Postgres => {
+                                        ("Roles and privileges…", crate::roles::open)
                                     }
-                                }),
-                            )
+                                    Dialect::Sqlite => return menu,
+                                };
+                            menu.separator().item(PopupMenuItem::new(label).on_click({
+                                let this = this.clone();
+                                move |_, window, cx| {
+                                    let Some(session) = this
+                                        .read_with(cx, |this, _| this.completion.session.clone())
+                                        .ok()
+                                    else {
+                                        return;
+                                    };
+                                    open_manager(session, window, cx);
+                                }
+                            }))
                         })
                 })
             })

@@ -893,8 +893,10 @@ async fn table_designer_foreign_keys_and_options() {
 async fn user_manager_statements_run() {
     use ovs_core::sql::Dialect;
     use ovs_core::sql::users::{
-        Account, AccountChange, Grants, LIST_ACCOUNTS, Scope, account_statements, drop_user,
-        grant_statements, list_database_grants, parse_accounts, parse_privileges, privileges_query,
+        Account, AccountChange, Flavor, Grants, Scope, account_statements, create_role, drop_role,
+        drop_user, grant_statements, granted_roles_query, list_accounts, list_database_grants,
+        parse_accounts, parse_granted_roles, parse_privileges, privileges_query,
+        role_grant_statements,
     };
 
     const D: Dialect = Dialect::MySql;
@@ -915,11 +917,21 @@ async fn user_manager_statements_run() {
     let Some((mut s, db)) = scratch("users").await else {
         return;
     };
+    let flavor = Flavor::of(s.server_version());
+    let accounts =
+        async |s: &mut Box<dyn Session>| parse_accounts(&query(s, list_accounts(flavor)).await);
     let account = Account {
         user: "ovs_test_user".into(),
         host: "10.0.0.%".into(),
     };
-    let _ = s.execute(&drop_user(D, &account), None).await;
+    // Also the renamed account a failed run may have left.
+    for host in ["10.0.0.%", "10.1.%"] {
+        let leftover = Account {
+            host: host.into(),
+            ..account.clone()
+        };
+        let _ = s.execute(&drop_user(D, &leftover), None).await;
+    }
     run(
         &mut s,
         account_statements(
@@ -928,11 +940,17 @@ async fn user_manager_statements_run() {
                 original: None,
                 account: account.clone(),
                 password: Some("first-Pass1".into()),
+                lock: Some(true),
             },
         ),
     )
     .await;
-    assert!(parse_accounts(&query(&mut s, LIST_ACCOUNTS).await).contains(&account));
+    let info = accounts(&mut s)
+        .await
+        .into_iter()
+        .find(|a| a.account == account)
+        .expect("created");
+    assert!(info.locked && !info.is_role);
 
     let scope = Scope::Database(db.clone());
     let none = parse_privileges(
@@ -994,6 +1012,7 @@ async fn user_manager_statements_run() {
                 original: Some(account.clone()),
                 account: renamed.clone(),
                 password: Some("second-Pass2".into()),
+                lock: Some(false),
             },
         ),
     )
@@ -1003,8 +1022,146 @@ async fn user_manager_statements_run() {
         &Scope::Global,
     );
     assert_eq!(global, global_after);
+    let info = accounts(&mut s)
+        .await
+        .into_iter()
+        .find(|a| a.account == renamed)
+        .expect("renamed");
+    assert!(!info.locked);
+
+    // Privileges on one table.
+    run(&mut s, vec![format!("CREATE TABLE `{db}`.orders (id INT)")]).await;
+    let table = Scope::Table {
+        database: db.clone(),
+        table: "orders".into(),
+    };
+    let none = parse_privileges(
+        &query(&mut s, &privileges_query(D, &renamed, &table)).await,
+        &table,
+    );
+    assert_eq!(none, Grants::default());
+    let wanted = Grants {
+        privileges: ["SELECT", "UPDATE", "CREATE VIEW", "SHOW VIEW"]
+            .map(String::from)
+            .into(),
+        grant_option: true,
+    };
+    run(
+        &mut s,
+        grant_statements(D, &renamed, &table, &none, &wanted),
+    )
+    .await;
+    let read = parse_privileges(
+        &query(&mut s, &privileges_query(D, &renamed, &table)).await,
+        &table,
+    );
+    assert_eq!(read, wanted);
+    let fewer = Grants {
+        privileges: ["SELECT".to_owned()].into(),
+        grant_option: false,
+    };
+    run(&mut s, grant_statements(D, &renamed, &table, &read, &fewer)).await;
+    assert_eq!(
+        parse_privileges(
+            &query(&mut s, &privileges_query(D, &renamed, &table)).await,
+            &table
+        ),
+        fewer
+    );
+
+    // Roles: created, listed as roles, granted and revoked.
+    let role_names = ["ovs_test_readers", "ovs_test_writers"];
+    for name in role_names {
+        let role = accounts(&mut s)
+            .await
+            .into_iter()
+            .find(|a| a.account.user == name);
+        if let Some(role) = role {
+            run(&mut s, vec![drop_role(D, flavor, &role.account)]).await;
+        }
+        run(&mut s, vec![create_role(D, name)]).await;
+    }
+    let listed = accounts(&mut s).await;
+    let roles: Vec<Account> = role_names
+        .iter()
+        .map(|name| {
+            let info = listed
+                .iter()
+                .find(|a| a.account.user == *name)
+                .expect("role listed");
+            assert!(info.is_role, "{name} is listed as a role");
+            info.account.clone()
+        })
+        .collect();
+    assert!(
+        !listed
+            .iter()
+            .find(|a| a.account == renamed)
+            .unwrap()
+            .is_role
+    );
+    let granted = async |s: &mut Box<dyn Session>| {
+        parse_granted_roles(&query(s, &granted_roles_query(D, flavor, &renamed)).await)
+    };
+    assert!(granted(&mut s).await.is_empty());
+    let both: std::collections::BTreeSet<Account> = roles.iter().cloned().collect();
+    run(
+        &mut s,
+        role_grant_statements(
+            D,
+            flavor,
+            &renamed,
+            &std::collections::BTreeSet::default(),
+            &both,
+        ),
+    )
+    .await;
+    assert_eq!(granted(&mut s).await, both);
+    let one: std::collections::BTreeSet<Account> = [roles[1].clone()].into();
+    run(
+        &mut s,
+        role_grant_statements(D, flavor, &renamed, &both, &one),
+    )
+    .await;
+    assert_eq!(granted(&mut s).await, one);
+    // Granted roles are active when the account logs in.
+    let defaults = match flavor {
+        Flavor::MySql => format!(
+            "SELECT DEFAULT_ROLE_USER FROM mysql.default_roles WHERE USER = '{}' AND HOST = '{}'",
+            renamed.user, renamed.host
+        ),
+        Flavor::MariaDb => format!(
+            "SELECT default_role FROM mysql.user WHERE User = '{}' AND Host = '{}'",
+            renamed.user, renamed.host
+        ),
+    };
+    let rs = query(&mut s, &defaults).await;
+    assert_eq!(rs.rows.len(), 1);
+    assert_eq!(rs.rows[0][0].to_string(), "ovs_test_writers");
+    // Roles hold privileges like accounts do (a MariaDB role has no host).
+    let role_scope = Scope::Database(db.clone());
+    let select = Grants {
+        privileges: ["SELECT".to_owned()].into(),
+        grant_option: false,
+    };
+    run(
+        &mut s,
+        grant_statements(D, &roles[0], &role_scope, &Grants::default(), &select),
+    )
+    .await;
+    assert_eq!(
+        parse_privileges(
+            &query(&mut s, &privileges_query(D, &roles[0], &role_scope)).await,
+            &role_scope
+        ),
+        select
+    );
+    for role in &roles {
+        run(&mut s, vec![drop_role(D, flavor, role)]).await;
+    }
+
     run(&mut s, vec![drop_user(D, &renamed)]).await;
-    assert!(!parse_accounts(&query(&mut s, LIST_ACCOUNTS).await).contains(&renamed));
+    assert!(!accounts(&mut s).await.iter().any(|a| a.account == renamed));
     cleanup(s, &db).await;
 }
 

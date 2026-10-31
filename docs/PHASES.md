@@ -96,8 +96,11 @@ Phase 2 is complete.
 - ✅ SQL dump backup and restore (run script) with abort-on-error.
 - ✅ Import CSV (batched `INSERT`s in one transaction, rolled back on error).
 - ✅ Process list, variables and status views.
-- ✅ User manager: create, rename, drop, change password; global and per-database privileges
-  with GRANT OPTION.
+- ✅ User manager: create, rename, drop, change password, lock; global, per-database and
+  per-table privileges with GRANT OPTION.
+- ✅ Roles in the user manager: create and drop roles, give them privileges, and grant them to
+  accounts. MySQL makes every granted role active at login (`SET DEFAULT ROLE ALL`); MariaDB
+  activates one role at a time, so a single granted role is made the default.
 - ✅ Copy a database or table to another connection of the same engine (or another database
   on the same one), adapting collations between MySQL and MariaDB. The target can be open in
   a tab or only saved: a saved one is connected for the copy, directly or through its SSH
@@ -147,6 +150,14 @@ Phase 4 is complete.
 - ✅ Dumps create types and free-standing sequences before the tables that use them, only when
   missing, and carry sequence values over. Replacing a whole schema drops its tables with
   `CASCADE` so views don't block it.
+- ✅ Role manager (server menu → "Roles and privileges…"): create, rename and drop roles; login,
+  superuser, create-database, create-role, inherit, replication and bypass-RLS attributes;
+  connection limit, password and expiry; memberships, including PostgreSQL's built-in `pg_*`
+  roles. Privileges on the database, a schema, a table, or all tables or sequences in a schema,
+  with the grant option. Privileges held on only some of a schema's tables show as "on n of m".
+  Default privileges cover tables and sequences the connected user creates later. PUBLIC is
+  listed, so defaults such as `CONNECT` can be revoked. Dropping a role first hands what it
+  owns in this database to the connected user and revokes its privileges here.
 
 Phase 5 is complete.
 

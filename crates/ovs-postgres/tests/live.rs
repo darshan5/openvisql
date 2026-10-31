@@ -1016,3 +1016,232 @@ async fn query_builder_sql_runs() {
     );
     cleanup(s, &schema).await;
 }
+
+#[tokio::test]
+async fn role_manager_statements_run() {
+    use ovs_core::sql::roles::{
+        Grantee, LIST_MEMBERSHIPS, LIST_ROLES, Role, Target, default_privilege_statements,
+        default_privileges_query, drop_role, drop_role_statements, grant_statements,
+        parse_default_privileges, parse_privileges, parse_roles, privileges_query, role_statements,
+    };
+    use ovs_core::sql::users::Grants;
+
+    async fn run(s: &mut Box<dyn Session>, statements: Vec<String>) {
+        for sql in statements {
+            exec(s, &sql).await;
+        }
+    }
+    async fn roles(s: &mut Box<dyn Session>) -> Vec<Role> {
+        let list = rows(s, LIST_ROLES).await;
+        parse_roles(&list, &rows(s, LIST_MEMBERSHIPS).await)
+    }
+    async fn read(
+        s: &mut Box<dyn Session>,
+        grantee: &Grantee,
+        target: &Target,
+    ) -> ovs_core::sql::roles::Privileges {
+        parse_privileges(&rows(s, &privileges_query(grantee, target)).await, target)
+    }
+    fn grants(items: &[&str], grant_option: bool) -> Grants {
+        Grants {
+            privileges: items.iter().map(|s| (*s).to_owned()).collect(),
+            grant_option,
+        }
+    }
+
+    let Some((mut s, schema)) = scratch("roles").await else {
+        return;
+    };
+    for name in ["Ovs App", "ovs_service", "ovs_readers"] {
+        let _ = s.execute(&drop_role(name), None).await;
+    }
+    script(
+        &mut s,
+        "CREATE TABLE a (id int); CREATE TABLE b (id int); CREATE SEQUENCE n;",
+    )
+    .await;
+    run(
+        &mut s,
+        role_statements(
+            None,
+            &Role {
+                name: "ovs_readers".into(),
+                ..Role::default()
+            },
+            None,
+        ),
+    )
+    .await;
+    let app = Role {
+        name: "Ovs App".into(),
+        login: true,
+        create_db: true,
+        connection_limit: Some(4),
+        valid_until: Some("2030-01-01 00:00:00+00".into()),
+        member_of: ["ovs_readers".to_owned(), "pg_monitor".to_owned()].into(),
+        ..Role::default()
+    };
+    run(&mut s, role_statements(None, &app, Some("it's secret"))).await;
+    let read_app = roles(&mut s)
+        .await
+        .into_iter()
+        .find(|r| r.name == "Ovs App")
+        .expect("created");
+    assert!(read_app.login && read_app.create_db && read_app.inherit && !read_app.superuser);
+    assert_eq!(read_app.connection_limit, Some(4));
+    assert!(
+        read_app
+            .valid_until
+            .as_deref()
+            .unwrap()
+            .starts_with("2030-01-01")
+    );
+    assert_eq!(read_app.member_of, app.member_of);
+    // The password works for signing in.
+    let (mut cfg, _) = config().unwrap();
+    cfg.user = "Ovs App".into();
+    PostgresDriver
+        .connect(&cfg, Some("it's secret"))
+        .await
+        .expect("the new role signs in")
+        .close()
+        .await
+        .unwrap();
+
+    let who = Grantee::Role("Ovs App".into());
+    let database = match rows(&mut s, "SELECT current_database()").await.rows[0][0].clone() {
+        Value::Text(t) => t,
+        other => other.to_string(),
+    };
+    for (target, wanted) in [
+        (
+            Target::Database(database),
+            grants(&["CONNECT", "TEMPORARY"], true),
+        ),
+        (Target::Schema(schema.clone()), grants(&["USAGE"], false)),
+        (
+            Target::Table {
+                schema: schema.clone(),
+                name: "a".into(),
+            },
+            grants(&["SELECT", "UPDATE"], false),
+        ),
+    ] {
+        let before = read(&mut s, &who, &target).await;
+        run(
+            &mut s,
+            grant_statements(&who, &target, &before.grants, &wanted),
+        )
+        .await;
+        assert_eq!(
+            read(&mut s, &who, &target).await.grants,
+            wanted,
+            "{target:?}"
+        );
+    }
+
+    // Table a has SELECT and UPDATE; b has nothing, so those are partial across the schema.
+    let all = Target::AllTables(schema.clone());
+    let before = read(&mut s, &who, &all).await;
+    assert_eq!(before.objects, 2);
+    assert!(before.grants.privileges.is_empty());
+    assert_eq!(before.partial.get("SELECT"), Some(&1));
+    run(
+        &mut s,
+        grant_statements(&who, &all, &before.grants, &grants(&["SELECT"], false)),
+    )
+    .await;
+    let after = read(&mut s, &who, &all).await;
+    assert_eq!(after.grants, grants(&["SELECT"], false));
+    assert_eq!(after.partial.get("UPDATE"), Some(&1));
+
+    // Tables created later by this connection's user get the default privileges.
+    let later_query = default_privileges_query(&who, &all).unwrap();
+    let no_defaults = parse_default_privileges(&rows(&mut s, &later_query).await, &all);
+    assert_eq!(no_defaults, Grants::default());
+    run(
+        &mut s,
+        default_privilege_statements(
+            &who,
+            &all,
+            &no_defaults,
+            &grants(&["SELECT", "INSERT"], false),
+        ),
+    )
+    .await;
+    assert_eq!(
+        parse_default_privileges(&rows(&mut s, &later_query).await, &all),
+        grants(&["SELECT", "INSERT"], false)
+    );
+    exec(&mut s, "CREATE TABLE c (id int)").await;
+    let c = Target::Table {
+        schema: schema.clone(),
+        name: "c".into(),
+    };
+    assert_eq!(
+        read(&mut s, &who, &c).await.grants,
+        grants(&["SELECT", "INSERT"], false)
+    );
+
+    let seqs = Target::AllSequences(schema.clone());
+    run(
+        &mut s,
+        grant_statements(&who, &seqs, &Grants::default(), &grants(&["USAGE"], false)),
+    )
+    .await;
+    assert_eq!(
+        read(&mut s, &who, &seqs).await.grants,
+        grants(&["USAGE"], false)
+    );
+
+    // PUBLIC's default CONNECT on the database shows, and can be revoked and restored.
+    let db_target = Target::Database(
+        match rows(&mut s, "SELECT current_database()").await.rows[0][0].clone() {
+            Value::Text(t) => t,
+            other => other.to_string(),
+        },
+    );
+    let public = read(&mut s, &Grantee::Public, &db_target).await.grants;
+    assert!(public.privileges.contains("CONNECT"));
+
+    // Rename and change attributes and memberships.
+    let service = Role {
+        name: "ovs_service".into(),
+        create_db: false,
+        inherit: false,
+        connection_limit: None,
+        valid_until: None,
+        member_of: ["ovs_readers".to_owned()].into(),
+        ..read_app.clone()
+    };
+    run(&mut s, role_statements(Some(&read_app), &service, None)).await;
+    let read_service = roles(&mut s)
+        .await
+        .into_iter()
+        .find(|r| r.name == "ovs_service")
+        .expect("renamed");
+    assert_eq!(read_service, service);
+
+    // It holds privileges and default privileges, and owns a table; dropping hands the table
+    // over and revokes the rest.
+    exec(
+        &mut s,
+        &format!("ALTER TABLE {schema}.b OWNER TO ovs_service"),
+    )
+    .await;
+    run(&mut s, drop_role_statements("ovs_service")).await;
+    exec(&mut s, &drop_role("ovs_readers")).await;
+    assert!(!roles(&mut s).await.iter().any(|r| r.name == "ovs_service"));
+    assert_eq!(
+        rows(
+            &mut s,
+            &format!(
+                "SELECT tableowner FROM pg_tables WHERE schemaname = '{schema}' AND tablename = 'b'"
+            )
+        )
+        .await
+        .rows[0][0],
+        Value::Text("postgres".into())
+    );
+    cleanup(s, &schema).await;
+}

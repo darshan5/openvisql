@@ -16,6 +16,7 @@ mod grid;
 mod import_dialog;
 mod query;
 mod query_builder;
+mod roles;
 mod runtime;
 mod settings;
 mod shell;

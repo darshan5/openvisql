@@ -10,6 +10,7 @@ mod edit;
 pub mod keywords;
 mod lexer;
 pub mod paging;
+pub mod roles;
 mod splitter;
 pub mod templates;
 pub mod text;
