@@ -16,12 +16,13 @@ use gpui_kit::component::{
     input::{Input, InputState, Textarea, TextareaState},
     menu::{DropdownMenu as _, PopupMenuItem},
     resizable::{resizable_panel, v_resizable},
+    scroll::{Scrollbar, ScrollbarMode},
     tab::{Tab, TabBar},
     table::{ColumnSort, DataTable, TableEvent, TableState},
     v_flex,
 };
 use gpui_kit::{
-    AppContext as _, Context, Entity, EventEmitter, InteractiveElement as _, IntoElement,
+    App, AppContext as _, Context, Entity, EventEmitter, InteractiveElement as _, IntoElement,
     ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
     Subscription, Task, Window, div, prelude::FluentBuilder as _, px,
 };
@@ -2056,7 +2057,7 @@ impl Render for QueryTab {
                     div()
                         .flex_1()
                         .min_h_0()
-                        .child(DataTable::new(&result.table).small().stripe(true)),
+                        .child(render_result_grid(&result.table, cx)),
                 )
                 .child(Self::render_result_footer(result, active, cx))
                 .into_any_element()
@@ -2168,6 +2169,90 @@ fn load_bytes_from_file(
             .ok();
         })
         .detach();
+}
+
+/// The result grid with its scroll bars in gutters of their own along the right and bottom
+/// edges, rather than the table's overlay ones: they are always there, even when the rows
+/// don't fill the grid, and never cover the last row or column.
+fn render_result_grid(table: &Entity<TableState<ResultGrid>>, cx: &App) -> impl IntoElement {
+    use gpui_kit::component::Size;
+    use gpui_kit::component::table::TableDelegate as _;
+
+    let state = table.read(cx);
+    // Without rows the table doesn't lay out its list, so the vertical handle is stale.
+    let has_rows = state.delegate().rows_count(cx) > 0;
+    // The rows' viewport starts below the column headings (one row, at the grid's size).
+    let heading = Size::Small.table_row_height();
+    let gutter = Scrollbar::width();
+    let track = cx.theme().muted;
+    let border = cx.theme().border;
+
+    v_flex()
+        .size_full()
+        .child(
+            h_flex()
+                .w_full()
+                .flex_1()
+                .min_h_0()
+                .child(
+                    div().flex_1().min_w_0().h_full().child(
+                        DataTable::new(table)
+                            .small()
+                            .stripe(true)
+                            .scrollbar_visible(false, false),
+                    ),
+                )
+                .child(
+                    div()
+                        .relative()
+                        .flex_none()
+                        .w(gutter)
+                        .h_full()
+                        .bg(track)
+                        .border_l_1()
+                        .border_color(border)
+                        .when(has_rows, |this| {
+                            this.child(
+                                div()
+                                    .absolute()
+                                    .top(heading)
+                                    .bottom_0()
+                                    .left_0()
+                                    .right_0()
+                                    .child(
+                                        Scrollbar::vertical(&state.vertical_scroll_handle)
+                                            .mode(ScrollbarMode::Always)
+                                            .viewport_from_layout(),
+                                    ),
+                            )
+                        }),
+                ),
+        )
+        .child(
+            h_flex()
+                .w_full()
+                .flex_none()
+                .h(gutter)
+                .bg(track)
+                .border_t_1()
+                .border_color(border)
+                .child(
+                    div().relative().flex_1().min_w_0().h_full().child(
+                        Scrollbar::horizontal(&state.horizontal_scroll_handle)
+                            .mode(ScrollbarMode::Always)
+                            .viewport_from_layout(),
+                    ),
+                )
+                // The corner where the two gutters meet.
+                .child(
+                    div()
+                        .flex_none()
+                        .w(gutter)
+                        .h_full()
+                        .border_l_1()
+                        .border_color(border),
+                ),
+        )
 }
 
 #[cfg(test)]

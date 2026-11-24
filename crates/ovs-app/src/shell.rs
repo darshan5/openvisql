@@ -18,9 +18,9 @@ use gpui_kit::component::{
     v_flex,
 };
 use gpui_kit::{
-    Anchor, App, AppContext as _, Bounds, Context, Entity, FocusHandle, InteractiveElement as _,
-    IntoElement, ParentElement as _, Pixels, Render, SharedString, Size, Styled as _, Subscription,
-    Task, Window, WindowBounds, div, point, px, size,
+    Anchor, AnyWindowHandle, App, AppContext as _, Bounds, Context, DisplayId, Entity, FocusHandle,
+    InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render, SharedString, Size,
+    Styled as _, Subscription, Task, Window, WindowBounds, div, point, px, size,
 };
 use ovs_store::{SavedConnectionTab, Session, Store, ThemePreference, WindowGeometry};
 use uuid::Uuid;
@@ -41,7 +41,9 @@ const SAVE_DEBOUNCE: Duration = Duration::from_millis(700);
 
 /// Opens a new main window, restoring the previous session if there is one.
 pub fn open_window(cx: &mut App) {
-    let options = window_options_at("OpenViSQL", saved_window_bounds(cx), cx);
+    let (bounds, display) = saved_window_bounds(cx).unzip();
+    let mut options = window_options_at("OpenViSQL", bounds, cx);
+    options.display_id = display;
     let requested = options.window_bounds;
     gpui_kit::open_window(options, cx, move |window, cx| {
         cx.new(|cx| AppShell::new(window, requested, cx))
@@ -65,6 +67,7 @@ pub struct AppShell {
     save_task: Option<Task<()>>,
     /// The window's latest place and size, saved with the session.
     window_geometry: Option<WindowGeometry>,
+    window: AnyWindowHandle,
     /// How much bigger the window reports itself than the size it was opened with (the title
     /// bar, on macOS). Taken off before saving, so a reopened window keeps its size.
     chrome: Size<Pixels>,
@@ -86,7 +89,7 @@ impl AppShell {
         crate::settings::apply_theme(Some(window), cx);
         // Remember where the window is and how big, whenever it moves or resizes.
         let moved = cx.observe_window_bounds(window, |this, window, cx| {
-            this.window_geometry = Some(geometry(window.window_bounds(), this.chrome));
+            this.window_geometry = Some(geometry(window, this.chrome, cx));
             this.schedule_save(cx);
         });
         // A maximized window's reported size isn't the one it was opened with.
@@ -97,9 +100,28 @@ impl AppShell {
             }
             _ => Size::default(),
         };
+        // Read where the window is as it closes or the app quits too, so the last place is kept
+        // even if a move or resize went unreported.
         let quit = cx.on_app_quit(|this: &mut Self, cx| {
+            let chrome = this.chrome;
+            if let Ok(latest) = this
+                .window
+                .update(cx, |_, window, cx| geometry(window, chrome, cx))
+            {
+                this.window_geometry = Some(latest);
+            }
             this.save_now(cx);
             async {}
+        });
+        let shell = cx.weak_entity();
+        window.on_window_should_close(cx, move |window, cx| {
+            shell
+                .update(cx, |this, cx| {
+                    this.window_geometry = Some(geometry(window, this.chrome, cx));
+                    this.save_now(cx);
+                })
+                .ok();
+            true
         });
         let mut shell = Self {
             focus_handle,
@@ -108,7 +130,8 @@ impl AppShell {
             active: 0,
             saved_tabs: HashMap::new(),
             save_task: None,
-            window_geometry: Some(geometry(window.window_bounds(), chrome)),
+            window_geometry: Some(geometry(window, chrome, cx)),
+            window: window.window_handle(),
             chrome,
             tab_fit: TabFit::default(),
             subscriptions: vec![quit, appearance, moved],
@@ -448,8 +471,18 @@ fn theme_menu(cx: &App) -> impl IntoElement {
         })
 }
 
-/// `bounds` as saved in the session file, without the window's `chrome`.
-fn geometry(bounds: WindowBounds, chrome: Size<Pixels>) -> WindowGeometry {
+/// Where `window` is, as saved in the session file: without the window's `chrome`, and with
+/// the display it's on.
+fn geometry(window: &Window, chrome: Size<Pixels>, cx: &App) -> WindowGeometry {
+    let display = window.display(cx).and_then(|d| d.uuid().ok());
+    geometry_of(window.window_bounds(), chrome, display)
+}
+
+fn geometry_of(
+    bounds: WindowBounds,
+    chrome: Size<Pixels>,
+    display: Option<Uuid>,
+) -> WindowGeometry {
     let b = bounds.get_bounds();
     WindowGeometry {
         x: f32::from(b.origin.x),
@@ -457,12 +490,25 @@ fn geometry(bounds: WindowBounds, chrome: Size<Pixels>) -> WindowGeometry {
         width: f32::from(b.size.width - chrome.width),
         height: f32::from(b.size.height - chrome.height),
         maximized: matches!(bounds, WindowBounds::Maximized(_)),
+        display,
     }
 }
 
-/// Where the main window was last time, if that's still on a connected display.
-fn saved_window_bounds(cx: &App) -> Option<WindowBounds> {
+/// Where the main window was last time, and on which display, if that display is still
+/// connected (otherwise the primary one) and the window would show on it.
+fn saved_window_bounds(cx: &App) -> Option<(WindowBounds, DisplayId)> {
     let saved = Store::default().load_session().ok()?.window?;
+    let displays = cx.displays();
+    let display = saved
+        .display
+        .and_then(|uuid| displays.iter().find(|d| d.uuid().ok() == Some(uuid)))
+        .cloned()
+        .or_else(|| cx.primary_display())?;
+    restore_bounds(&saved, display.bounds().size).map(|bounds| (bounds, display.id()))
+}
+
+/// `saved` as window bounds on a display of `display_size`, or `None` if it's unusable there.
+fn restore_bounds(saved: &WindowGeometry, display_size: Size<Pixels>) -> Option<WindowBounds> {
     // Too small to use usually means a bad file; let the default apply.
     if saved.width < 400. || saved.height < 300. {
         return None;
@@ -471,12 +517,9 @@ fn saved_window_bounds(cx: &App) -> Option<WindowBounds> {
         point(px(saved.x), px(saved.y)),
         size(px(saved.width), px(saved.height)),
     );
-    // A display that was unplugged would leave the window out of sight.
-    if !cx
-        .displays()
-        .iter()
-        .any(|display| display.bounds().intersects(&bounds))
-    {
+    // The place is relative to the display, so it has to overlap the display's own area or
+    // the window would open out of sight.
+    if !Bounds::new(point(px(0.), px(0.)), display_size).intersects(&bounds) {
         return None;
     }
     Some(if saved.maximized {
@@ -484,4 +527,53 @@ fn saved_window_bounds(cx: &App) -> Option<WindowBounds> {
     } else {
         WindowBounds::Windowed(bounds)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn saved(x: f32, y: f32, width: f32, height: f32) -> WindowGeometry {
+        WindowGeometry {
+            x,
+            y,
+            width,
+            height,
+            maximized: false,
+            display: None,
+        }
+    }
+
+    #[test]
+    fn restores_a_window_that_shows_on_its_display() {
+        let display = size(px(1470.), px(956.));
+        let bounds = restore_bounds(&saved(300., 120., 1000., 700.), display).unwrap();
+        assert_eq!(
+            bounds,
+            WindowBounds::Windowed(Bounds::new(
+                point(px(300.), px(120.)),
+                size(px(1000.), px(700.))
+            ))
+        );
+    }
+
+    #[test]
+    fn skips_a_window_off_its_display_or_too_small() {
+        let display = size(px(1470.), px(956.));
+        assert!(restore_bounds(&saved(2000., 100., 1000., 700.), display).is_none());
+        assert!(restore_bounds(&saved(10., 10., 200., 100.), display).is_none());
+    }
+
+    #[test]
+    fn saves_the_size_without_the_title_bar_and_the_display() {
+        let display = Uuid::from_u128(3);
+        let bounds = WindowBounds::Windowed(Bounds::new(
+            point(px(40.), px(60.)),
+            size(px(1280.), px(848.)),
+        ));
+        let g = geometry_of(bounds, size(px(0.), px(28.)), Some(display));
+        assert_eq!((g.x, g.y, g.width, g.height), (40., 60., 1280., 820.));
+        assert_eq!(g.display, Some(display));
+        assert!(!g.maximized);
+    }
 }

@@ -102,7 +102,8 @@ pub struct Session {
 }
 
 /// A window's place and size in logical pixels, and whether it was maximized (the place and
-/// size are then where it returns to when restored).
+/// size are then where it returns to when restored). The place is relative to the top-left of
+/// the display the window was on.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct WindowGeometry {
     pub x: f32,
@@ -111,6 +112,9 @@ pub struct WindowGeometry {
     pub height: f32,
     #[serde(default)]
     pub maximized: bool,
+    /// The display the window was on, when the platform can name it.
+    #[serde(default)]
+    pub display: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -395,6 +399,7 @@ mod tests {
                 width: 1440.,
                 height: 900.,
                 maximized: true,
+                display: Some(Uuid::from_u128(7)),
             }),
         };
         store.save_session(&session).unwrap();
