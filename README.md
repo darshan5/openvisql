@@ -209,6 +209,30 @@ See [docs/SETUP.md](docs/SETUP.md) for development setup and running the integra
 | `ovs-store` | Saved connections, passwords (keychain or encrypted file), history, session |
 | `ovs-app` | The desktop app, built with [GPUI Kit](https://gpui-kit.com) |
 
+## Related projects
+
+OpenViSQL is one of three native Rust apps for Windows and macOS built to work well for people
+and for AI agents. Each has a GUI and a headless command line, and on Windows each command line
+is its own console program (`*-cli.exe`), so cmd, PowerShell and agents get its output and exit
+code. On macOS the command line is inside the app bundle.
+
+| Project | What it is | Command line for scripts and agents |
+|---|---|---|
+| [**superfastnotepad**](https://github.com/darshan5/superfastnotepad) | Fast text and source-code editor | `superfastnotepad-cli`: `search` files (grep-style hits, CSV lines as `column: value`, newest files first), `tail --follow --until`, `lines` around a hit, `replace --dry-run`, `diff`, `info`, `convert` encodings and line endings, `format`/`minify`/`validate` JSON, XML, CSV and more, `hash`, `time`, `uuid` |
+| [**superfastimageview**](https://github.com/darshan5/superfastimageview) | Very fast image viewer with basic editing and batch conversion | `superfastimageview-cli`: `info --json`, `convert`, `resize`, `rotate` (lossless for JPEG), `flip`, `strip` metadata, `compress --target-size`; wildcards and folders expanded by the program, `--dry-run`, nothing overwritten without `--overwrite`/`--in-place` |
+| **OpenViSQL** (this project) | SQL client for MySQL, MariaDB, PostgreSQL and SQLite | `openvisql-cli`: run SQL from `--file`, `--string` or a saved `--snippet`, against a saved or ad-hoc connection; text, records, CSV, TSV, JSON or Markdown output |
+
+```
+superfastnotepad-cli search --dir C:\logs --glob "*.txt" --regex "ERROR" --out C:\temp\hits.txt
+superfastimageview-cli resize big.jpg --max 1568 -o small.jpg
+openvisql-cli --conn mydb --snippet "Order lines" --param order=1042 --out C:\temp\r.txt
+```
+
+They share the same conventions: `--out <file>` writes the result to a file, `--help` lists the
+options, and exit code 0 means success, with other codes for "nothing found" or errors (each
+project's README lists them). The superfastnotepad and superfastimageview command lines are on
+their `main` branches and ship in their next releases.
+
 ## License
 
 [MIT](LICENSE)
