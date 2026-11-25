@@ -529,13 +529,13 @@ mod tests {
             sql: sql.into(),
         };
         store
-            .upsert_snippet(snippet("Check lines", "SELECT 1"))
+            .upsert_snippet(snippet("Order lines", "SELECT 1"))
             .unwrap();
         store
             .upsert_snippet(snippet("affected rows", "SELECT 2"))
             .unwrap();
         store
-            .upsert_snippet(snippet("check LINES", "SELECT {{n}}"))
+            .upsert_snippet(snippet("order LINES", "SELECT {{n}}"))
             .unwrap();
         let all = store.load_snippets().unwrap();
         assert_eq!(all.len(), 2);

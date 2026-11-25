@@ -218,11 +218,11 @@ OpenViSQL is MIT-licensed, so its code must stay compatible with MIT:
 ## ADR-011: Remote-friendly querying: snippets, text views, read-only, command line
 
 - **Date:** 2026-11-25
-- **Context:** OpenViSQL is used on a POS server reached only through a remote-control viewer,
+- **Context:** OpenViSQL is used on servers reached only through a remote-control viewer,
   sometimes by an agent that sees the screen through screenshots and OCR. Long queries typed
   key by key were slow and fragile, the grid's small text was hard to read, a stale result
   could be mistaken for a new one, the first click on Execute was sometimes lost, and a
-  write to the POS database needed extra care.
+  write to a production database needed extra care.
 - **Decision:**
   - **Snippets** in `snippets.toml` with `{{name}}` placeholders, substituted as plain text
     (quoting is up to the snippet). F2 opens a picker (Enter runs the first match), the

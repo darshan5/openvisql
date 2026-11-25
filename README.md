@@ -48,7 +48,7 @@ the right, and results below.
   warnings, errors and timings.
 - **Saved queries** (snippets): save the editor's query with **⌘⇧K / Ctrl+Shift+K**, run one
   with **F2** (type part of its name, Enter). `{{name}}` placeholders are asked for before it
-  runs, e.g. `WHERE CheckNumber = {{check}}`; the query opens in its own tab. Stored in
+  runs, e.g. `WHERE order_id = {{order}}`; the query opens in its own tab. Stored in
   `snippets.toml`.
 - Results as a **Grid**, **Records** (one block per row, like MySQL's `\G`) or **Text** (a boxed
   plain-text table), switched above each result. The app starts on the grid; a choice holds
@@ -111,18 +111,18 @@ the right, and results below.
 a window, for scripts and for remote machines driven through a Run box:
 
 ```
-openvisql query --conn checkposting --string "SHOW DATABASES;"
-openvisql query --conn checkposting --file C:\temp\q.sql --format records --out C:\temp\r.txt
-openvisql query --conn checkposting --snippet "Check lines" --param check=46411 --out C:\temp\r.txt
+openvisql query --conn mydb --string "SHOW DATABASES;"
+openvisql query --conn mydb --file C:\temp\q.sql --format records --out C:\temp\r.txt
+openvisql query --conn mydb --snippet "Order lines" --param order=1042 --out C:\temp\r.txt
 ```
 
 - **Without a saved connection:** `--engine mysql|postgres|sqlite` with `--host`, `--port`,
   `--user`, `--password` (or `--password-file`), `--db`, and `--path` for SQLite, e.g.
-  `openvisql query --engine mysql --user dauser --password secret --db checkpostingdb
+  `openvisql query --engine mysql --user appuser --password secret --db appdb
   --string "SHOW TABLES;"`. The same flags override parts of a `--conn` connection. A plain
   `--password` is visible to other processes and kept in shell history; `--password-file` or
   `OPENVISQL_PASSWORD` avoid that.
-- **Saved queries:** `--snippet "Check lines" --param check=46411` runs one (every
+- **Saved queries:** `--snippet "Order lines" --param order=1042` runs one (every
   `{{placeholder}}` needs a `--param`, and an unknown `--param` is an error).
   `--list-snippets` lists them with their parameters; `--save-snippet <name>` with `--file` or
   `--string` adds or replaces one; `--delete-snippet <name>` removes one. They're the same

@@ -51,9 +51,9 @@ fn rows<'a>(
 ///
 /// ```text
 /// +---------+-------------+
-/// | CheckID | CheckNumber |
+/// | id      | order_id    |
 /// +---------+-------------+
-/// |  199369 |       46411 |
+/// |    1042 |       20871 |
 /// +---------+-------------+
 /// ```
 ///
@@ -129,8 +129,8 @@ pub fn text_table(rs: &ResultSet, order: Option<&[usize]>, max_cell_chars: usize
 ///
 /// ```text
 /// *************************** 1. row ***************************
-///     CheckID: 199369
-/// CheckNumber: 46411
+///       id: 1042
+/// order_id: 20871
 /// ```
 ///
 /// Multi-line values keep their line breaks, indented under the value. Values longer than

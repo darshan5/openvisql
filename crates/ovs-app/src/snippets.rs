@@ -392,7 +392,7 @@ struct SaveForm {
 
 impl SaveForm {
     fn new(sql: String, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let name = cx.new(|cx| InputState::new(window, cx).placeholder("Name, e.g. Check lines"));
+        let name = cx.new(|cx| InputState::new(window, cx).placeholder("Name, e.g. Order lines"));
         Self {
             sql,
             name,
@@ -478,15 +478,15 @@ mod tests {
     #[test]
     fn name_matches_come_before_sql_matches() {
         let all = [
-            s("Affected rows", "SELECT * FROM check_detail"),
-            s("Check lines", "SELECT 1"),
+            s("Affected rows", "SELECT * FROM order_items"),
+            s("Order lines", "SELECT 1"),
             s("Tenders", "SELECT 2"),
         ];
-        let names: Vec<&str> = matching(&all, "CHECK")
+        let names: Vec<&str> = matching(&all, "ORDER")
             .iter()
             .map(|s| s.name.as_str())
             .collect();
-        assert_eq!(names, ["Check lines", "Affected rows"]);
+        assert_eq!(names, ["Order lines", "Affected rows"]);
         assert_eq!(matching(&all, "  ").len(), 3);
         assert_eq!(matching(&all, "nothing").len(), 0);
     }

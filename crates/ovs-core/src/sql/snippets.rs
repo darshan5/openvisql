@@ -66,9 +66,9 @@ mod tests {
 
     #[test]
     fn finds_each_parameter_once_in_order() {
-        let sql = "SELECT * FROM checks WHERE CheckNumber = {{check}} \
-                   AND RevCtrID = {{ rvc }} OR CheckNumber = {{check}}";
-        assert_eq!(params(sql), ["check", "rvc"]);
+        let sql = "SELECT * FROM orders WHERE order_id = {{order}} \
+                   AND store_id = {{ store }} OR order_id = {{order}}";
+        assert_eq!(params(sql), ["order", "store"]);
     }
 
     #[test]
@@ -83,15 +83,15 @@ mod tests {
     #[test]
     fn fills_everywhere_including_quotes() {
         let values = HashMap::from([
-            ("check".to_owned(), "46411".to_owned()),
+            ("order".to_owned(), "1042".to_owned()),
             ("name".to_owned(), "Cash".to_owned()),
         ]);
         assert_eq!(
             fill(
-                "WHERE n = {{check}} AND t = '{{ name }}' AND m = {{check}} AND x = {{other}}",
+                "WHERE n = {{order}} AND t = '{{ name }}' AND m = {{order}} AND x = {{other}}",
                 &values
             ),
-            "WHERE n = 46411 AND t = 'Cash' AND m = 46411 AND x = {{other}}"
+            "WHERE n = 1042 AND t = 'Cash' AND m = 1042 AND x = {{other}}"
         );
     }
 

@@ -70,11 +70,11 @@ On Windows, nothing reaches the console: use --out, or redirect with
 > out.txt 2>&1.
 
 Examples:
-  openvisql query --conn checkposting --string \"SHOW DATABASES;\"
-  openvisql query --engine mysql --user dauser --password secret --db checkpostingdb --string \"SHOW TABLES;\"
+  openvisql query --conn mydb --string \"SHOW DATABASES;\"
+  openvisql query --engine mysql --user appuser --password secret --db appdb --string \"SHOW TABLES;\"
   openvisql query --engine sqlite --path C:\\data\\test.db --string \"SELECT 1;\"
-  openvisql query --conn checkposting --file C:\\temp\\q.sql --format records --out C:\\temp\\r.txt
-  openvisql query --conn checkposting --snippet \"Check lines\" --param check=46411 --out C:\\temp\\r.txt
+  openvisql query --conn mydb --file C:\\temp\\q.sql --format records --out C:\\temp\\r.txt
+  openvisql query --conn mydb --snippet \"Order lines\" --param order=1042 --out C:\\temp\\r.txt
 ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -777,7 +777,7 @@ mod tests {
     fn parses_a_string_query() {
         let parsed = parse(&args(&[
             "--conn",
-            "checkposting",
+            "mydb",
             "--string",
             "SHOW DATABASES;",
             "--format",
@@ -786,7 +786,7 @@ mod tests {
             "r.txt",
         ]))
         .unwrap();
-        assert_eq!(parsed.conn.as_deref(), Some("checkposting"));
+        assert_eq!(parsed.conn.as_deref(), Some("mydb"));
         assert_eq!(parsed.source, Source::Text("SHOW DATABASES;".into()));
         assert_eq!(parsed.format, Format::Records);
         assert_eq!(parsed.out, Some(PathBuf::from("r.txt")));
@@ -814,24 +814,24 @@ mod tests {
             "--port",
             "3307",
             "--user",
-            "dauser",
+            "appuser",
             "--password",
             "s3cret",
             "--db",
-            "checkpostingdb",
+            "appdb",
             "--string",
             "SHOW TABLES",
         ]))
         .unwrap();
         assert_eq!(parsed.conn, None);
-        assert_eq!(parsed.database.as_deref(), Some("checkpostingdb"));
+        assert_eq!(parsed.database.as_deref(), Some("appdb"));
         assert_eq!(
             parsed.direct,
             Direct {
                 engine: Some(Engine::MySql),
                 host: Some("db.local".into()),
                 port: Some(3307),
-                user: Some("dauser".into()),
+                user: Some("appuser".into()),
                 password: Some("s3cret".into()),
                 ..Direct::default()
             }
@@ -850,10 +850,10 @@ mod tests {
     fn builds_configs_from_flags() {
         let mysql = Direct {
             engine: Some(Engine::MySql),
-            user: Some("dauser".into()),
+            user: Some("appuser".into()),
             ..Direct::default()
         };
-        let config = build_config(None, &mysql, Some("checkpostingdb")).unwrap();
+        let config = build_config(None, &mysql, Some("appdb")).unwrap();
         assert_eq!(
             (
                 config.engine,
@@ -861,7 +861,7 @@ mod tests {
                 config.port,
                 config.user.as_str()
             ),
-            (Engine::MySql, "localhost", 3306, "dauser")
+            (Engine::MySql, "localhost", 3306, "appuser")
         );
         assert!(config.safe_updates && !config.read_only && !config.save_password);
         // MySQL switches with USE; PostgreSQL connects to the database.
@@ -880,7 +880,7 @@ mod tests {
         assert!(build_config(None, &lite, None).is_err());
         // Flags override a saved connection, keeping the rest.
         let saved = ConnectionConfig {
-            name: "checkposting".into(),
+            name: "mydb".into(),
             host: "10.0.0.5".into(),
             port: 3306,
             read_only: true,
@@ -916,9 +916,9 @@ mod tests {
             "--conn",
             "c",
             "--snippet",
-            "Check lines",
+            "Order lines",
             "--param",
-            "check=46411",
+            "order=1042",
             "--param",
             "note=a=b",
         ]))
@@ -926,9 +926,9 @@ mod tests {
         assert_eq!(
             parsed.source,
             Source::Snippet {
-                name: "Check lines".into(),
+                name: "Order lines".into(),
                 params: vec![
-                    ("check".into(), "46411".into()),
+                    ("order".into(), "1042".into()),
                     ("note".into(), "a=b".into())
                 ],
             }
@@ -987,21 +987,21 @@ mod tests {
     #[test]
     fn resolves_snippets_strictly() {
         let saved = [ovs_store::Snippet {
-            name: "Check lines".into(),
-            sql: "SELECT * FROM checks WHERE CheckNumber = {{check}}".into(),
+            name: "Order lines".into(),
+            sql: "SELECT * FROM orders WHERE order_id = {{order}}".into(),
         }];
         let p = |n: &str, v: &str| (n.to_owned(), v.to_owned());
         assert_eq!(
-            resolve_snippet(&saved, "check LINES", &[p("check", "46411")]).unwrap(),
-            "SELECT * FROM checks WHERE CheckNumber = 46411"
+            resolve_snippet(&saved, "order LINES", &[p("order", "1042")]).unwrap(),
+            "SELECT * FROM orders WHERE order_id = 1042"
         );
-        let missing = resolve_snippet(&saved, "Check lines", &[]).unwrap_err();
-        assert!(missing.contains("--param check="), "{missing}");
+        let missing = resolve_snippet(&saved, "Order lines", &[]).unwrap_err();
+        assert!(missing.contains("--param order="), "{missing}");
         let unknown =
-            resolve_snippet(&saved, "Check lines", &[p("check", "1"), p("chek", "2")]).unwrap_err();
-        assert!(unknown.contains("{{chek}}"), "{unknown}");
+            resolve_snippet(&saved, "Order lines", &[p("order", "1"), p("ordr", "2")]).unwrap_err();
+        assert!(unknown.contains("{{ordr}}"), "{unknown}");
         let none = resolve_snippet(&saved, "nope", &[]).unwrap_err();
-        assert!(none.contains("saved: Check lines"), "{none}");
+        assert!(none.contains("saved: Order lines"), "{none}");
     }
 
     #[test]
@@ -1017,11 +1017,11 @@ mod tests {
     #[test]
     fn finds_connections_by_name_or_id() {
         let c = ConnectionConfig {
-            name: "CheckPosting".into(),
+            name: "MyDb".into(),
             ..ConnectionConfig::default()
         };
         let id = c.id.to_string();
-        assert!(find_connection(vec![c.clone()], "checkposting").is_some());
+        assert!(find_connection(vec![c.clone()], "mydb").is_some());
         assert!(find_connection(vec![c.clone()], &id).is_some());
         assert!(find_connection(vec![c], "other").is_none());
     }

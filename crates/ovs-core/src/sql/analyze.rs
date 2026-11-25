@@ -259,13 +259,13 @@ mod tests {
     fn counts_rows_an_update_would_touch() {
         assert_eq!(
             affected_rows_query(
-                "UPDATE menu_item_detail SET MenuItemDefID = 6839480 \
-                 WHERE MenuItemDtlID IN (1, 2) AND MenuItemDefID = 8240555;"
+                "UPDATE order_items SET product_id = 20 \
+                 WHERE item_id IN (1, 2) AND product_id = 10;"
             )
             .as_deref(),
             Some(
-                "SELECT COUNT(*) FROM menu_item_detail \
-                 WHERE MenuItemDtlID IN (1, 2) AND MenuItemDefID = 8240555"
+                "SELECT COUNT(*) FROM order_items \
+                 WHERE item_id IN (1, 2) AND product_id = 10"
             )
         );
         assert_eq!(

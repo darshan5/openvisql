@@ -2346,7 +2346,7 @@ fn grid_size(font_size: f32) -> gpui_kit::component::Size {
 }
 
 /// The line above a result: when it ran and what ran, e.g.
-/// `20:37:12 · SELECT mi.MenuItemDtlID, d.CheckID … FROM menu_item_detail mi …`.
+/// `20:37:12 · SELECT o.order_id, o.total … FROM orders o …`.
 fn render_result_header(result: &ResultTab, font_size: f32, cx: &App) -> impl IntoElement {
     let theme = cx.theme();
     h_flex()
