@@ -6,6 +6,7 @@
 
 mod backup;
 mod browser;
+mod cli;
 mod completion;
 mod connect;
 mod copy_dialog;
@@ -21,6 +22,7 @@ mod runtime;
 mod settings;
 mod shell;
 mod shortcuts;
+mod snippets;
 mod tab_fit;
 mod update;
 mod users;
@@ -55,6 +57,11 @@ actions!(
         ThemeLight,
         ThemeDark,
         OpenUpdate,
+        ZoomResultsIn,
+        ZoomResultsOut,
+        ZoomResultsReset,
+        OpenSnippets,
+        SaveSnippet,
         Quit
     ]
 );
@@ -107,6 +114,10 @@ pub fn set_menus(cx: &mut App) {
                 MenuItem::action("Appearance: Match System", ThemeSystem),
                 MenuItem::action("Appearance: Light", ThemeLight),
                 MenuItem::action("Appearance: Dark", ThemeDark),
+                MenuItem::separator(),
+                MenuItem::action("Bigger Results Text", ZoomResultsIn),
+                MenuItem::action("Smaller Results Text", ZoomResultsOut),
+                MenuItem::action("Default Results Text Size", ZoomResultsReset),
             ],
             disabled: false,
         },
@@ -116,6 +127,9 @@ pub fn set_menus(cx: &mut App) {
                 MenuItem::action("Execute Current Statement", ExecuteCurrent),
                 MenuItem::action("Execute All", ExecuteAll),
                 MenuItem::action("Stop", StopQuery),
+                MenuItem::separator(),
+                MenuItem::action("Saved Queries…", OpenSnippets),
+                MenuItem::action("Save Query as Snippet…", SaveSnippet),
                 MenuItem::separator(),
                 MenuItem::action("Refresh Object Browser", RefreshBrowser),
             ],
@@ -161,6 +175,11 @@ pub fn window_options_at(
 }
 
 fn main() {
+    // `openvisql query …` runs SQL from the command line and exits without opening a window.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("query") {
+        std::process::exit(cli::main(&args[1..]));
+    }
     gpui_kit::application()
         .with_assets(gpui_kit::assets::Assets)
         .run(|cx| {

@@ -35,6 +35,8 @@ use ovs_core::{
 };
 use ovs_store::{HistoryEntry, SavedQueryTab, Store};
 
+use crate::settings::ResultView;
+
 use crate::completion::{CompletionSource, SqlCompletions};
 use crate::export_dialog::ExportForm;
 use crate::grid::{Editability, KillProcess, OpenValue, ResultGrid, ServerSort};
@@ -46,6 +48,12 @@ const MAX_FETCH_ROWS: usize = 50_000;
 const VALUE_HEX_PREVIEW: usize = 64 * 1024;
 /// Longest statement text shown in the Messages tab.
 const MESSAGE_SQL_CHARS: usize = 400;
+/// Longest statement text in the line above a result.
+const HEADER_SQL_CHARS: usize = 160;
+/// Rows shown in the records and text views; the grid (or Export) has the rest.
+const TEXT_VIEW_ROWS: usize = 1_000;
+/// Longest value in the records and text views.
+const TEXT_VIEW_CELL_CHARS: usize = 500;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum RunMode {
@@ -79,6 +87,11 @@ enum SessionState {
 
 struct ResultTab {
     label: SharedString,
+    /// Local time the statement finished, e.g. `20:37:12`, shown above the result so an old
+    /// result is never mistaken for a new one.
+    executed_at: SharedString,
+    /// The statement that produced the result, on one line.
+    statement: SharedString,
     table: Entity<TableState<ResultGrid>>,
     rows: usize,
     elapsed: Duration,
@@ -137,6 +150,8 @@ struct Limits {
 /// Summary of the last run, shown in the status bar.
 #[derive(Clone, Default)]
 pub struct RunSummary {
+    /// Local time the run finished, e.g. `20:37:12`.
+    pub finished_at: String,
     pub statements: usize,
     pub errors: usize,
     pub elapsed: Duration,
@@ -401,6 +416,18 @@ impl QueryTab {
         }
     }
 
+    /// The selected text, or the whole editor when nothing is selected.
+    pub fn selection_or_all(&self, cx: &gpui_kit::App) -> String {
+        let editor = self.editor.read(cx);
+        let text = editor.value();
+        let selection = editor.selected_range();
+        if selection.is_empty() {
+            text.to_string()
+        } else {
+            text[selection].to_owned()
+        }
+    }
+
     pub fn database(&self) -> Option<&str> {
         self.database.as_deref()
     }
@@ -521,6 +548,28 @@ impl QueryTab {
             return;
         }
 
+        if self.config.read_only {
+            let writes = statements
+                .iter()
+                .filter(|s| sql::classify(&s.sql).is_write())
+                .count();
+            if writes > 0 {
+                let message = format!(
+                    "Not run: this connection is read-only, and {writes} statement{} would \
+                     change data or schema. Turn off \u{201c}Read-only\u{201d} in the \
+                     connection's settings to write.",
+                    if writes == 1 { "" } else { "s" }
+                );
+                self.results.clear();
+                self.reports.clear();
+                self.push_note(message.clone());
+                self.active_result = 0;
+                window.push_notification(message, cx);
+                cx.notify();
+                return;
+            }
+        }
+
         let unsafe_count = statements
             .iter()
             .filter(|s| sql::missing_where(&s.sql))
@@ -545,14 +594,109 @@ impl QueryTab {
                     .ok_variant(ButtonVariant::Danger)
                     .on_ok(move |_, window, cx| {
                         let statements = statements.clone();
-                        this.update(cx, |this, cx| this.run(statements, window, cx))
+                        this.update(cx, |this, cx| this.confirm_then_run(statements, window, cx))
                             .ok();
                         true
                     })
             });
             return;
         }
-        self.run(statements, window, cx);
+        self.confirm_then_run(statements, window, cx);
+    }
+
+    /// Runs `statements`, first asking to confirm with a count of the rows each UPDATE and
+    /// DELETE would touch when the connection asks for that ("Preview affected rows").
+    fn confirm_then_run(
+        &mut self,
+        statements: Vec<Statement>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let writes: Vec<(usize, Option<String>)> = if self.config.confirm_writes {
+            statements
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| {
+                    matches!(
+                        sql::classify(&s.sql),
+                        StatementKind::Update | StatementKind::Delete
+                    )
+                })
+                .map(|(ix, s)| (ix, sql::affected_rows_query(&s.sql)))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let SessionState::Ready { session, .. } = &self.session else {
+            return;
+        };
+        if writes.is_empty() {
+            self.run(statements, window, cx);
+            return;
+        }
+        let session = session.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let mut counts = Vec::new();
+            for (ix, count_sql) in writes {
+                let count = match count_sql {
+                    Some(count_sql) => {
+                        let session = session.clone();
+                        runtime::run(async move {
+                            let out = session.lock().await.execute(&count_sql, None).await;
+                            out.ok().and_then(|o| first_count(&o))
+                        })
+                        .await
+                    }
+                    None => None,
+                };
+                counts.push((ix, count));
+            }
+            this.update_in(cx, |_, window, cx| {
+                Self::open_write_confirmation(statements, &counts, window, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// "This will change N rows" for each UPDATE/DELETE, with Run and Cancel.
+    fn open_write_confirmation(
+        statements: Vec<Statement>,
+        counts: &[(usize, Option<u64>)],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let lines: Vec<String> = counts
+            .iter()
+            .map(|(ix, count)| {
+                let what = one_line_sql(&statements[*ix].sql, 90);
+                match count {
+                    Some(n) => format!(
+                        "{} row{} \u{2014} {what}",
+                        thousands(*n),
+                        if *n == 1 { "" } else { "s" }
+                    ),
+                    None => format!("couldn't count \u{2014} {what}"),
+                }
+            })
+            .collect();
+        let description = lines.join("\n");
+        let this = cx.entity().downgrade();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let (this, statements) = (this.clone(), statements.clone());
+            alert
+                .title("Run these changes?")
+                .description(description.clone())
+                .confirm()
+                .ok_text("Run")
+                .ok_variant(ButtonVariant::Danger)
+                .on_ok(move |_, window, cx| {
+                    let statements = statements.clone();
+                    this.update(cx, |this, cx| this.run(statements, window, cx))
+                        .ok();
+                    true
+                })
+        });
     }
 
     fn run(&mut self, statements: Vec<Statement>, window: &mut Window, cx: &mut Context<Self>) {
@@ -613,14 +757,7 @@ impl QueryTab {
                     let session = session.clone();
                     runtime::run(async move {
                         let out = session.lock().await.execute(&count_sql, None).await.ok()?;
-                        match out.first()? {
-                            QueryOutcome::Rows(rs) => match rs.rows.first()?.first()? {
-                                Value::Int(n) => u64::try_from(*n).ok(),
-                                Value::UInt(n) => Some(*n),
-                                other => other.to_string().parse().ok(),
-                            },
-                            QueryOutcome::Affected { .. } => None,
-                        }
+                        first_count(&out)
                     })
                     .await
                 } else {
@@ -727,15 +864,23 @@ impl QueryTab {
         let dialect = self.config.engine.dialect();
         let rows = rs.rows.len();
         let truncated = rs.truncated;
-        let source = limits.source_sql.clone().zip(single_source_table(&rs));
+        // Nothing is editable on a read-only connection.
+        let read_only = self.config.read_only;
+        let source = limits
+            .source_sql
+            .clone()
+            .filter(|_| !read_only)
+            .zip(single_source_table(&rs));
         // A join can still be edited one table at a time; the user picks which.
-        let edit_tables = if limits.source_sql.is_some() {
+        let edit_tables = if limits.source_sql.is_some() && !read_only {
             source_tables(&rs)
         } else {
             Vec::new()
         };
         let editability = if source.is_some() {
             Editability::Checking
+        } else if read_only {
+            Editability::ReadOnly("the connection is read-only".into())
         } else if limits.source_sql.is_none() {
             Editability::ReadOnly("only SELECT results can be edited".into())
         } else if edit_tables.len() > 1 {
@@ -817,6 +962,8 @@ impl QueryTab {
             } else {
                 format!("Results {n}").into()
             },
+            executed_at: clock_time().into(),
+            statement: one_line_sql(&limits.statement, HEADER_SQL_CHARS).into(),
             table,
             rows,
             elapsed,
@@ -962,6 +1109,7 @@ impl QueryTab {
                     }
                 }
                 this.last_run = Some(RunSummary {
+                    finished_at: clock_time(),
                     statements: this.reports.len(),
                     errors: this.reports.iter().filter(|r| r.error.is_some()).count(),
                     elapsed: started.elapsed(),
@@ -1758,6 +1906,27 @@ impl QueryTab {
                     .on_click(cx.listener(|this, _, _, cx| this.add_row(cx))),
             );
         }
+        let current = crate::settings::result_view(cx);
+        for (id, view, label, tip) in [
+            ("view-grid", ResultView::Grid, "Grid", "Editable grid"),
+            (
+                "view-records",
+                ResultView::Records,
+                "Records",
+                "One block per row (like \\G)",
+            ),
+            ("view-text", ResultView::Text, "Text", "Plain-text table"),
+        ] {
+            let button = Button::new(id).xsmall().label(label).tooltip(tip);
+            let button = if view == current {
+                button.primary()
+            } else {
+                button.ghost()
+            };
+            row = row.child(button.on_click(move |_, _, cx| {
+                crate::settings::set_result_view(view, cx);
+            }));
+        }
         row.child(
             Button::new("export")
                 .ghost()
@@ -1877,6 +2046,7 @@ impl QueryTab {
         self.running = None;
         let errors = self.reports.iter().filter(|r| r.error.is_some()).count();
         self.last_run = Some(RunSummary {
+            finished_at: clock_time(),
             statements: self.reports.len(),
             errors,
             elapsed,
@@ -1923,8 +2093,13 @@ impl QueryTab {
         let header = if self.reports.is_empty() {
             "No statements executed yet.".to_owned()
         } else {
+            let at = self
+                .last_run
+                .as_ref()
+                .map(|r| format!("{} · ", r.finished_at))
+                .unwrap_or_default();
             format!(
-                "{} statement(s) executed, {} succeeded, {} failed",
+                "{at}{} statement(s) executed, {} succeeded, {} failed",
                 self.reports.len(),
                 self.reports.len() - errors,
                 errors
@@ -2026,6 +2201,35 @@ fn sql_is_note(report: &StatementReport) -> bool {
     report.sql.is_empty()
 }
 
+/// The number in the first cell of the first result, as `SELECT COUNT(*)` returns it.
+fn first_count(outcomes: &[QueryOutcome]) -> Option<u64> {
+    match outcomes.first()? {
+        QueryOutcome::Rows(rs) => match rs.rows.first()?.first()? {
+            Value::Int(n) => u64::try_from(*n).ok(),
+            Value::UInt(n) => Some(*n),
+            other => other.to_string().parse().ok(),
+        },
+        QueryOutcome::Affected { .. } => None,
+    }
+}
+
+/// The local time now, e.g. `20:37:12`.
+pub fn clock_time() -> String {
+    chrono::Local::now().format("%H:%M:%S").to_string()
+}
+
+/// `sql` on one line (runs of whitespace collapsed), cut to `max` characters with `…`.
+fn one_line_sql(sql: &str, max: usize) -> String {
+    let flat = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max {
+        flat
+    } else {
+        let mut out: String = flat.chars().take(max.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
+}
+
 pub fn format_duration(d: Duration) -> String {
     if d < Duration::from_secs(1) {
         format!("{} ms", d.as_millis())
@@ -2049,16 +2253,24 @@ impl Render for QueryTab {
             self.render_result_actions(result, active, cx)
                 .into_any_element()
         });
+        let view = crate::settings::result_view(cx);
+        let font_size = crate::settings::prefs(cx).results_font_size;
         let body = if let Some(result) = self.results.get(active) {
+            let content = match view {
+                ResultView::Grid => {
+                    render_result_grid(&result.table, font_size, cx).into_any_element()
+                }
+                ResultView::Records | ResultView::Text => {
+                    render_result_text(result, view, font_size, cx).into_any_element()
+                }
+            };
             v_flex()
                 .size_full()
-                .children(self.render_filter_bar(active, cx))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .child(render_result_grid(&result.table, cx)),
-                )
+                .child(render_result_header(result, font_size, cx))
+                .when(view == ResultView::Grid, |el| {
+                    el.children(self.render_filter_bar(active, cx))
+                })
+                .child(div().flex_1().min_h_0().child(content))
                 .child(Self::render_result_footer(result, active, cx))
                 .into_any_element()
         } else {
@@ -2120,6 +2332,98 @@ impl Render for QueryTab {
     }
 }
 
+/// Row height for the results text size: rows grow with the text so it isn't clipped.
+fn grid_size(font_size: f32) -> gpui_kit::component::Size {
+    use gpui_kit::component::Size;
+    if font_size <= 13.0 {
+        Size::Small
+    } else if font_size <= 16.0 {
+        Size::Medium
+    } else {
+        Size::Large
+    }
+}
+
+/// The line above a result: when it ran and what ran, e.g.
+/// `20:37:12 · SELECT mi.MenuItemDtlID, d.CheckID … FROM menu_item_detail mi …`.
+fn render_result_header(result: &ResultTab, font_size: f32, cx: &App) -> impl IntoElement {
+    let theme = cx.theme();
+    h_flex()
+        .px_2()
+        .py_0p5()
+        .gap_2()
+        .border_b_1()
+        .border_color(theme.border)
+        .text_size(px((font_size - 1.0).max(10.0)))
+        .child(
+            div()
+                .flex_none()
+                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                .child(format!("Executed {}", result.executed_at)),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .font_family(theme.mono_font_family.clone())
+                .child(result.statement.clone()),
+        )
+}
+
+/// The records (`\G`-style) or boxed-table view of a result: plain monospace text in full
+/// contrast, easy to read in a screenshot.
+fn render_result_text(
+    result: &ResultTab,
+    view: ResultView,
+    font_size: f32,
+    cx: &App,
+) -> impl IntoElement {
+    let grid = result.table.read(cx).delegate();
+    let data = grid.data();
+    let order = grid.display_order();
+    let shown = &order[..order.len().min(TEXT_VIEW_ROWS)];
+    let mut text = match view {
+        ResultView::Records => {
+            ovs_core::plain_text::records(data, Some(shown), TEXT_VIEW_CELL_CHARS)
+        }
+        _ => ovs_core::plain_text::text_table(data, Some(shown), TEXT_VIEW_CELL_CHARS),
+    };
+    if shown.len() < order.len() {
+        let _ = write!(
+            text,
+            "\n(first {} of {} rows; the grid and Export have them all)",
+            thousands(shown.len() as u64),
+            thousands(order.len() as u64)
+        );
+    }
+    let theme = cx.theme();
+    div()
+        .id("result-text")
+        .size_full()
+        .overflow_scroll()
+        .p_2()
+        .bg(theme.background)
+        .text_color(theme.foreground)
+        .font_family(theme.mono_font_family.clone())
+        .text_size(px(font_size))
+        .child(v_flex().children(text.lines().map(|line| {
+            div()
+                .flex_none()
+                .whitespace_nowrap()
+                .child(keep_indent(line))
+        })))
+}
+
+/// `line` with its leading spaces made non-breaking: plain leading spaces render narrower than
+/// a monospace cell, which knocks the records view's right-aligned names out of line.
+fn keep_indent(line: &str) -> String {
+    let body = line.trim_start_matches(' ');
+    let indent = line.len() - body.len();
+    format!("{}{body}", "\u{a0}".repeat(indent))
+}
+
 /// Asks where to save and writes a binary value there.
 fn save_bytes_to_file(bytes: Vec<u8>, cx: &mut gpui_kit::App) {
     let dir = dirs::download_dir()
@@ -2174,15 +2478,19 @@ fn load_bytes_from_file(
 /// The result grid with its scroll bars in gutters of their own along the right and bottom
 /// edges, rather than the table's overlay ones: they are always there, even when the rows
 /// don't fill the grid, and never cover the last row or column.
-fn render_result_grid(table: &Entity<TableState<ResultGrid>>, cx: &App) -> impl IntoElement {
-    use gpui_kit::component::Size;
+fn render_result_grid(
+    table: &Entity<TableState<ResultGrid>>,
+    font_size: f32,
+    cx: &App,
+) -> impl IntoElement {
     use gpui_kit::component::table::TableDelegate as _;
 
     let state = table.read(cx);
     // Without rows the table doesn't lay out its list, so the vertical handle is stale.
     let has_rows = state.delegate().rows_count(cx) > 0;
+    let size = grid_size(font_size);
     // The rows' viewport starts below the column headings (one row, at the grid's size).
-    let heading = Size::Small.table_row_height();
+    let heading = size.table_row_height();
     let gutter = Scrollbar::width();
     let track = cx.theme().muted;
     let border = cx.theme().border;
@@ -2195,12 +2503,17 @@ fn render_result_grid(table: &Entity<TableState<ResultGrid>>, cx: &App) -> impl 
                 .flex_1()
                 .min_h_0()
                 .child(
-                    div().flex_1().min_w_0().h_full().child(
-                        DataTable::new(table)
-                            .small()
-                            .stripe(true)
-                            .scrollbar_visible(false, false),
-                    ),
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .text_size(px(font_size))
+                        .child(
+                            DataTable::new(table)
+                                .with_size(size)
+                                .stripe(true)
+                                .scrollbar_visible(false, false),
+                        ),
                 )
                 .child(
                     div()
@@ -2258,6 +2571,18 @@ fn render_result_grid(table: &Entity<TableState<ResultGrid>>, cx: &App) -> impl 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn leading_spaces_become_non_breaking() {
+        assert_eq!(keep_indent("  id: 1"), "\u{a0}\u{a0}id: 1");
+        assert_eq!(keep_indent("| a  b |"), "| a  b |");
+    }
+
+    #[test]
+    fn one_line_sql_collapses_and_cuts() {
+        assert_eq!(one_line_sql("SELECT *\n  FROM t\n", 100), "SELECT * FROM t");
+        assert_eq!(one_line_sql("SELECT abcdef", 8), "SELECT …");
+    }
 
     #[test]
     fn thousands_separators() {

@@ -207,6 +207,11 @@ impl ResultGrid {
         &self.data
     }
 
+    /// Rows of [`Self::data`] in the order the grid shows them (after sorting).
+    pub fn display_order(&self) -> &[usize] {
+        &self.order
+    }
+
     pub fn editability(&self) -> &Editability {
         &self.editability
     }
@@ -442,6 +447,22 @@ impl TableDelegate for ResultGrid {
                 .order
                 .sort_by(|&a, &b| rows[b][col_ix].sort_cmp(&rows[a][col_ix])),
         }
+    }
+
+    /// Column headings in the main text colour (black in light mode, white in dark), rather
+    /// than the table's muted heading colour.
+    fn render_th(
+        &mut self,
+        col_ix: usize,
+        _: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> impl IntoElement {
+        div().size_full().text_color(cx.theme().foreground).child(
+            self.columns
+                .get(col_ix)
+                .map(|c| c.name.clone())
+                .unwrap_or_default(),
+        )
     }
 
     fn render_td(

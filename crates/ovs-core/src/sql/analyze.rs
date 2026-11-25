@@ -24,6 +24,11 @@ impl StatementKind {
     pub fn changes_schema(&self) -> bool {
         matches!(self, Self::Ddl)
     }
+
+    /// Statements that change data or schema, which a read-only connection refuses.
+    pub fn is_write(&self) -> bool {
+        matches!(self, Self::Insert | Self::Update | Self::Delete | Self::Ddl)
+    }
 }
 
 /// Words (upper-cased) at nesting depth 0, ignoring trivia.
@@ -164,9 +169,165 @@ pub fn missing_where(sql: &str) -> bool {
         && !top_level_words(sql).iter().any(|w| w == "WHERE")
 }
 
+/// A `SELECT COUNT(*)` over the rows an `UPDATE` or `DELETE` would touch: its tables and its
+/// own `WHERE`, without `SET`, `ORDER BY`, `LIMIT` or `RETURNING`. Used to preview a write
+/// ("This will change 6 rows") before running it.
+///
+/// For multi-table statements the count is of joined rows, which can exceed the rows changed.
+/// Returns `None` for other statements, and for forms it can't rewrite reliably (`DELETE …
+/// USING`, statements starting with `WITH`).
+pub fn affected_rows_query(sql: &str) -> Option<String> {
+    let kind = classify(sql);
+    if !matches!(kind, StatementKind::Update | StatementKind::Delete) {
+        return None;
+    }
+    let tokens: Vec<_> = tokenize(sql)
+        .into_iter()
+        .filter(|t| !t.kind.is_trivia())
+        .collect();
+    // Top-level words with their token index.
+    let mut depth = 0i32;
+    let mut top: Vec<(usize, String)> = Vec::new();
+    for (i, tok) in tokens.iter().enumerate() {
+        match tok.kind {
+            TokenKind::Punct if tok.text(sql) == "(" => depth += 1,
+            TokenKind::Punct if tok.text(sql) == ")" => depth -= 1,
+            TokenKind::Word if depth == 0 => top.push((i, tok.text(sql).to_ascii_uppercase())),
+            _ => {}
+        }
+    }
+    let find = |word: &str, after: usize| {
+        top.iter()
+            .find(|(i, w)| *i > after && w == word)
+            .map(|(i, _)| *i)
+    };
+    // Where the WHERE clause (or the table list, without one) stops.
+    let tail_start = |after: usize| {
+        top.iter()
+            .find(|(i, w)| *i > after && matches!(w.as_str(), "ORDER" | "LIMIT" | "RETURNING"))
+            .map_or(sql.trim_end().trim_end_matches(';').len(), |(i, _)| {
+                tokens[*i].range.start
+            })
+    };
+    let text = |from: usize, to: usize| sql[from..to].trim().to_owned();
+    let where_clause = |where_ix: Option<usize>| {
+        where_ix.map(|w| {
+            let end = tail_start(w);
+            text(tokens[w].range.start, end)
+        })
+    };
+    let first = top.first()?.0;
+
+    let (tables, where_ix) = if kind == StatementKind::Update {
+        const MODIFIERS: [&str; 3] = ["LOW_PRIORITY", "IGNORE", "ONLY"];
+        let start = tokens[first + 1..]
+            .iter()
+            .position(|t| !MODIFIERS.contains(&t.text(sql).to_ascii_uppercase().as_str()))
+            .map(|p| first + 1 + p)?;
+        let set = find("SET", start)?;
+        let where_ix = find("WHERE", set);
+        let mut tables = text(tokens[start].range.start, tokens[set].range.start);
+        // PostgreSQL: UPDATE t SET … FROM other WHERE …
+        if let Some(from) = find("FROM", set).filter(|f| where_ix.is_none_or(|w| *f < w)) {
+            let end = where_ix.map_or_else(|| tail_start(from), |w| tokens[w].range.start);
+            tables = format!("{tables}, {}", text(tokens[from].range.end, end));
+        }
+        (tables, where_ix)
+    } else {
+        let from = find("FROM", first)?;
+        if find("USING", from).is_some() {
+            return None;
+        }
+        let where_ix = find("WHERE", from);
+        let end = where_ix.map_or_else(|| tail_start(from), |w| tokens[w].range.start);
+        (text(tokens[from].range.end, end), where_ix)
+    };
+    if tables.is_empty() {
+        return None;
+    }
+    Some(match where_clause(where_ix) {
+        Some(clause) => format!("SELECT COUNT(*) FROM {tables} {clause}"),
+        None => format!("SELECT COUNT(*) FROM {tables}"),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn counts_rows_an_update_would_touch() {
+        assert_eq!(
+            affected_rows_query(
+                "UPDATE menu_item_detail SET MenuItemDefID = 6839480 \
+                 WHERE MenuItemDtlID IN (1, 2) AND MenuItemDefID = 8240555;"
+            )
+            .as_deref(),
+            Some(
+                "SELECT COUNT(*) FROM menu_item_detail \
+                 WHERE MenuItemDtlID IN (1, 2) AND MenuItemDefID = 8240555"
+            )
+        );
+        assert_eq!(
+            affected_rows_query("update low_priority t set a = 1 order by id limit 5").as_deref(),
+            Some("SELECT COUNT(*) FROM t")
+        );
+        // A subquery's WHERE stays inside the SET.
+        assert_eq!(
+            affected_rows_query("UPDATE t SET a = (SELECT 1 FROM u WHERE u.x = 1) WHERE b = 2")
+                .as_deref(),
+            Some("SELECT COUNT(*) FROM t WHERE b = 2")
+        );
+        // MySQL join and PostgreSQL FROM forms.
+        assert_eq!(
+            affected_rows_query("UPDATE a JOIN b ON a.id = b.id SET a.x = 1 WHERE b.y = 2")
+                .as_deref(),
+            Some("SELECT COUNT(*) FROM a JOIN b ON a.id = b.id WHERE b.y = 2")
+        );
+        assert_eq!(
+            affected_rows_query("UPDATE a SET x = b.x FROM b WHERE a.id = b.id RETURNING a.id")
+                .as_deref(),
+            Some("SELECT COUNT(*) FROM a, b WHERE a.id = b.id")
+        );
+    }
+
+    #[test]
+    fn counts_rows_a_delete_would_touch() {
+        assert_eq!(
+            affected_rows_query("DELETE FROM t WHERE id > 10 ORDER BY id LIMIT 3").as_deref(),
+            Some("SELECT COUNT(*) FROM t WHERE id > 10")
+        );
+        assert_eq!(
+            affected_rows_query("delete quick from logs").as_deref(),
+            Some("SELECT COUNT(*) FROM logs")
+        );
+        assert_eq!(
+            affected_rows_query("DELETE t1 FROM t1 JOIN t2 ON t1.id = t2.id WHERE t2.gone = 1")
+                .as_deref(),
+            Some("SELECT COUNT(*) FROM t1 JOIN t2 ON t1.id = t2.id WHERE t2.gone = 1")
+        );
+        assert_eq!(
+            affected_rows_query("DELETE FROM t1 USING t1 JOIN t2 WHERE t2.x = 1"),
+            None
+        );
+        assert_eq!(affected_rows_query("SELECT * FROM t"), None);
+        assert_eq!(affected_rows_query("INSERT INTO t VALUES (1)"), None);
+    }
+
+    #[test]
+    fn writes_are_recognised() {
+        for sql in [
+            "insert into t values (1)",
+            "update t set a=1",
+            "delete from t",
+            "drop table t",
+        ] {
+            assert!(classify(sql).is_write(), "{sql}");
+        }
+        for sql in ["select 1", "show tables", "use db", "set @a = 1"] {
+            assert!(!classify(sql).is_write(), "{sql}");
+        }
+    }
 
     #[test]
     fn classifies_statements() {

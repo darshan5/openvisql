@@ -61,7 +61,14 @@ pub async fn connect(
             config.port = port;
         }
         let driver = driver_for(&config);
-        let session = driver.connect(&config, password.as_deref()).await?;
+        let mut session = driver.connect(&config, password.as_deref()).await?;
+        // A read-only connection is enforced by the server too, for every session: query tabs,
+        // the object browser and its tools alike.
+        if config.read_only {
+            session
+                .execute(config.engine.dialect().read_only_session(), None)
+                .await?;
+        }
         Ok(Arc::new(Mutex::new(session)))
     })
     .await

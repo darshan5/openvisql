@@ -1067,6 +1067,36 @@ impl ConnectView {
                                             cx.notify();
                                         })),
                                 ),
+                            )
+                            .child(
+                                Field::new().label_indent(true).child(
+                                    Checkbox::new("confirm-writes")
+                                        .label("Preview affected rows before UPDATE/DELETE")
+                                        .checked(self.editing.confirm_writes)
+                                        .on_change(cx.listener(|this, value: &bool, _, cx| {
+                                            this.editing.confirm_writes = *value;
+                                            cx.notify();
+                                        })),
+                                ),
+                            )
+                            .child(
+                                Field::new()
+                                    .label_indent(true)
+                                    .description(
+                                        "Blocks INSERT, UPDATE, DELETE and DDL, and makes every \
+                                         session read-only on the server.",
+                                    )
+                                    .child(
+                                        Checkbox::new("read-only")
+                                            .label("Read-only")
+                                            .checked(self.editing.read_only)
+                                            .on_change(cx.listener(
+                                                |this, value: &bool, _, cx| {
+                                                    this.editing.read_only = *value;
+                                                    cx.notify();
+                                                },
+                                            )),
+                                    ),
                             ),
                     ),
             )

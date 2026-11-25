@@ -215,3 +215,42 @@ OpenViSQL is MIT-licensed, so its code must stay compatible with MIT:
 - **Consequences:** Nothing checks pushes automatically, so the checks must be run before
   each commit. Windows builds are only exercised by the release workflow.
 
+## ADR-011: Remote-friendly querying: snippets, text views, read-only, command line
+
+- **Date:** 2026-11-25
+- **Context:** OpenViSQL is used on a POS server reached only through a remote-control viewer,
+  sometimes by an agent that sees the screen through screenshots and OCR. Long queries typed
+  key by key were slow and fragile, the grid's small text was hard to read, a stale result
+  could be mistaken for a new one, the first click on Execute was sometimes lost, and a
+  write to the POS database needed extra care.
+- **Decision:**
+  - **Snippets** in `snippets.toml` with `{{name}}` placeholders, substituted as plain text
+    (quoting is up to the snippet). F2 opens a picker (Enter runs the first match), the
+    parameters are asked for in a dialog, and the query runs in a new tab. Enter goes through
+    each dialog's `on_ok`; the parameter dialog opens 150 ms after the picker closes so the
+    same Enter can't confirm it.
+  - **Records and Text views** render from `ovs_core::plain_text` (shared with the command
+    line), capped at 1,000 rows and 500 characters a value. The results text size (⌘= / ⌘−) is a
+    preference; the view is kept only for the running app, which always starts on the grid. Leading spaces are drawn as no-break spaces so the records
+    view's right-aligned names line up.
+  - Each result records the local time it finished and its statement, shown above it.
+  - Toolbar **Execute** fires on mouse-down instead of on click.
+  - **Read-only connections** are enforced twice: statements classified as writes are
+    refused before running, and `runtime::connect` puts every session in read-only mode on
+    the server, which also covers what the classifier can't see (`WITH … DELETE`, procedures)
+    and the object browser's tools. **Write preview** (`confirm_writes`, off by default)
+    rewrites each UPDATE/DELETE as `SELECT COUNT(*) FROM <tables> <WHERE>` and asks first.
+  - **`openvisql query`** is dispatched in `main` before GPUI starts, so no window opens. It
+    reuses the store, drivers and `runtime::connect`; it refuses (exit 3) what the GUI would
+    ask about unless `--yes` is given. It also runs, lists, saves and deletes snippets
+    (`--snippet` with `--param`, `--list-snippets`, `--save-snippet`, `--delete-snippet`);
+    a snippet run fails unless every placeholder has exactly one matching `--param`.
+- **Consequences:**
+  - The preview count is of joined rows for multi-table statements, and `DELETE … USING`
+    can't be previewed (the dialog says "couldn't count").
+  - The command line can't use SSH tunnels yet (host-key prompts need the GUI).
+  - On Windows the release build has no console, so command-line output needs `--out` or a
+    redirect.
+  - The lost-first-click on Execute couldn't be reproduced on macOS; the mouse-down change is
+    a mitigation to confirm on the Windows machine where it happened.
+

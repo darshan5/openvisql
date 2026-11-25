@@ -28,6 +28,16 @@ impl Dialect {
         }
     }
 
+    /// The statement that makes the rest of the session read-only, so the server itself
+    /// refuses writes on a connection marked read-only.
+    pub fn read_only_session(self) -> &'static str {
+        match self {
+            Self::MySql => "SET SESSION TRANSACTION READ ONLY",
+            Self::Postgres => "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY",
+            Self::Sqlite => "PRAGMA query_only = ON",
+        }
+    }
+
     /// `db.table` with both parts quoted. An empty `schema` yields just the quoted name.
     pub fn qualified(self, schema: &str, name: &str) -> String {
         if schema.is_empty() {

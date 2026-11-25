@@ -10,9 +10,9 @@ use gpui_kit::{
 
 use crate::{
     CloseConnection, CloseQueryTab, ExecuteAll, ExecuteCurrent, LowerCase, NewConnection,
-    NewQueryTab, NextConnection, OpenSettings, OpenSqlFile, PreviousConnection, Quit,
-    RefreshBrowser, SaveSqlFile, SaveSqlFileAs, StopQuery, ToggleComment, UpperCase,
-    WORKSPACE_CONTEXT,
+    NewQueryTab, NextConnection, OpenSettings, OpenSnippets, OpenSqlFile, PreviousConnection, Quit,
+    RefreshBrowser, SaveSnippet, SaveSqlFile, SaveSqlFileAs, StopQuery, ToggleComment, UpperCase,
+    WORKSPACE_CONTEXT, ZoomResultsIn, ZoomResultsOut, ZoomResultsReset,
 };
 
 /// Where a shortcut works.
@@ -109,6 +109,21 @@ pub fn all() -> Vec<Shortcut> {
         shortcut("secondary-/", "Toggle comment", Query, ToggleComment),
         shortcut("secondary-shift-u", "UPPERCASE selection", Query, UpperCase),
         shortcut("secondary-shift-l", "lowercase selection", Query, LowerCase),
+        shortcut("f2", "Saved queries", Query, OpenSnippets),
+        shortcut(
+            "secondary-shift-k",
+            "Save query as snippet",
+            Query,
+            SaveSnippet,
+        ),
+        shortcut("secondary-=", "Bigger results text", Query, ZoomResultsIn),
+        shortcut("secondary--", "Smaller results text", Query, ZoomResultsOut),
+        shortcut(
+            "secondary-0",
+            "Default results text size",
+            Query,
+            ZoomResultsReset,
+        ),
     ];
     // Suggestions on demand; they also open by themselves while typing.
     list.push(Shortcut {

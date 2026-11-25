@@ -17,7 +17,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::{
     App, AppContext as _, Context, Entity, EntityId, EventEmitter, InteractiveElement as _,
-    IntoElement, ParentElement as _, PathPromptOptions, Render, SharedString,
+    IntoElement, MouseButton, ParentElement as _, PathPromptOptions, Render, SharedString,
     StatefulInteractiveElement as _, Styled as _, Subscription, Window, div,
     prelude::FluentBuilder as _, px,
 };
@@ -32,9 +32,9 @@ use crate::query::{QueryEvent, QueryTab, RunMode, TabSpec, format_duration};
 use crate::runtime::{self, SharedSession};
 use crate::tab_fit::{OnNew, OnSelect, TAB_BAR_RESERVED, TabFit, tab_list_menu};
 use crate::{
-    CloseQueryTab, ExecuteAll, ExecuteCurrent, LowerCase, NewConnection, NewQueryTab, OpenSqlFile,
-    RefreshBrowser, SaveSqlFile, SaveSqlFileAs, StopQuery, ToggleComment, UpperCase,
-    WORKSPACE_CONTEXT,
+    CloseQueryTab, ExecuteAll, ExecuteCurrent, LowerCase, NewConnection, NewQueryTab, OpenSnippets,
+    OpenSqlFile, RefreshBrowser, SaveSnippet, SaveSqlFile, SaveSqlFileAs, StopQuery, ToggleComment,
+    UpperCase, WORKSPACE_CONTEXT, ZoomResultsIn, ZoomResultsOut, ZoomResultsReset,
 };
 
 struct InlineRename {
@@ -684,29 +684,48 @@ impl Workspace {
             .gap_1()
             .border_b_1()
             .border_color(cx.theme().border)
+            // Execute fires on mouse-down rather than on a full click: driven through a
+            // remote-control viewer, a click that arrives right after typing (or after a jump
+            // of the pointer) could be lost, so the first press did nothing.
             .child(
-                Button::new("execute")
-                    .ghost()
-                    .small()
-                    .icon(IconName::Play)
-                    .label("Execute")
-                    .disabled(running)
-                    .tooltip("Execute current statement or selection (F9 / ⌘↵)")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.execute(RunMode::Current, window, cx);
-                    })),
+                div()
+                    .when(!running, |el| {
+                        el.on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, window, cx| {
+                                this.execute(RunMode::Current, window, cx);
+                            }),
+                        )
+                    })
+                    .child(
+                        Button::new("execute")
+                            .ghost()
+                            .small()
+                            .icon(IconName::Play)
+                            .label("Execute")
+                            .disabled(running)
+                            .tooltip("Execute current statement or selection (F9 / ⌘↵)"),
+                    ),
             )
             .child(
-                Button::new("execute-all")
-                    .ghost()
-                    .small()
-                    .icon(IconName::ChevronsUpDown)
-                    .label("Execute all")
-                    .disabled(running)
-                    .tooltip("Execute every statement (Ctrl+F9 / ⇧⌘↵)")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.execute(RunMode::All, window, cx);
-                    })),
+                div()
+                    .when(!running, |el| {
+                        el.on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, window, cx| {
+                                this.execute(RunMode::All, window, cx);
+                            }),
+                        )
+                    })
+                    .child(
+                        Button::new("execute-all")
+                            .ghost()
+                            .small()
+                            .icon(IconName::ChevronsUpDown)
+                            .label("Execute all")
+                            .disabled(running)
+                            .tooltip("Execute every statement (Ctrl+F9 / ⇧⌘↵)"),
+                    ),
             )
             .child(
                 Button::new("stop")
@@ -718,6 +737,24 @@ impl Workspace {
                     .tooltip("Stop the running query (⌘. / Ctrl+.)")
                     .on_click(cx.listener(|this, _, _, cx| this.stop(cx))),
             )
+            .child(
+                Button::new("snippets")
+                    .ghost()
+                    .small()
+                    .label("Saved queries")
+                    .tooltip("Run a saved query (F2); save one with ⌘⇧K / Ctrl+Shift+K")
+                    .on_click(cx.listener(|_, _, window, cx| Self::open_snippets(window, cx))),
+            )
+            .when(self.config.read_only, |bar| {
+                bar.child(
+                    div()
+                        .px_2()
+                        .rounded(cx.theme().radius)
+                        .bg(cx.theme().warning.opacity(0.25))
+                        .text_sm()
+                        .child("READ-ONLY"),
+                )
+            })
             .child(
                 Button::new("refresh")
                     .ghost()
@@ -934,10 +971,16 @@ impl Workspace {
             Some(t) if t.is_running() => "Executing…".into(),
             Some(t) => match (t.connection_error(), t.last_run()) {
                 (Some(err), _) => format!("Not connected: {err}").into(),
-                (None, Some(run)) if run.errors > 0 => {
-                    format!("Completed with {} error(s)", run.errors).into()
-                }
-                (None, Some(run)) => format!("{} statement(s) completed", run.statements).into(),
+                (None, Some(run)) if run.errors > 0 => format!(
+                    "Completed with {} error(s) at {}",
+                    run.errors, run.finished_at
+                )
+                .into(),
+                (None, Some(run)) => format!(
+                    "{} statement(s) completed at {}",
+                    run.statements, run.finished_at
+                )
+                .into(),
                 (None, None) => "Ready".into(),
             },
             None => "Ready".into(),
@@ -1011,6 +1054,27 @@ impl Workspace {
             .update(cx, super::browser::ObjectBrowser::refresh);
     }
 
+    /// The saved-queries picker; a chosen query runs in a new tab.
+    fn open_snippets(window: &mut Window, cx: &mut Context<Self>) {
+        let this = cx.entity().downgrade();
+        let run: crate::snippets::RunSql = Rc::new(move |title, sql, window, cx| {
+            this.update(cx, |this, cx| {
+                let db = this.active_database(cx);
+                this.add_tab(Some(title), db, sql, true, window, cx);
+            })
+            .ok();
+        });
+        crate::snippets::open_picker(run, window, cx);
+    }
+
+    /// Saves the selection, or else the whole editor, as a snippet.
+    fn save_snippet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(sql) = self.active_tab().map(|t| t.read(cx).selection_or_all(cx)) else {
+            return;
+        };
+        crate::snippets::open_save(&sql, window, cx);
+    }
+
     fn execute(&mut self, mode: RunMode, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(tab) = self.active_tab().cloned() {
             tab.update(cx, |tab, cx| tab.execute(mode, window, cx));
@@ -1039,6 +1103,15 @@ impl Render for Workspace {
                 this.execute(RunMode::All, window, cx);
             }))
             .on_action(cx.listener(|this, _: &StopQuery, _, cx| this.stop(cx)))
+            .on_action(cx.listener(|_, _: &OpenSnippets, window, cx| {
+                Self::open_snippets(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SaveSnippet, window, cx| {
+                this.save_snippet(window, cx);
+            }))
+            .on_action(|_: &ZoomResultsIn, _, cx| crate::settings::zoom_results(Some(1.0), cx))
+            .on_action(|_: &ZoomResultsOut, _, cx| crate::settings::zoom_results(Some(-1.0), cx))
+            .on_action(|_: &ZoomResultsReset, _, cx| crate::settings::zoom_results(None, cx))
             .on_action(cx.listener(|this, _: &RefreshBrowser, _, cx| this.refresh(cx)))
             .on_action(cx.listener(|this, _: &NewQueryTab, window, cx| {
                 let db = this.active_database(cx);

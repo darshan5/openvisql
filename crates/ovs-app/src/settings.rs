@@ -60,6 +60,61 @@ pub fn set_theme(theme: ThemePreference, window: &mut Window, cx: &mut App) {
     cx.refresh_windows();
 }
 
+/// Replaces the preferences with `change` applied, saves them, and redraws every window. A
+/// failure to save is ignored: the change still applies for this session.
+fn update_prefs(change: impl FnOnce(&mut Preferences), cx: &mut App) {
+    let mut preferences = prefs(cx).clone();
+    change(&mut preferences);
+    let _ = Store::default().save_preferences(&preferences);
+    cx.set_global(Prefs(preferences));
+    cx.refresh_windows();
+}
+
+/// How a query tab shows a result set.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ResultView {
+    /// The editable, sortable grid.
+    #[default]
+    Grid,
+    /// One block per row, `column: value` lines (like MySQL's `\G`).
+    Records,
+    /// A boxed plain-text table.
+    Text,
+}
+
+/// The view chosen in this run of the app. Not saved: every launch starts on the grid.
+struct CurrentResultView(ResultView);
+
+impl Global for CurrentResultView {}
+
+/// How results are shown right now.
+pub fn result_view(cx: &App) -> ResultView {
+    cx.try_global::<CurrentResultView>()
+        .map_or(ResultView::Grid, |v| v.0)
+}
+
+/// Shows results as a grid, records or text until the app quits.
+pub fn set_result_view(view: ResultView, cx: &mut App) {
+    cx.set_global(CurrentResultView(view));
+    cx.refresh_windows();
+}
+
+/// Steps the results text size up or down by one point, or back to the default (`None`).
+pub fn zoom_results(step: Option<f32>, cx: &mut App) {
+    update_prefs(
+        |p| {
+            p.results_font_size = match step {
+                Some(step) => (p.results_font_size + step).clamp(
+                    *Preferences::FONT_SIZE_RANGE.start(),
+                    *Preferences::FONT_SIZE_RANGE.end(),
+                ),
+                None => Preferences::default().results_font_size,
+            };
+        },
+        cx,
+    );
+}
+
 /// The name of a theme choice, as menus show it.
 pub fn theme_label(theme: ThemePreference) -> &'static str {
     match theme {
@@ -78,6 +133,7 @@ pub const THEMES: [ThemePreference; 3] = [
 pub struct SettingsForm {
     row_limit: Entity<InputState>,
     font_size: Entity<InputState>,
+    results_font_size: Entity<InputState>,
     theme: ThemePreference,
     stop_on_error: bool,
     check_for_updates: bool,
@@ -95,6 +151,9 @@ impl SettingsForm {
                 .new(|cx| InputState::new(window, cx).default_value(current.row_limit.to_string())),
             font_size: cx.new(|cx| {
                 InputState::new(window, cx).default_value(current.editor_font_size.to_string())
+            }),
+            results_font_size: cx.new(|cx| {
+                InputState::new(window, cx).default_value(current.results_font_size.to_string())
             }),
             theme: current.theme,
             stop_on_error: current.stop_on_error,
@@ -148,9 +207,22 @@ impl SettingsForm {
                     Preferences::FONT_SIZE_RANGE.end()
                 )
             })?;
+        let results_text = self.results_font_size.read(cx).value().trim().to_owned();
+        let results_font_size: f32 = results_text
+            .parse()
+            .ok()
+            .filter(|n| Preferences::FONT_SIZE_RANGE.contains(n))
+            .ok_or_else(|| {
+                format!(
+                    "Results font size must be from {} to {}.",
+                    Preferences::FONT_SIZE_RANGE.start(),
+                    Preferences::FONT_SIZE_RANGE.end()
+                )
+            })?;
         Ok(Preferences {
             row_limit,
             editor_font_size,
+            results_font_size,
             theme: self.theme,
             stop_on_error: self.stop_on_error,
             check_for_updates: self.check_for_updates,
@@ -176,6 +248,12 @@ impl Render for SettingsForm {
                         Field::new()
                             .label("Editor font size")
                             .child(Input::new(&self.font_size)),
+                    )
+                    .child(
+                        Field::new()
+                            .label("Results font size")
+                            .description("Also ⌘/Ctrl + and − while a connection is open.")
+                            .child(Input::new(&self.results_font_size)),
                     )
                     .child(
                         Field::new().label("Theme").child(

@@ -7,6 +7,7 @@
 //! - Query history lives in `history.toml`, capped at [`HISTORY_LIMIT`] entries.
 //! - Open connection tabs and their query tabs live in `session.toml`, so the app reopens
 //!   where the user left off.
+//! - Saved queries ("snippets") live in `snippets.toml`.
 
 use std::fs;
 use std::io;
@@ -139,6 +140,22 @@ pub struct Preferences {
     pub stop_on_error: bool,
     /// Ask GitHub for a newer release when the app starts.
     pub check_for_updates: bool,
+    /// Text size of results (grid, records and text views), changed with ⌘/Ctrl + and −.
+    pub results_font_size: f32,
+}
+
+/// A saved query. `{{name}}` placeholders in `sql` are asked for before it runs.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Snippet {
+    pub name: String,
+    pub sql: String,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct SnippetsFile {
+    #[serde(default, rename = "snippet")]
+    snippets: Vec<Snippet>,
 }
 
 impl Preferences {
@@ -154,6 +171,7 @@ impl Default for Preferences {
             theme: ThemePreference::System,
             stop_on_error: false,
             check_for_updates: true,
+            results_font_size: 13.0,
         }
     }
 }
@@ -303,6 +321,37 @@ impl Store {
 
     pub fn save_session(&self, session: &Session) -> Result<()> {
         write_toml(&self.path("session.toml"), session)
+    }
+
+    /// Saved queries, sorted by name.
+    pub fn load_snippets(&self) -> Result<Vec<Snippet>> {
+        let file: SnippetsFile = read_toml(&self.path("snippets.toml"))?;
+        let mut snippets = file.snippets;
+        snippets.sort_by_key(|s| s.name.to_lowercase());
+        Ok(snippets)
+    }
+
+    pub fn save_snippets(&self, snippets: &[Snippet]) -> Result<()> {
+        write_toml(
+            &self.path("snippets.toml"),
+            &SnippetsFile {
+                snippets: snippets.to_vec(),
+            },
+        )
+    }
+
+    /// Adds `snippet`, replacing any with the same name (ignoring case).
+    pub fn upsert_snippet(&self, snippet: Snippet) -> Result<()> {
+        let mut snippets = self.load_snippets()?;
+        snippets.retain(|s| !s.name.eq_ignore_ascii_case(&snippet.name));
+        snippets.push(snippet);
+        self.save_snippets(&snippets)
+    }
+
+    pub fn delete_snippet(&self, name: &str) -> Result<()> {
+        let mut snippets = self.load_snippets()?;
+        snippets.retain(|s| !s.name.eq_ignore_ascii_case(name));
+        self.save_snippets(&snippets)
     }
 
     pub fn load_history(&self) -> Result<Vec<HistoryEntry>> {
@@ -461,6 +510,32 @@ mod tests {
         // The app follows the system's appearance until another theme is chosen.
         assert_eq!(partial.theme, ThemePreference::System);
         assert!(partial.check_for_updates);
+    }
+
+    #[test]
+    fn snippets_upsert_by_name_and_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        assert_eq!(store.load_snippets().unwrap(), Vec::<Snippet>::new());
+        let snippet = |name: &str, sql: &str| Snippet {
+            name: name.into(),
+            sql: sql.into(),
+        };
+        store
+            .upsert_snippet(snippet("Check lines", "SELECT 1"))
+            .unwrap();
+        store
+            .upsert_snippet(snippet("affected rows", "SELECT 2"))
+            .unwrap();
+        store
+            .upsert_snippet(snippet("check LINES", "SELECT {{n}}"))
+            .unwrap();
+        let all = store.load_snippets().unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].name, "affected rows");
+        assert_eq!(all[1].sql, "SELECT {{n}}");
+        store.delete_snippet("Affected Rows").unwrap();
+        assert_eq!(store.load_snippets().unwrap().len(), 1);
     }
 
     #[test]

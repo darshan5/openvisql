@@ -11,14 +11,15 @@ pub mod keywords;
 mod lexer;
 pub mod paging;
 pub mod roles;
+pub mod snippets;
 mod splitter;
 pub mod templates;
 pub mod text;
 pub mod users;
 
 pub use analyze::{
-    LimitClause, StatementKind, apply_row_limit, classify, count_query, limit_clause,
-    missing_where, strip_limit,
+    LimitClause, StatementKind, affected_rows_query, apply_row_limit, classify, count_query,
+    limit_clause, missing_where, strip_limit,
 };
 pub use dialect::Dialect;
 pub use edit::{CellEdit, RowEdit, RowKey, generate_edit};

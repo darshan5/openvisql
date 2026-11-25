@@ -132,6 +132,11 @@ pub struct ConnectionConfig {
     pub connect_timeout_secs: u64,
     /// Ask before running UPDATE/DELETE without a WHERE clause.
     pub safe_updates: bool,
+    /// Refuse writes: INSERT/UPDATE/DELETE/DDL are blocked in the app, and every session is
+    /// made read-only on the server (`SET SESSION TRANSACTION READ ONLY` and equivalents).
+    pub read_only: bool,
+    /// Before running an UPDATE or DELETE, count the rows it would touch and ask to confirm.
+    pub confirm_writes: bool,
     pub ssh: SshConfig,
     /// The database file, for engines that open one (SQLite).
     pub path: String,
@@ -159,6 +164,8 @@ impl Default for ConnectionConfig {
             init_commands: String::new(),
             connect_timeout_secs: 10,
             safe_updates: true,
+            read_only: false,
+            confirm_writes: false,
             ssh: SshConfig::default(),
             path: String::new(),
             database: String::new(),

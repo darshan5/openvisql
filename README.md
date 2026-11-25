@@ -46,6 +46,22 @@ the right, and results below.
   `LIMIT 50` automatically. The results footer shows "Showing 50 of 20,000 rows" whenever a
   limit cut the result short. Multiple result sets open in separate tabs, and a Messages tab shows rows affected,
   warnings, errors and timings.
+- **Saved queries** (snippets): save the editor's query with **⌘⇧K / Ctrl+Shift+K**, run one
+  with **F2** (type part of its name, Enter). `{{name}}` placeholders are asked for before it
+  runs, e.g. `WHERE CheckNumber = {{check}}`; the query opens in its own tab. Stored in
+  `snippets.toml`.
+- Results as a **Grid**, **Records** (one block per row, like MySQL's `\G`) or **Text** (a boxed
+  plain-text table), switched above each result. The app starts on the grid; a choice holds
+  until it quits. Grid column headings use the main text colour. **⌘= / ⌘−** (Ctrl on
+  Windows) change the results text size, **⌘0** resets it. Each result shows when it ran and
+  the statement that produced it ("Executed 20:37:12 · SELECT …"), and the status bar says when
+  the last run finished.
+- Per-connection safety options:
+  - **Read-only:** INSERT, UPDATE, DELETE and DDL are refused in the app, every session is
+    opened read-only on the server (`SET SESSION TRANSACTION READ ONLY`, PostgreSQL's
+    equivalent, or SQLite's `query_only`), grid editing is off, and the toolbar says READ-ONLY.
+  - **Preview affected rows before UPDATE/DELETE** (off by default): counts the rows each
+    statement would touch and asks "Run these changes? 6 rows — UPDATE …" first.
 - Query tabs can be renamed with a double click and reordered by dragging.
 - Double-clicking a column in the object browser inserts `` `column` `` at the cursor.
 - Result **paging** (Prev/Next), a **WHERE filter** box and **server-side sorting** for large
@@ -83,9 +99,35 @@ the right, and results below.
 - Query history is saved locally.
 - **Settings** (⌘, / Ctrl+,):
   - row limit / page size
-  - editor font size
+  - editor font size and results font size
   - theme: system, light or dark
   - whether "Execute all" stops at the first error
+
+## Command line
+
+`openvisql query` runs SQL against a saved connection and prints the results without opening
+a window, for scripts and for remote machines driven through a Run box:
+
+```
+openvisql query --conn checkposting --string "SHOW DATABASES;"
+openvisql query --conn checkposting --file C:\temp\q.sql --format records --out C:\temp\r.txt
+openvisql query --conn checkposting --snippet "Check lines" --param check=46411 --out C:\temp\r.txt
+```
+
+- **Saved queries:** `--snippet "Check lines" --param check=46411` runs one (every
+  `{{placeholder}}` needs a `--param`, and an unknown `--param` is an error).
+  `--list-snippets` lists them with their parameters; `--save-snippet <name>` with `--file` or
+  `--string` adds or replaces one; `--delete-snippet <name>` removes one. They're the same
+  snippets as F2 in the app.
+- `--string` understands `\n`, `\t`, `\"`, `\'` and `\\`; other backslashes are kept.
+- `--format text` (default boxed table), `records`, `csv`, `tsv`, `json` or `markdown`.
+- `--database`, `--limit <n>`, `--read-only`, `--yes` (allow what the connection would ask
+  about). `openvisql query --help` lists everything.
+- The password comes from where the connection saved it, or `OPENVISQL_PASSWORD`. SSH
+  connections aren't supported from the command line yet.
+- Exit codes: 0 success, 1 a statement failed, 2 bad arguments or connection, 3 refused.
+- On Windows the app is a GUI program, so nothing reaches the console: use `--out`, or
+  redirect with `> out.txt 2>&1`.
 
 ## Download
 

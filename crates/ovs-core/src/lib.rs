@@ -8,6 +8,7 @@
 //! - [`editing`]: deciding how grid edits are written back, and pending changes.
 //! - [`import`]: loading CSV files into tables.
 //! - [`export`]: CSV, JSON, SQL, Markdown and HTML output of result sets.
+//! - [`plain_text`]: boxed-table and one-record-per-block text renderings of result sets.
 //! - [`sql`]: lexing, statement splitting, quoting and grid-edit SQL generation.
 
 pub mod connection;
@@ -18,6 +19,7 @@ pub mod editing;
 pub mod error;
 pub mod export;
 pub mod import;
+pub mod plain_text;
 pub mod result;
 pub mod schema;
 pub mod sql;
