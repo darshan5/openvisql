@@ -142,6 +142,11 @@ pub struct Preferences {
     pub check_for_updates: bool,
     /// Text size of results (grid, records and text views), changed with ⌘/Ctrl + and −.
     pub results_font_size: f32,
+    /// Font family of the SQL editor and the records/text result views; empty for the
+    /// theme's monospace font.
+    pub editor_font_family: String,
+    /// Font family of the results grid; empty for the theme's interface font.
+    pub grid_font_family: String,
 }
 
 /// A saved query. `{{name}}` placeholders in `sql` are asked for before it runs.
@@ -172,6 +177,8 @@ impl Default for Preferences {
             stop_on_error: false,
             check_for_updates: true,
             results_font_size: 13.0,
+            editor_font_family: String::new(),
+            grid_font_family: String::new(),
         }
     }
 }

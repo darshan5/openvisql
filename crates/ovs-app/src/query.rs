@@ -2301,6 +2301,7 @@ impl Render for QueryTab {
                 .size_range(px(80.)..px(2000.))
                 .child(
                     Editor::new(&self.editor)
+                        .font_family(crate::settings::editor_font(cx))
                         .text_size(px(crate::settings::prefs(cx).editor_font_size))
                         .size_full()
                         .bordered(false),
@@ -2406,7 +2407,7 @@ fn render_result_text(
         .p_2()
         .bg(theme.background)
         .text_color(theme.foreground)
-        .font_family(theme.mono_font_family.clone())
+        .font_family(crate::settings::editor_font(cx))
         .text_size(px(font_size))
         .child(v_flex().children(text.lines().map(|line| {
             div()
@@ -2507,6 +2508,7 @@ fn render_result_grid(
                         .flex_1()
                         .min_w_0()
                         .h_full()
+                        .font_family(crate::settings::grid_font(cx))
                         .text_size(px(font_size))
                         .child(
                             DataTable::new(table)

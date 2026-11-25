@@ -100,6 +100,8 @@ the right, and results below.
 - **Settings** (⌘, / Ctrl+,):
   - row limit / page size
   - editor font size and results font size
+  - editor font (also the Records/Text result views) and grid font, chosen from the fonts
+    installed on the machine; a font that's later removed falls back to the default
   - theme: system, light or dark
   - whether "Execute all" stops at the first error
 

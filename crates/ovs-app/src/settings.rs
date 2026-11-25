@@ -2,7 +2,7 @@
 //! `ovs-store`.
 
 use gpui_kit::component::{
-    ActiveTheme as _, Theme, ThemeMode, WindowExt as _,
+    ActiveTheme as _, IndexPath, Theme, ThemeMode, WindowExt as _,
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,
     form::{Field, Form},
@@ -11,11 +11,13 @@ use gpui_kit::component::{
     link::Link,
     radio::RadioGroup,
     scroll::ScrollbarMode,
+    searchable_list::SearchableVec,
+    select::{Select, SelectState},
     v_flex,
 };
 use gpui_kit::{
     App, AppContext as _, Axis, Context, Entity, Global, IntoElement, ParentElement as _, Render,
-    Styled as _, Task, Window, div, prelude::FluentBuilder as _, px,
+    SharedString, Styled as _, Task, Window, div, prelude::FluentBuilder as _, px,
 };
 use ovs_store::{Preferences, Store, ThemePreference};
 
@@ -68,6 +70,70 @@ fn update_prefs(change: impl FnOnce(&mut Preferences), cx: &mut App) {
     let _ = Store::default().save_preferences(&preferences);
     cx.set_global(Prefs(preferences));
     cx.refresh_windows();
+}
+
+/// The first entry of the font lists: the theme's own font.
+const DEFAULT_FONT: &str = "(Default)";
+
+/// Font families installed on this machine, sorted. Read once: listing fonts is slow.
+fn installed_fonts(cx: &App) -> &'static [String] {
+    static FONTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    FONTS.get_or_init(|| cx.text_system().all_font_names())
+}
+
+/// `family` when it's set and installed, else `fallback`. GPUI stops the app on a family it
+/// can't find, so a font that was uninstalled since it was chosen must never reach it.
+fn installed_or(family: &str, fallback: SharedString, cx: &App) -> SharedString {
+    if !family.is_empty() && installed_fonts(cx).iter().any(|f| f == family) {
+        family.to_owned().into()
+    } else {
+        fallback
+    }
+}
+
+/// The font for SQL: the editor and the records/text result views.
+pub fn editor_font(cx: &App) -> SharedString {
+    let fallback = cx.theme().mono_font_family.clone();
+    installed_or(&prefs(cx).editor_font_family, fallback, cx)
+}
+
+/// The font for the results grid.
+pub fn grid_font(cx: &App) -> SharedString {
+    let fallback = cx.theme().font_family.clone();
+    installed_or(&prefs(cx).grid_font_family, fallback, cx)
+}
+
+type FontSelect = Entity<SelectState<SearchableVec<SharedString>>>;
+
+/// A searchable list of installed fonts, with "(Default)" first and `current` selected.
+fn font_select(current: &str, window: &mut Window, cx: &mut App) -> FontSelect {
+    let mut names: Vec<SharedString> = vec![DEFAULT_FONT.into()];
+    names.extend(
+        installed_fonts(cx)
+            .iter()
+            .map(|f| SharedString::from(f.clone())),
+    );
+    let selected = names
+        .iter()
+        .position(|n| n.as_ref() == current)
+        .unwrap_or(0);
+    cx.new(|cx| {
+        SelectState::new(
+            SearchableVec::new(names),
+            Some(IndexPath::new(selected)),
+            window,
+            cx,
+        )
+        .searchable(true)
+    })
+}
+
+/// The chosen family, or empty for "(Default)".
+fn chosen_font(select: &FontSelect, cx: &App) -> String {
+    match select.read(cx).selected_value() {
+        Some(name) if name.as_ref() != DEFAULT_FONT => name.to_string(),
+        _ => String::new(),
+    }
 }
 
 /// How a query tab shows a result set.
@@ -134,6 +200,8 @@ pub struct SettingsForm {
     row_limit: Entity<InputState>,
     font_size: Entity<InputState>,
     results_font_size: Entity<InputState>,
+    editor_font: FontSelect,
+    grid_font: FontSelect,
     theme: ThemePreference,
     stop_on_error: bool,
     check_for_updates: bool,
@@ -155,6 +223,8 @@ impl SettingsForm {
             results_font_size: cx.new(|cx| {
                 InputState::new(window, cx).default_value(current.results_font_size.to_string())
             }),
+            editor_font: font_select(&current.editor_font_family, window, cx),
+            grid_font: font_select(&current.grid_font_family, window, cx),
             theme: current.theme,
             stop_on_error: current.stop_on_error,
             check_for_updates: current.check_for_updates,
@@ -223,6 +293,8 @@ impl SettingsForm {
             row_limit,
             editor_font_size,
             results_font_size,
+            editor_font_family: chosen_font(&self.editor_font, cx),
+            grid_font_family: chosen_font(&self.grid_font, cx),
             theme: self.theme,
             stop_on_error: self.stop_on_error,
             check_for_updates: self.check_for_updates,
@@ -248,6 +320,20 @@ impl Render for SettingsForm {
                         Field::new()
                             .label("Editor font size")
                             .child(Input::new(&self.font_size)),
+                    )
+                    .child(
+                        Field::new()
+                            .label("Editor font")
+                            .description(
+                                "Editor and Records/Text views; monospace keeps them aligned.",
+                            )
+                            .child(Select::new(&self.editor_font).placeholder(DEFAULT_FONT)),
+                    )
+                    .child(
+                        Field::new()
+                            .label("Grid font")
+                            .description("The results grid.")
+                            .child(Select::new(&self.grid_font).placeholder(DEFAULT_FONT)),
                     )
                     .child(
                         Field::new()
