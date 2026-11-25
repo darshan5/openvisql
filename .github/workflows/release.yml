@@ -1,6 +1,9 @@
 name: Release
 
-# Pushing a tag like v0.2.0 builds installers and attaches them to a draft GitHub release.
+# Two ways to release, both ending in a published GitHub release with the installers:
+#   - Actions > Release > Run workflow, with a version like 0.2.0: bumps the workspace version,
+#     commits "chore: release 0.2.0" to main, tags v0.2.0, then builds and publishes.
+#   - Push a tag like v0.2.0 yourself (its version must match Cargo.toml).
 # Signing is optional: without the secrets below, the macOS app gets an ad-hoc signature
 # (no certificate) and the Windows installer is unsigned.
 #
@@ -14,6 +17,11 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, without the v (e.g. 0.2.0)"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -21,8 +29,58 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && 'main' || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        if: github.event_name == 'workflow_dispatch'
+      - name: Bump the version, commit and tag
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::version must look like 0.2.0, got '$VERSION'"; exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" >/dev/null; then
+            echo "::error::tag v$VERSION already exists"; exit 1
+          fi
+          # The first `version =` in the root manifest is [workspace.package]'s.
+          sed -i "0,/^version = \".*\"/s//version = \"$VERSION\"/" Cargo.toml
+          cargo update --workspace
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "chore: release $VERSION"
+          git tag "v$VERSION"
+          git push origin HEAD:main "v$VERSION"
+      - name: Resolve the tag
+        id: tag
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            tag="v$VERSION"
+          else
+            tag="$GITHUB_REF_NAME"
+            manifest=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+            if [ "v$manifest" != "$tag" ]; then
+              echo "::error::tag $tag doesn't match Cargo.toml version $manifest"; exit 1
+            fi
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
   package:
+    needs: prepare
     strategy:
       fail-fast: false
       matrix:
@@ -36,6 +94,8 @@ jobs:
       HAS_WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE != '' }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -98,18 +158,23 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: package
-    if: startsWith(github.ref, 'refs/tags/')
+    needs: [prepare, package]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
-      - name: Create a draft release with the installers
+      - name: Publish the release with the installers
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" dist/* \
-            --repo "${GITHUB_REPOSITORY}" --draft --generate-notes \
-            --title "OpenViSQL ${GITHUB_REF_NAME#v}"
+          # A release left as a draft by an earlier run gets the new installers and is published.
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          else
+            gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" \
+              --latest --generate-notes --title "OpenViSQL ${TAG#v}"
+          fi
