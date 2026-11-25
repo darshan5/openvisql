@@ -1,8 +1,9 @@
 name: Portable Windows exe
 
-# Builds the standalone openvisql.exe (no installer) from an existing release tag and attaches
-# it to that release as openvisql_<version>_x64-portable.exe. New releases get it from
-# release.yml; this is for adding it to a release made before that.
+# Builds the standalone openvisql.exe and openvisql-cli.exe (no installer) from an existing
+# release tag and attaches them to that release as openvisql_<version>_x64-portable.exe and
+# openvisql-cli_<version>_x64.exe. New releases get them from release.yml; this is for adding
+# them to a release made before that. (openvisql-cli exists from 0.2.1.)
 
 on:
   workflow_dispatch:
@@ -43,6 +44,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.tag }}
         run: |
-          out="openvisql_${TAG#v}_x64-portable.exe"
-          cp target/x86_64-pc-windows-msvc/release/openvisql.exe "$out"
-          gh release upload "$TAG" "$out" --clobber --repo "$GITHUB_REPOSITORY"
+          app="openvisql_${TAG#v}_x64-portable.exe"
+          cp target/x86_64-pc-windows-msvc/release/openvisql.exe "$app"
+          files=("$app")
+          if [ -f target/x86_64-pc-windows-msvc/release/openvisql-cli.exe ]; then
+            cli="openvisql-cli_${TAG#v}_x64.exe"
+            cp target/x86_64-pc-windows-msvc/release/openvisql-cli.exe "$cli"
+            files+=("$cli")
+          fi
+          gh release upload "$TAG" "${files[@]}" --clobber --repo "$GITHUB_REPOSITORY"

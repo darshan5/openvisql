@@ -66,8 +66,9 @@ new saved one. SSH-tunnelled connections aren't supported here yet.
 Exit codes: 0 success, 1 a statement failed, 2 bad arguments or connection,
 3 refused (read-only connection or a safety check).
 
-On Windows, nothing reaches the console: use --out, or redirect with
-> out.txt 2>&1.
+On Windows, run openvisql-cli.exe instead (same arguments, `query` optional):
+it's a console program, so cmd and PowerShell wait for it, show its output and
+see its exit code. openvisql.exe is a GUI program there: use --out with it.
 
 Examples:
   openvisql query --conn mydb --string \"SHOW DATABASES;\"

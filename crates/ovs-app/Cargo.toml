@@ -11,6 +11,11 @@ rust-version.workspace = true
 name = "openvisql"
 path = "src/main.rs"
 
+# Console program for scripts and agents (Windows shells don't wait for the GUI binary).
+[[bin]]
+name = "openvisql-cli"
+path = "src/cli_main.rs"
+
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
@@ -45,7 +50,10 @@ category = "DeveloperTool"
 icons = ["icons/icon.icns", "icons/icon.ico", "icons/icon.png"]
 out-dir = "../../target/packages"
 before-packaging-command = "cargo build --release -p ovs-app"
-binaries = [{ path = "openvisql", main = true }]
+binaries = [
+  { path = "openvisql", main = true },
+  { path = "openvisql-cli", main = false },
+]
 
 [package.metadata.packager.nsis]
 installer-mode = "currentUser"

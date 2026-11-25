@@ -138,14 +138,17 @@ jobs:
           fi
           cargo packager --release --target ${{ matrix.target }} --formats ${{ matrix.formats }}
 
-      - name: Add the portable Windows .exe
+      - name: Add the standalone Windows .exes
         if: runner.os == 'Windows'
         shell: bash
         env:
           TAG: ${{ needs.prepare.outputs.tag }}
-        # The app itself, runnable from anywhere without installing (it keeps its settings in
-        # %APPDATA%\openvisql like the installed one). Signed with the installer below.
-        run: cp "target/${{ matrix.target }}/release/openvisql.exe" "target/packages/openvisql_${TAG#v}_x64-portable.exe"
+        # The app and the console command line, each runnable from anywhere without installing
+        # (settings live in %APPDATA%\openvisql like the installed copy's). The installer also
+        # installs both. Signed with the installer below.
+        run: |
+          cp "target/${{ matrix.target }}/release/openvisql.exe" "target/packages/openvisql_${TAG#v}_x64-portable.exe"
+          cp "target/${{ matrix.target }}/release/openvisql-cli.exe" "target/packages/openvisql-cli_${TAG#v}_x64.exe"
       - name: Sign the Windows installer
         if: runner.os == 'Windows' && env.HAS_WINDOWS_CERTIFICATE == 'true'
         shell: pwsh

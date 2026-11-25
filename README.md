@@ -107,8 +107,9 @@ the right, and results below.
 
 ## Command line
 
-`openvisql query` runs SQL against a saved connection and prints the results without opening
-a window, for scripts and for remote machines driven through a Run box:
+`openvisql-cli` (or `openvisql query`, the same thing inside the app's binary) runs SQL and
+prints the results without opening a window, for scripts and for remote machines driven
+through a Run box:
 
 ```
 openvisql query --conn mydb --string "SHOW DATABASES;"
@@ -134,15 +135,46 @@ openvisql query --conn mydb --snippet "Order lines" --param order=1042 --out C:\
 - The password is the first of `--password`, `--password-file`, `OPENVISQL_PASSWORD` and the
   one saved with the connection. SSH connections aren't supported from the command line yet.
 - Exit codes: 0 success, 1 a statement failed, 2 bad arguments or connection, 3 refused.
-- On Windows the app is a GUI program, so nothing reaches the console: use `--out`, or
-  redirect with `> out.txt 2>&1`.
+- `openvisql-cli` takes the same arguments as `openvisql query`, with or without `query`.
+
+### For scripts and agents on Windows
+
+Use **`openvisql-cli.exe`**, not `openvisql.exe`. The app is a GUI program, so cmd and
+PowerShell don't wait for it to finish, its output never reaches the console, and its exit code
+is lost; a script can read an empty result file before the query has run. `openvisql-cli.exe` is
+a console program, so both shells wait for it, show its output and set the exit code
+(`%ERRORLEVEL%` in cmd, `$LASTEXITCODE` in PowerShell).
+
+```
+openvisql-cli.exe --conn mydb --snippet "Order lines" --param order=1042
+openvisql-cli.exe --conn mydb --file C:\temp\q.sql --format records --out C:\temp\r.txt
+```
+
+- Prefer `--file` or `--snippet` to long `--string` SQL: quoting differs between shells.
+  - cmd: `%name%` inside the SQL (as in `LIKE '%abc%'`) is replaced when a variable of that name
+    exists; in a `.bat` file write `%%`.
+  - PowerShell: in `"…"` strings `$name` is expanded, and Windows PowerShell 5.1 can drop
+    embedded double quotes. Put the SQL in single quotes: `--string 'SELECT * FROM t WHERE a = 1'`.
+- The Run box (Win+R) cuts commands at about 259 characters, and needs `cmd /c` for `>`
+  redirection; `--out` avoids redirection altogether.
+- If you must use `openvisql.exe query` (no console): in cmd run it with
+  `start "" /wait openvisql.exe query … --out C:\temp\r.txt`; in PowerShell pipe it
+  (`& .\openvisql.exe query … | Out-String`) so PowerShell waits.
 
 ## Download
 
-Installers for macOS on Apple Silicon (`.dmg`) and Windows (`-setup.exe`) are
-attached to [GitHub releases](https://github.com/darshan5/openvisql/releases), along with a
-**portable Windows `.exe`** (`openvisql_<version>_x64-portable.exe`): one file that runs from
-anywhere without installing, including `openvisql query` on the command line.
+Each [GitHub release](https://github.com/darshan5/openvisql/releases) has:
+
+- `OpenViSQL_<version>_aarch64.dmg`: the macOS app (Apple Silicon). The command-line program
+  is inside it at `OpenViSQL.app/Contents/MacOS/openvisql-cli`.
+- `openvisql_<version>_x64-setup.exe`: the Windows installer. It installs the app and
+  `openvisql-cli.exe` side by side.
+- `openvisql_<version>_x64-portable.exe`: the Windows app as one file that runs from anywhere,
+  without installing.
+- `openvisql-cli_<version>_x64.exe`: the Windows command-line program as one file, for scripts,
+  agents and headless use.
+
+The Windows files are 64-bit and need nothing else installed (the C runtime is built in).
 
 The builds aren't signed with a developer certificate yet, so the first launch needs one
 approval:
