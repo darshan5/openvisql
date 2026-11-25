@@ -140,7 +140,9 @@ openvisql query --conn mydb --snippet "Order lines" --param order=1042 --out C:\
 ## Download
 
 Installers for macOS on Apple Silicon (`.dmg`) and Windows (`-setup.exe`) are
-attached to [GitHub releases](https://github.com/darshan5/openvisql/releases).
+attached to [GitHub releases](https://github.com/darshan5/openvisql/releases), along with a
+**portable Windows `.exe`** (`openvisql_<version>_x64-portable.exe`): one file that runs from
+anywhere without installing, including `openvisql query` on the command line.
 
 The builds aren't signed with a developer certificate yet, so the first launch needs one
 approval:

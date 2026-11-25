@@ -86,7 +86,9 @@ jobs:
       matrix:
         include:
           - { os: macos-latest, target: aarch64-apple-darwin, formats: "app,dmg" }
-          - { os: windows-latest, target: x86_64-pc-windows-msvc, formats: "nsis" }
+          # The C runtime is linked in, so the installer's app and the portable .exe run
+          # without the Visual C++ redistributable.
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, formats: "nsis", rustflags: "-C target-feature=+crt-static" }
     runs-on: ${{ matrix.os }}
     env:
       # Step conditions can't read secrets directly, so expose whether they're set.
@@ -109,6 +111,7 @@ jobs:
         shell: bash
         env:
           CARGO_BUILD_TARGET: ${{ matrix.target }}
+          RUSTFLAGS: ${{ matrix.rustflags }}
           SECRET_APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           SECRET_APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           SECRET_APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
@@ -135,6 +138,14 @@ jobs:
           fi
           cargo packager --release --target ${{ matrix.target }} --formats ${{ matrix.formats }}
 
+      - name: Add the portable Windows .exe
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        # The app itself, runnable from anywhere without installing (it keeps its settings in
+        # %APPDATA%\openvisql like the installed one). Signed with the installer below.
+        run: cp "target/${{ matrix.target }}/release/openvisql.exe" "target/packages/openvisql_${TAG#v}_x64-portable.exe"
       - name: Sign the Windows installer
         if: runner.os == 'Windows' && env.HAS_WINDOWS_CERTIFICATE == 'true'
         shell: pwsh

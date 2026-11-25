@@ -1,0 +1,48 @@
+name: Portable Windows exe
+
+# Builds the standalone openvisql.exe (no installer) from an existing release tag and attaches
+# it to that release as openvisql_<version>_x64-portable.exe. New releases get it from
+# release.yml; this is for adding it to a release made before that.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag (e.g. v0.2.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  portable:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: x86_64-pc-windows-msvc-portable
+      - name: Build
+        shell: bash
+        env:
+          # The C runtime linked in: runs without the Visual C++ redistributable.
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: cargo build --release -p ovs-app --target x86_64-pc-windows-msvc
+      - name: Attach to the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          out="openvisql_${TAG#v}_x64-portable.exe"
+          cp target/x86_64-pc-windows-msvc/release/openvisql.exe "$out"
+          gh release upload "$TAG" "$out" --clobber --repo "$GITHUB_REPOSITORY"
