@@ -228,9 +228,8 @@ superfastimageview-cli resize big.jpg --max 1568 -o small.jpg
 openvisql-cli --conn mydb --snippet "Order lines" --param order=1042 --out C:\temp\r.txt
 ```
 
-They share the same conventions: `--out <file>` writes the result to a file, `--help` lists the
-options, and exit code 0 means success, with other codes for "nothing found" or errors (each
-project's README lists them). The superfastnotepad and superfastimageview command lines are on
+All three print results on standard output and exit with 0 on success; each project's README
+lists its options and its other exit codes. The superfastnotepad and superfastimageview command lines are on
 their `main` branches and ship in their next releases.
 
 ## License
