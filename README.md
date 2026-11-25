@@ -116,6 +116,12 @@ openvisql query --conn checkposting --file C:\temp\q.sql --format records --out 
 openvisql query --conn checkposting --snippet "Check lines" --param check=46411 --out C:\temp\r.txt
 ```
 
+- **Without a saved connection:** `--engine mysql|postgres|sqlite` with `--host`, `--port`,
+  `--user`, `--password` (or `--password-file`), `--db`, and `--path` for SQLite, e.g.
+  `openvisql query --engine mysql --user dauser --password secret --db checkpostingdb
+  --string "SHOW TABLES;"`. The same flags override parts of a `--conn` connection. A plain
+  `--password` is visible to other processes and kept in shell history; `--password-file` or
+  `OPENVISQL_PASSWORD` avoid that.
 - **Saved queries:** `--snippet "Check lines" --param check=46411` runs one (every
   `{{placeholder}}` needs a `--param`, and an unknown `--param` is an error).
   `--list-snippets` lists them with their parameters; `--save-snippet <name>` with `--file` or
@@ -125,8 +131,8 @@ openvisql query --conn checkposting --snippet "Check lines" --param check=46411 
 - `--format text` (default boxed table), `records`, `csv`, `tsv`, `json` or `markdown`.
 - `--database`, `--limit <n>`, `--read-only`, `--yes` (allow what the connection would ask
   about). `openvisql query --help` lists everything.
-- The password comes from where the connection saved it, or `OPENVISQL_PASSWORD`. SSH
-  connections aren't supported from the command line yet.
+- The password is the first of `--password`, `--password-file`, `OPENVISQL_PASSWORD` and the
+  one saved with the connection. SSH connections aren't supported from the command line yet.
 - Exit codes: 0 success, 1 a statement failed, 2 bad arguments or connection, 3 refused.
 - On Windows the app is a GUI program, so nothing reaches the console: use `--out`, or
   redirect with `> out.txt 2>&1`.

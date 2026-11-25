@@ -11,14 +11,14 @@ use std::path::PathBuf;
 
 use ovs_core::export::{ExportFormat, ExportOptions, export_to_string};
 use ovs_core::sql::{self, StatementKind};
-use ovs_core::{ConnectionConfig, QueryOutcome, plain_text};
+use ovs_core::{ConnectionConfig, Engine, QueryOutcome, plain_text};
 use ovs_store::Store;
 
 use crate::runtime;
 
 const USAGE: &str = "\
-Usage: openvisql query --conn <name|id> (--file <path> | --string <sql> |
-                       --snippet <name> [--param name=value ...]) [options]
+Usage: openvisql query (--conn <name|id> | --engine <engine> ...) (--file <path> |
+                       --string <sql> | --snippet <name> [--param name=value ...]) [options]
        openvisql query --list-snippets
        openvisql query --save-snippet <name> (--file <path> | --string <sql>)
        openvisql query --delete-snippet <name>
@@ -26,6 +26,19 @@ Usage: openvisql query --conn <name|id> (--file <path> | --string <sql> |
 Runs SQL against a saved connection and prints the results. No window opens.
 
   --conn <name|id>     Saved connection, by name (ignoring case) or id
+
+Connecting without a saved connection (or overriding parts of one):
+  --engine <engine>    mysql (also MariaDB), postgres or sqlite
+  --host <host>        Server host (default localhost)
+  --port <port>        Server port (default 3306 for MySQL, 5432 for PostgreSQL)
+  --user <user>        User name
+  --password <pass>    Password. Visible to other processes and kept in shell
+                       history; --password-file or OPENVISQL_PASSWORD avoid that
+  --password-file <path>  Read the password from a file (first line)
+  --path <file>        SQLite database file
+  --db <name>          Same as --database. For PostgreSQL, the database to connect to
+
+What to run:
   --file <path>        Read the SQL from a file (one or more statements)
   --string <sql>       The SQL itself. Backslash escapes are understood:
                        \\n newline, \\t tab, \\\" quote, \\' apostrophe, \\\\ backslash
@@ -45,9 +58,10 @@ Runs SQL against a saved connection and prints the results. No window opens.
                        before them) and writes on connections that preview them
   --help               Show this help
 
-The password comes from where the connection saved it, or from the
-OPENVISQL_PASSWORD environment variable. SSH-tunnelled connections aren't
-supported here yet.
+The password is the first of: --password, --password-file, the
+OPENVISQL_PASSWORD environment variable, and the one saved with --conn.
+Ad-hoc connections ask before UPDATE/DELETE without WHERE (use --yes), like a
+new saved one. SSH-tunnelled connections aren't supported here yet.
 
 Exit codes: 0 success, 1 a statement failed, 2 bad arguments or connection,
 3 refused (read-only connection or a safety check).
@@ -57,6 +71,8 @@ On Windows, nothing reaches the console: use --out, or redirect with
 
 Examples:
   openvisql query --conn checkposting --string \"SHOW DATABASES;\"
+  openvisql query --engine mysql --user dauser --password secret --db checkpostingdb --string \"SHOW TABLES;\"
+  openvisql query --engine sqlite --path C:\\data\\test.db --string \"SELECT 1;\"
   openvisql query --conn checkposting --file C:\\temp\\q.sql --format records --out C:\\temp\\r.txt
   openvisql query --conn checkposting --snippet \"Check lines\" --param check=46411 --out C:\\temp\\r.txt
 ";
@@ -82,9 +98,22 @@ enum Source {
     },
 }
 
+/// Connection settings given on the command line, each overriding the saved connection's.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Direct {
+    engine: Option<Engine>,
+    host: Option<String>,
+    port: Option<u16>,
+    user: Option<String>,
+    password: Option<String>,
+    password_file: Option<PathBuf>,
+    path: Option<String>,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct Args {
-    conn: String,
+    conn: Option<String>,
+    direct: Direct,
     source: Source,
     database: Option<String>,
     format: Format,
@@ -158,6 +187,7 @@ fn parse(args: &[String]) -> Result<Args, String> {
     let mut read_only = false;
     let mut yes = false;
     let mut params: Vec<(String, String)> = Vec::new();
+    let mut direct = Direct::default();
     let mut it = args.iter();
     let two_sources = "give only one of --file, --string and --snippet";
     while let Some(arg) = it.next() {
@@ -196,7 +226,29 @@ fn parse(args: &[String]) -> Result<Args, String> {
                     .ok_or_else(|| format!("--param needs name=value, not {pair}"))?;
                 params.push((name.trim().to_owned(), val.to_owned()));
             }
-            "--database" => database = Some(value("--database")?),
+            "--database" | "--db" => database = Some(value(arg)?),
+            "--engine" => {
+                direct.engine = Some(match value("--engine")?.to_ascii_lowercase().as_str() {
+                    "mysql" | "mariadb" => Engine::MySql,
+                    "postgres" | "postgresql" | "pg" => Engine::Postgres,
+                    "sqlite" => Engine::Sqlite,
+                    other => return Err(format!("unknown engine \u{201c}{other}\u{201d}")),
+                });
+            }
+            "--host" => direct.host = Some(value("--host")?),
+            "--port" => {
+                let text = value("--port")?;
+                direct.port = Some(
+                    text.parse()
+                        .map_err(|_| format!("--port must be a port number, not {text}"))?,
+                );
+            }
+            "--user" => direct.user = Some(value("--user")?),
+            "--password" => direct.password = Some(value("--password")?),
+            "--password-file" => {
+                direct.password_file = Some(PathBuf::from(value("--password-file")?));
+            }
+            "--path" => direct.path = Some(value("--path")?),
             "--format" => {
                 format = match value("--format")?.to_ascii_lowercase().as_str() {
                     "text" | "table" => Format::Text,
@@ -229,8 +281,12 @@ fn parse(args: &[String]) -> Result<Args, String> {
         Some(other) => other,
         None => return Err("give the SQL with --file, --string or --snippet".into()),
     };
+    if conn.is_none() && direct.engine.is_none() {
+        return Err("give a saved connection with --conn, or connect with --engine".into());
+    }
     Ok(Args {
-        conn: conn.ok_or("--conn is required")?,
+        conn,
+        direct,
         source,
         database,
         format,
@@ -450,6 +506,63 @@ fn resolve_snippet(
     Ok(sql::snippets::fill(&snippet.sql, &values))
 }
 
+/// The connection to use: the saved one (if any) with every setting given on the command
+/// line applied over it. Without a saved one, `--engine` starts from a new connection's
+/// defaults (which ask before UPDATE/DELETE without WHERE).
+fn build_config(
+    saved: Option<ConnectionConfig>,
+    direct: &Direct,
+    database: Option<&str>,
+) -> Result<ConnectionConfig, String> {
+    let mut config = if let Some(config) = saved {
+        config
+    } else {
+        let engine = direct.engine.ok_or("--engine is required without --conn")?;
+        ConnectionConfig {
+            name: "command line".into(),
+            engine,
+            port: engine.default_port(),
+            save_password: false,
+            ..ConnectionConfig::default()
+        }
+    };
+    if let Some(engine) = direct.engine
+        && engine != config.engine
+    {
+        config.engine = engine;
+        config.port = engine.default_port();
+    }
+    if let Some(host) = &direct.host {
+        config.host.clone_from(host);
+    }
+    if let Some(port) = direct.port {
+        config.port = port;
+    }
+    if let Some(user) = &direct.user {
+        config.user.clone_from(user);
+    }
+    if let Some(path) = &direct.path {
+        config.path.clone_from(path);
+    }
+    if config.engine == Engine::Postgres
+        && let Some(db) = database
+    {
+        db.clone_into(&mut config.database);
+    }
+    if config.engine == Engine::Sqlite && config.path.trim().is_empty() {
+        return Err("SQLite needs the database file: --path <file>".into());
+    }
+    Ok(config)
+}
+
+/// The password from `--password`, else the first line of `--password-file`, else
+/// `OPENVISQL_PASSWORD`; `None` leaves it to the saved connection.
+fn choose_password(flag: Option<&str>, file: Option<&str>, env: Option<String>) -> Option<String> {
+    flag.map(str::to_owned)
+        .or_else(|| file.map(|f| f.lines().next().unwrap_or_default().to_owned()))
+        .or(env)
+}
+
 /// The saved connection called `name` (ignoring case), or with that id.
 fn find_connection(all: Vec<ConnectionConfig>, name: &str) -> Option<ConnectionConfig> {
     all.into_iter()
@@ -458,20 +571,27 @@ fn find_connection(all: Vec<ConnectionConfig>, name: &str) -> Option<ConnectionC
 
 fn run(args: &Args, out: &mut String) -> Result<(), Failure> {
     let store = Store::default();
-    let connections = store
-        .load_connections()
-        .map_err(|e| fail(2, format!("could not read saved connections: {e}")))?;
-    let names: Vec<String> = connections.iter().map(|c| c.name.clone()).collect();
-    let mut config = find_connection(connections, &args.conn).ok_or_else(|| {
-        fail(
-            2,
-            format!(
-                "no saved connection called \u{201c}{}\u{201d} (saved: {})",
-                args.conn,
-                names.join(", ")
-            ),
-        )
-    })?;
+    let saved = match &args.conn {
+        Some(name) => {
+            let connections = store
+                .load_connections()
+                .map_err(|e| fail(2, format!("could not read saved connections: {e}")))?;
+            let names: Vec<String> = connections.iter().map(|c| c.name.clone()).collect();
+            Some(find_connection(connections, name).ok_or_else(|| {
+                fail(
+                    2,
+                    format!(
+                        "no saved connection called \u{201c}{name}\u{201d} (saved: {})",
+                        names.join(", ")
+                    ),
+                )
+            })?)
+        }
+        None => None,
+    };
+    let from_saved = saved.is_some();
+    let mut config =
+        build_config(saved, &args.direct, args.database.as_deref()).map_err(|e| fail(2, e))?;
     if config.ssh.enabled {
         return Err(fail(
             2,
@@ -498,15 +618,36 @@ fn run(args: &Args, out: &mut String) -> Result<(), Failure> {
     }
     check_allowed(&config, &statements, args.yes)?;
 
-    let password = match std::env::var("OPENVISQL_PASSWORD") {
-        Ok(p) => Some(p),
-        Err(_) if config.save_password && config.engine.is_server() => store
-            .password(config.id, config.password_store)
-            .map_err(|e| fail(2, format!("could not read the saved password: {e}")))?,
-        Err(_) => None,
+    let file_password = match &args.direct.password_file {
+        Some(path) => Some(
+            std::fs::read_to_string(path)
+                .map_err(|e| fail(2, format!("could not read {}: {e}", path.display())))?,
+        ),
+        None => None,
+    };
+    let saved_password = || {
+        if from_saved && config.save_password && config.engine.is_server() {
+            store
+                .password(config.id, config.password_store)
+                .map_err(|e| fail(2, format!("could not read the saved password: {e}")))
+        } else {
+            Ok(None)
+        }
+    };
+    let password = match choose_password(
+        args.direct.password.as_deref(),
+        file_password.as_deref(),
+        std::env::var("OPENVISQL_PASSWORD").ok(),
+    ) {
+        Some(p) => Some(p),
+        None => saved_password()?,
     };
 
-    let database = args.database.clone();
+    // PostgreSQL connects to the database itself (set by build_config); the others switch.
+    let database = args
+        .database
+        .clone()
+        .filter(|_| config.engine != Engine::Postgres);
     let limit = args.limit;
     let format = args.format;
     let reports = runtime::runtime().block_on(async move {
@@ -645,7 +786,7 @@ mod tests {
             "r.txt",
         ]))
         .unwrap();
-        assert_eq!(parsed.conn, "checkposting");
+        assert_eq!(parsed.conn.as_deref(), Some("checkposting"));
         assert_eq!(parsed.source, Source::Text("SHOW DATABASES;".into()));
         assert_eq!(parsed.format, Format::Records);
         assert_eq!(parsed.out, Some(PathBuf::from("r.txt")));
@@ -661,6 +802,112 @@ mod tests {
         assert!(parse(&args(&["--conn", "c", "--string", "x", "--limit", "0"])).is_err());
         assert!(parse(&args(&["--conn", "c", "--string"])).is_err());
         assert!(parse(&args(&["--conn", "c", "--string", "x", "--bogus"])).is_err());
+    }
+
+    #[test]
+    fn parses_a_direct_connection() {
+        let parsed = parse(&args(&[
+            "--engine",
+            "MariaDB",
+            "--host",
+            "db.local",
+            "--port",
+            "3307",
+            "--user",
+            "dauser",
+            "--password",
+            "s3cret",
+            "--db",
+            "checkpostingdb",
+            "--string",
+            "SHOW TABLES",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.conn, None);
+        assert_eq!(parsed.database.as_deref(), Some("checkpostingdb"));
+        assert_eq!(
+            parsed.direct,
+            Direct {
+                engine: Some(Engine::MySql),
+                host: Some("db.local".into()),
+                port: Some(3307),
+                user: Some("dauser".into()),
+                password: Some("s3cret".into()),
+                ..Direct::default()
+            }
+        );
+        assert!(parse(&args(&["--engine", "oracle", "--string", "x"])).is_err());
+        assert!(
+            parse(&args(&[
+                "--engine", "mysql", "--port", "x", "--string", "x"
+            ]))
+            .is_err()
+        );
+        assert!(parse(&args(&["--string", "x"])).is_err());
+    }
+
+    #[test]
+    fn builds_configs_from_flags() {
+        let mysql = Direct {
+            engine: Some(Engine::MySql),
+            user: Some("dauser".into()),
+            ..Direct::default()
+        };
+        let config = build_config(None, &mysql, Some("checkpostingdb")).unwrap();
+        assert_eq!(
+            (
+                config.engine,
+                config.host.as_str(),
+                config.port,
+                config.user.as_str()
+            ),
+            (Engine::MySql, "localhost", 3306, "dauser")
+        );
+        assert!(config.safe_updates && !config.read_only && !config.save_password);
+        // MySQL switches with USE; PostgreSQL connects to the database.
+        assert_eq!(config.database, "");
+        let pg = Direct {
+            engine: Some(Engine::Postgres),
+            ..Direct::default()
+        };
+        let config = build_config(None, &pg, Some("sales")).unwrap();
+        assert_eq!((config.port, config.database.as_str()), (5432, "sales"));
+        // SQLite needs a file.
+        let lite = Direct {
+            engine: Some(Engine::Sqlite),
+            ..Direct::default()
+        };
+        assert!(build_config(None, &lite, None).is_err());
+        // Flags override a saved connection, keeping the rest.
+        let saved = ConnectionConfig {
+            name: "checkposting".into(),
+            host: "10.0.0.5".into(),
+            port: 3306,
+            read_only: true,
+            ..ConnectionConfig::default()
+        };
+        let over = Direct {
+            port: Some(3307),
+            ..Direct::default()
+        };
+        let config = build_config(Some(saved), &over, None).unwrap();
+        assert_eq!((config.host.as_str(), config.port), ("10.0.0.5", 3307));
+        assert!(config.read_only);
+    }
+
+    #[test]
+    fn password_precedence() {
+        let env = || Some("env".to_owned());
+        assert_eq!(
+            choose_password(Some("flag"), Some("file\n"), env()).as_deref(),
+            Some("flag")
+        );
+        assert_eq!(
+            choose_password(None, Some("file\nignored"), env()).as_deref(),
+            Some("file")
+        );
+        assert_eq!(choose_password(None, None, env()).as_deref(), Some("env"));
+        assert_eq!(choose_password(None, None, None), None);
     }
 
     #[test]
